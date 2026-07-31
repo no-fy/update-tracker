@@ -36,13 +36,10 @@ Grab `docker-compose.yml` from this repo and:
 docker compose up -d          # http://localhost:8500
 ```
 
-It asks you to choose a username and password, and from there **Add host**
-gives you a command to paste on each machine you want to watch.
-
-To also watch the containers on the machine running the dashboard, you have to
-hand it the Docker socket — see [Watching the machine the dashboard runs
-on](#watching-the-machine-the-dashboard-runs-on). Everything else works without
-it.
+That is the entire setup. The compose file binds the Docker socket, so this
+machine's containers show up immediately — no group id, no `PUID`, nothing to
+look up. It asks you to choose a username and password, and from there **Add
+host** gives you a command to paste on each other machine you want to watch.
 
 The image is published to the GitHub Container Registry for amd64 and arm64, so
 it runs on a NAS or a Pi as happily as on a server:
@@ -71,10 +68,9 @@ cd container-update-dashboard
 ./cud add root@nas.lan         # optional: push an agent over SSH instead
 ```
 
-This is the better path if you want the dashboard to watch its own machine,
-since it reads `/var/run/docker.sock` directly with no socket mount or group
-juggling. See [Running as a service](#running-the-dashboard-as-a-service) for
-the systemd unit.
+The user running it needs read access to `/var/run/docker.sock`, which normally
+means being in the `docker` group. See [Running as a
+service](#running-the-dashboard-as-a-service) for the systemd unit.
 
 </details>
 
@@ -111,43 +107,46 @@ first-run prompt but not the login page.
 
 ## Watching the machine the dashboard runs on
 
-This is the one case that needs a decision from you, because the dashboard has
-to read `/var/run/docker.sock` — and how it gets that depends on how you run it.
-
-**From a checkout**, nothing to configure. The user running `./cud serve` needs
-read access to the socket, which normally means being in the `docker` group:
-
-```bash
-sudo usermod -aG docker "$USER"   # then log out and back in
-groups | grep docker              # confirm it took
-./cud serve                       # registers the local socket by itself
-```
-
-**In a container**, the socket is not there unless you put it there, and the
-container user must be in the group that owns it. Both lines are already in
-`docker-compose.yml`, commented out — uncomment them and fill in the group id:
-
-```bash
-stat -c %g /var/run/docker.sock   # commonly 999 or 998, but check — it varies
-```
+Bind the socket. That is the whole configuration:
 
 ```yaml
 services:
   dashboard:
+    image: ghcr.io/no-fy/update-tracker:latest
+    ports:
+      - "8500:8500"
     volumes:
       - cud-config:/config
-      - /var/run/docker.sock:/var/run/docker.sock:ro    # ← uncomment
-    group_add:
-      - "999"                                           # ← put the number here
+      - /var/run/docker.sock:/var/run/docker.sock:ro
 ```
 
-Then `docker compose up -d`. The `:ro` is not decoration: the dashboard only
-ever issues GETs, and read-only mounting means a bug cannot become a container
-being stopped.
+It is already in `docker-compose.yml`, so `docker compose up -d` picks up this
+machine with nothing else set. **No group id to look up, no `group_add`, no
+`user:`, no environment variable.** Delete the socket line if you only want to
+watch remote hosts.
 
-Docker Desktop on macOS and Windows is the exception — the socket has no
-meaningful group there. Use `group_add: ["0"]`, or skip the local host and
-enrol the machine like any other.
+There is no `PUID`/`PGID` to set either, and the container is not running as
+root to get away with it. It starts as root, reads the group that owns the
+socket you mounted — whatever number that is on your host — joins it, takes
+ownership of the config volume, and then drops to an unprivileged user with
+`su-exec`. The server itself runs as uid 10001 for its whole life:
+
+```console
+$ docker compose exec dashboard ps -o user,args
+USER     COMMAND
+cud      python3 /app/cud serve
+```
+
+If you would rather it never start as root, set `user:` yourself — the
+entrypoint sees it is not root, changes nothing, and leaves the socket group to
+you via `group_add`.
+
+The `:ro` is not decoration: the dashboard only ever issues GETs, and mounting
+read-only means a bug cannot become a container being stopped.
+
+**From a checkout** there is nothing to configure either, beyond the user
+running `./cud serve` being able to read the socket — normally
+`sudo usermod -aG docker "$USER"`, then log out and back in.
 
 **How to tell it worked.** The host list shows *This machine*, online, with
 your containers under it.
@@ -155,7 +154,7 @@ your containers under it.
 | What you see | What it means |
 |---|---|
 | *This machine*, online | Working. |
-| *This machine*, offline: `cannot connect to Docker at /var/run/docker.sock: [Errno 13] Permission denied` | The mount is there but `group_add` is wrong or missing. Re-run `stat -c %g`. |
+| *This machine*, offline: `cannot connect to Docker at /var/run/docker.sock: [Errno 13] Permission denied` | You set `user:` yourself, so the entrypoint left permissions alone — add `group_add` with `stat -c %g /var/run/docker.sock`. |
 | No local host at all | The socket was not mounted. The dashboard will not invent a host it cannot read. |
 
 To watch a machine that is *not* the one running the dashboard, do not mount
@@ -366,19 +365,11 @@ docker compose run --rm -v ~/.ssh:/home/cud/.ssh:ro dashboard add root@nas.lan
 `cud-config` volume, so replacing the container keeps your registered hosts and
 your place under the registry rate limits. To edit the config by hand, either
 `docker compose cp dashboard:/config/config.json .` and copy it back, or swap
-the volume for a bind mount — in which case `chown 10001 ./config` first, since
-the process runs as a non-root user.
+the volume for a bind mount — no `chown` needed, the entrypoint takes ownership
+of it at startup.
 
-Two things are commented out in `docker-compose.yml` because most setups do not
-need them:
-
-- **The Docker socket.** Only `cud add --local` — watching the containers on
-  the machine the dashboard itself runs on — needs it. Uncomment the socket
-  mount *and* `group_add` with the host's docker gid
-  (`stat -c %g /var/run/docker.sock`). A dashboard that only polls remote
-  agents needs no Docker access at all.
-- **`CUD_PASSWORD`.** There is no auth by default. Set it if the port is
-  reachable beyond a trusted LAN.
+`CUD_PASSWORD` is commented out in `docker-compose.yml`: setting it skips the
+first-run prompt and fixes the password from the environment instead.
 
 Adding a remote host from inside the container needs your SSH key mounted, as
 above; `setup-host.py` uses key-based auth only. Running it from a checkout on
@@ -483,7 +474,8 @@ cud                       CLI: serve, check, hosts, add, remove
 setup-host.py             SSH provisioner for a remote host
 Dockerfile                the dashboard as a container
 Dockerfile.agent          the agent as a container, for enrolment
-docker-compose.yml        socket mount and password, commented out
+docker-compose.yml        socket bound, nothing else to fill in
+docker-entrypoint.sh      joins the socket's group, then drops root
 .github/workflows/        test, then build and push the image to ghcr.io
 agent/agent.py            the agent — one stdlib-only file, also imported for local hosts
 dashboard/registry.py     tag → digest, via the OCI distribution API

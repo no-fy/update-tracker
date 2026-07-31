@@ -1,13 +1,19 @@
 FROM python:3.12-alpine
 
-# The agent is one stdlib-only file. Nothing to install.
-COPY agent/agent.py /app/agent.py
+# The agent is one stdlib-only file. su-exec is only here so the entrypoint can
+# drop root once the socket group is sorted out.
+RUN apk add --no-cache su-exec
 
-# It only ever issues GETs to the Docker API, so it needs no write access and
-# no privileges -- just membership of the socket's group at run time, which
-# `docker run --group-add` supplies.
+COPY agent/agent.py /app/agent.py
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# It only ever issues GETs to the Docker API, so it needs no write access and no
+# privileges. The entrypoint starts as root purely to join the group that owns
+# the mounted socket -- whatever id that has on the host -- then drops to this
+# user for the life of the process.
 RUN adduser -S -u 10001 -H cudagent
-USER cudagent
+ENV APP_USER=cudagent
 
 EXPOSE 9713
 
@@ -16,4 +22,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 CMD \
 
 # CUD_AGENT_TOKEN is the bearer token. CUD_ENROLL_URL and CUD_ENROLL_TOKEN, when
 # set, make the agent register itself with the dashboard on startup.
-ENTRYPOINT ["python3", "/app/agent.py"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh", "python3", "/app/agent.py"]

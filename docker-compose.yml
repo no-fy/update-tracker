@@ -11,12 +11,10 @@ services:
       - "8500:8500"
     volumes:
       - cud-config:/config
-      # Watching *this* machine's containers (`cud add --local`) additionally
-      # needs the Docker socket, read-only, plus the socket's group below.
-      # Dashboards that only poll remote agents need neither.
-      # - /var/run/docker.sock:/var/run/docker.sock:ro
-    # group_add:
-    #   - "999"   # the host's docker gid: stat -c %g /var/run/docker.sock
+      # Watching this machine's own containers. Read-only, and that is all you
+      # need: the container works out the socket's group id itself at startup.
+      # Drop this line if you only want to watch remote hosts.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
       # There is no auth by default. Set this if the port is reachable beyond
       # a trusted LAN; any username then works with this password.
