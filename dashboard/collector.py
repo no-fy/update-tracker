@@ -122,7 +122,12 @@ def _poll_os(host, timeout):
     """Pending OS updates for a host. Optional: an agent may not expose them."""
     try:
         if host.get("mode") == "local":
-            return agent_module.os_updates()
+            import osupdate
+
+            # The HTTP layer adds this for remote agents; local hosts bypass it.
+            data = dict(agent_module.os_updates())
+            data["updating"] = osupdate.capability()
+            return data
         scheme = "https" if host.get("tls") else "http"
         url = "%s://%s:%s/v1/os" % (scheme, host.get("address"), host.get("port", 9713))
         return _http_get_json(
@@ -139,6 +144,69 @@ def _poll_os(host, timeout):
         return {"available": False, "error": "agent returned HTTP %s" % exc.code}
     except Exception as exc:
         return {"available": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+
+
+def start_os_update(host, packages=None, severity=None, timeout=30):
+    """Ask a host's agent to install updates. Raises on refusal."""
+    if host.get("mode") == "local":
+        import osupdate
+
+        snapshot = agent_module.os_updates()
+        upgradable = {u["name"] for u in (snapshot.get("updates") or [])}
+        requested = packages
+        if severity:
+            requested = [u["name"] for u in (snapshot.get("updates") or [])
+                         if u.get("severity") == severity]
+        elif requested is None:
+            requested = sorted(upgradable)
+        job = osupdate.RUNNER.start(
+            snapshot.get("manager"), requested, upgradable,
+            on_finish=lambda job: agent_module.os_updates(force=True),
+        )
+        return job.snapshot()
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/os/update" % (scheme, host.get("address"), host.get("port", 9713))
+    body = {}
+    if packages is not None:
+        body["packages"] = packages
+    if severity:
+        body["severity"] = severity
+    return _http_post_json(url, body, token=host.get("token"), timeout=timeout,
+                           verify_tls=host.get("verify_tls", True))
+
+
+def get_os_job(host, job_id, timeout=20):
+    if host.get("mode") == "local":
+        import osupdate
+
+        job = osupdate.RUNNER.get(job_id)
+        return job.snapshot() if job else None
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/os/job/%s" % (
+        scheme, host.get("address"), host.get("port", 9713), job_id)
+    try:
+        return _http_get_json(url, token=host.get("token"), timeout=timeout,
+                              verify_tls=host.get("verify_tls", True))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise
+
+
+def _http_post_json(url, payload, token=None, timeout=30, verify_tls=True):
+    data = json.dumps(payload or {}).encode("utf-8")
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    context = None
+    if url.startswith("https://") and not verify_tls:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 
 def poll_hosts(hosts, timeout=20, max_workers=8, include_stopped=True):

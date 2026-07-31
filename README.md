@@ -12,8 +12,12 @@ image, across as many servers as you like.
 - **No pulls.** "Needs an update" is decided by asking the registry what digest
   the tag points at right now and comparing it to the digest the container is
   running. One HTTP request per unique image, not one image download.
-- **Read-only, everywhere.** The agent only ever issues GETs to the Docker API.
-  Nothing in this tool can start, stop, pull or recreate a container.
+- **Read-only about containers.** The agent only ever issues GETs to the Docker
+  API. Nothing here can start, stop, pull or recreate a container.
+- **OS updates you can actually install.** Pending packages are listed with
+  what they are and how big they are, and you can install a selection — or
+  every security update — from the dashboard. `CUD_ALLOW_UPDATES=0` makes an
+  agent report-only.
 - **No dependencies.** Python 3.12+ standard library only, on both sides. No pip
   install, no node, no build step, no database.
 
@@ -239,9 +243,13 @@ ranks it.
 | **pacman** | Installed versions against the synced databases. |
 | **rpm** (dnf/yum) | Detected and reported as unsupported. The rpm database is a binary format this agent cannot read without librpm, and answering "no updates" would be worse than saying so. |
 
-Nothing is executed and nothing is installed. The package manager's files are
-parsed directly, which is why this works from a container and needs no
-privileges — but it does mean the agent has to see the host's filesystem:
+Reading the list executes nothing: the package manager's files are parsed
+directly. Debian compresses those indexes with **lz4**, which the standard
+library does not implement, so the agent decodes it itself — without that, a
+Debian or Proxmox host reports zero updates while `apt` sees dozens. `.gz`,
+`.xz` and `.bz2` indexes are read too.
+
+Reading still means the agent has to see the host's filesystem:
 
 ```
 -v /:/host:ro -e CUD_HOST_ROOT=/host
@@ -270,8 +278,38 @@ honestly report old data — the dashboard shows how stale the lists are rather
 than implying freshness it cannot check. Most systems refresh on a timer;
 if yours does not, that timestamp is the thing to watch.
 
-A scan costs about a second on a normal Debian box, so the agent caches it for
-15 minutes (`CUD_OS_CACHE_SECONDS`).
+A scan costs about two seconds on a normal Debian box, so the agent caches it
+for 15 minutes (`CUD_OS_CACHE_SECONDS`).
+
+### Installing them
+
+Tick the packages you want and press **Install selected**, or **Install N
+security updates** to take the whole security set at once. The package
+manager's output streams into the page, and the list refreshes when the job
+finishes. Clicking a row opens what the package is, its section and priority,
+download and installed size, and its homepage.
+
+This is the one part of the tool that writes anything, so it is worth being
+precise about what it needs and what it will not do:
+
+- **It runs the host's package manager, in the host's namespaces.** That is why
+  the enrolment command carries `--pid=host --privileged`. Without them the
+  agent says so rather than half-working.
+- **It only ever passes package names it already reported as upgradable.** Each
+  name is checked against that set and against
+  `^[A-Za-z0-9][A-Za-z0-9._+-]*$`, and the command is built as an argv list —
+  there is no shell in the path, so a metacharacter has nothing to do.
+- **It upgrades, it does not install new things.** apt runs with
+  `--only-upgrade`, keeping existing config files (`--force-confold`).
+- **One job per host at a time**, non-interactive, with a 30-minute ceiling.
+
+To take this away from an agent, add `-e CUD_ALLOW_UPDATES=0`, or drop
+`--pid=host --privileged`. Either makes it report-only, and the dashboard
+explains why the buttons are absent instead of failing when you press them.
+
+`docker compose up -d` gives the dashboard's own machine the same ability
+through `pid: host` and `privileged: true` in `docker-compose.yml`. Remove
+those two lines for a dashboard that only reports.
 
 ## What the statuses mean
 
@@ -465,6 +503,8 @@ tokens are never returned.
 | GET | `/api/hosts` | configured hosts, tokens redacted |
 | POST | `/api/hosts/<name>/enabled` | `{"enabled": false}` to pause a host |
 | DELETE | `/api/hosts/<name>` | unregister a host |
+| POST | `/api/hosts/<name>/os/update` | install updates: `{"packages": [...]}` or `{"severity": "security"}` |
+| GET | `/api/hosts/<name>/os/job/<id>` | that install's status and output |
 | POST | `/api/enrollments` | mint an enrolment and return the command to run |
 | GET | `/api/enrollments` | pending and finished enrolments, tokens omitted |
 | GET | `/api/enrollments/<id>` | one enrolment, to watch for the agent checking in |
@@ -481,8 +521,8 @@ tokens are never returned.
 is refused until they do — an unauthenticated dashboard will not hand out
 enrolment tokens to whoever can reach the port.
 
-The agent's own API is `/healthz` (open) plus `/v1/containers`, `/v1/info` and
-`/v1/os` (bearer token).
+The agent's own API is `/healthz` (open) plus `/v1/containers`, `/v1/info`,
+`/v1/os`, `POST /v1/os/update` and `/v1/os/job/<id>` (bearer token).
 
 ## Security notes
 
@@ -526,7 +566,8 @@ docker-compose.yml        socket bound, nothing else to fill in
 docker-entrypoint.sh      joins the socket's group, then drops root
 .github/workflows/        test, then build and push the image to ghcr.io
 agent/agent.py            the agent, also imported for local hosts
-agent/ospackages.py       reads apt/apk/pacman databases for OS updates
+agent/ospackages.py       reads apt/apk/pacman databases (incl. lz4 indexes)
+agent/osupdate.py         installs updates, guarded and never via a shell
 dashboard/registry.py     tag → digest, via the OCI distribution API
 dashboard/collector.py    polls hosts, classifies containers
 dashboard/server.py       web server and JSON API

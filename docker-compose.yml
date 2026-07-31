@@ -7,6 +7,11 @@ services:
     pull_policy: always
     container_name: container-update-dashboard
     restart: unless-stopped
+    # Installing OS updates on this machine means running its package manager,
+    # which needs the host's namespaces. Remove both lines, or set
+    # CUD_ALLOW_UPDATES=0, for a dashboard that only reports what is pending.
+    pid: host
+    privileged: true
     ports:
       - "8500:8500"
     volumes:

@@ -17,8 +17,10 @@ What "available" means depends on the host having refreshed its package lists
 pretending freshness we cannot provide.
 """
 
+import bz2
 import gzip
 import io
+import lzma
 import os
 import re
 import tarfile
@@ -41,6 +43,122 @@ IMPORTANT_PATTERNS = re.compile(
 def _root(path, host_root=None):
     root = host_root or os.environ.get("CUD_HOST_ROOT") or "/"
     return os.path.join(root, path.lstrip("/"))
+
+
+# ------------------------------------------------------------------- lz4 --
+#
+# Debian keeps /var/lib/apt/lists/*_Packages compressed with lz4, which the
+# standard library does not implement. Reading them matters more than the
+# purity of not implementing a codec: without this, a Debian or Proxmox host
+# reports zero updates while apt sees dozens -- the one wrong answer that
+# actually costs someone something.
+
+LZ4_MAGIC = b"\x04\x22\x4d\x18"
+
+
+def _lz4_block(src, out):
+    """Decode one LZ4 block, appending into `out` (a bytearray)."""
+    index = 0
+    length = len(src)
+    while index < length:
+        token = src[index]
+        index += 1
+
+        literals = token >> 4
+        if literals == 15:
+            while True:
+                step = src[index]
+                index += 1
+                literals += step
+                if step != 255:
+                    break
+        if literals:
+            out += src[index:index + literals]
+            index += literals
+        if index >= length:
+            break
+
+        offset = src[index] | (src[index + 1] << 8)
+        index += 2
+        if offset == 0:
+            raise ValueError("lz4: zero offset")
+
+        match = token & 0x0F
+        if match == 15:
+            while True:
+                step = src[index]
+                index += 1
+                match += step
+                if step != 255:
+                    break
+        match += 4
+
+        start = len(out) - offset
+        if start < 0:
+            raise ValueError("lz4: offset before start of output")
+        if offset >= match:
+            out += out[start:start + match]      # non-overlapping: one slice
+        else:
+            for position in range(match):        # overlapping run
+                out.append(out[start + position])
+    return out
+
+
+def lz4_decompress(data):
+    """Decode an LZ4 *frame* (the file format), not a bare block."""
+    if data[:4] != LZ4_MAGIC:
+        raise ValueError("not an lz4 frame")
+    flg = data[4]
+    if flg >> 6 != 1:
+        raise ValueError("unsupported lz4 version")
+    has_content_size = (flg >> 3) & 1
+    has_content_checksum = (flg >> 2) & 1
+    has_dict_id = flg & 1
+    has_block_checksum = (flg >> 4) & 1
+
+    position = 6                       # magic(4) + FLG + BD
+    position += 8 if has_content_size else 0
+    position += 4 if has_dict_id else 0
+    position += 1                      # header checksum
+
+    out = bytearray()
+    total = len(data)
+    while position + 4 <= total:
+        size = int.from_bytes(data[position:position + 4], "little")
+        position += 4
+        if size == 0:                  # end mark
+            break
+        stored_raw = bool(size & 0x80000000)
+        size &= 0x7FFFFFFF
+        block = data[position:position + size]
+        position += size
+        if stored_raw:
+            out += block
+        else:
+            _lz4_block(block, out)
+        if has_block_checksum:
+            position += 4
+    if has_content_checksum:
+        position += 4
+    return bytes(out)
+
+
+def _read_index(path):
+    """Read an apt index whatever apt chose to compress it with."""
+    if path.endswith(".lz4"):
+        with open(path, "rb") as handle:
+            return lz4_decompress(handle.read()).decode("utf-8", "replace")
+    if path.endswith(".gz"):
+        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    if path.endswith(".xz"):
+        with lzma.open(path, "rt", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    if path.endswith(".bz2"):
+        with bz2.open(path, "rt", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        return handle.read()
 
 
 # ---------------------------------------------------------------- versions --
@@ -180,18 +298,18 @@ def _apt_candidates(host_root=None):
         return candidates, newest_mtime
 
     for entry in sorted(os.listdir(lists_dir)):
-        if not entry.endswith("_Packages") and not entry.endswith("_Packages.gz"):
+        stem = entry
+        for suffix in (".lz4", ".gz", ".xz", ".bz2"):
+            if stem.endswith(suffix):
+                stem = stem[: -len(suffix)]
+                break
+        if not stem.endswith("_Packages"):
             continue
         full = os.path.join(lists_dir, entry)
         try:
             newest_mtime = max(newest_mtime, os.path.getmtime(full))
-            if entry.endswith(".gz"):
-                with gzip.open(full, "rt", encoding="utf-8", errors="replace") as handle:
-                    text = handle.read()
-            else:
-                with open(full, "r", encoding="utf-8", errors="replace") as handle:
-                    text = handle.read()
-        except OSError:
+            text = _read_index(full)
+        except (OSError, ValueError):
             continue
 
         for fields in _stanzas(text):
@@ -199,16 +317,28 @@ def _apt_candidates(host_root=None):
             version = fields.get("Version")
             if not name or not version:
                 continue
+            record = {
+                "version": version,
+                "origin": entry,
+                "description": (fields.get("Description") or "").strip(),
+                "section": fields.get("Section") or "",
+                "priority": fields.get("Priority") or "",
+                "size": _int_or_none(fields.get("Size")),
+                "installed_size": _int_or_none(fields.get("Installed-Size")),
+                "homepage": fields.get("Homepage") or "",
+                "source": fields.get("Source") or name,
+                "architecture": fields.get("Architecture") or "",
+            }
             known = candidates.get(name)
             if known is None or compare_versions(version, known["version"]) > 0:
-                candidates[name] = {"version": version, "origin": entry}
+                candidates[name] = record
             elif compare_versions(version, known["version"]) == 0 \
                     and "security" in entry.lower() \
                     and "security" not in known["origin"].lower():
                 # The same version is usually published to both -security and
                 # -updates. Whichever filename sorted first must not decide
                 # whether this reads as a security fix.
-                candidates[name] = {"version": version, "origin": entry}
+                candidates[name] = record
     return candidates, newest_mtime
 
 
@@ -227,6 +357,14 @@ def scan_dpkg(host_root=None):
                 "candidate": candidate["version"],
                 "severity": classify(name, candidate["origin"], current, candidate["version"]),
                 "source": _pretty_origin(candidate["origin"]),
+                "description": candidate.get("description") or "",
+                "section": candidate.get("section") or "",
+                "priority": candidate.get("priority") or "",
+                "download_bytes": candidate.get("size"),
+                "installed_bytes": (candidate.get("installed_size") or 0) * 1024 or None,
+                "homepage": candidate.get("homepage") or "",
+                "source_package": candidate.get("source") or name,
+                "architecture": candidate.get("architecture") or "",
             })
     return {
         "manager": "apt",
@@ -236,6 +374,13 @@ def scan_dpkg(host_root=None):
         "reboot_required": os.path.exists(_root("/var/run/reboot-required", host_root)),
         "packages_installed": len(installed),
     }
+
+
+def _int_or_none(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _pretty_origin(entry):

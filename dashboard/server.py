@@ -318,6 +318,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(200, {"enrollments": self.server.enrollments.list()})
             return
 
+        if path.startswith("/api/hosts/") and "/os/job/" in path:
+            rest = path[len("/api/hosts/"):]
+            name, _, job_id = rest.partition("/os/job/")
+            config, _ = self.server.load_config()
+            host = config_mod.find_host(config, urllib.parse.unquote(name))
+            if not host:
+                self._json(404, {"error": "no such host"})
+                return
+            try:
+                job = collector.get_os_job(host, urllib.parse.unquote(job_id))
+            except Exception as exc:
+                self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+                return
+            if job is None:
+                self._json(404, {"error": "no such job"})
+                return
+            self._json(200, job)
+            return
+
         if path.startswith("/api/enrollments/"):
             item = self.server.enrollments.get(
                 urllib.parse.unquote(path[len("/api/enrollments/"):])
@@ -367,6 +386,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_new_enrollment()
             return
 
+        if path.startswith("/api/hosts/") and path.endswith("/os/update"):
+            self._handle_os_update(
+                urllib.parse.unquote(path[len("/api/hosts/"):-len("/os/update")]))
+            return
+
         if path.startswith("/api/hosts/") and path.endswith("/enabled"):
             name = urllib.parse.unquote(path[len("/api/hosts/"):-len("/enabled")])
             body = self._read_body()
@@ -406,6 +430,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         token = self.server.sessions.create(username or "admin")
         self._json_with_session(200, {"ok": True, "username": username or "admin"}, token=token)
+
+    def _handle_os_update(self, name):
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+
+        body = self._read_body()
+        try:
+            job = collector.start_os_update(
+                host,
+                packages=body.get("packages"),
+                severity=body.get("severity"),
+            )
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")
+            try:
+                self._json(exc.code, json.loads(detail))
+            except ValueError:
+                self._json(exc.code, {"error": detail[:300] or "agent refused"})
+            return
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self.server.poller.refresh_async()
+        self._json(202, job)
 
     # -- first-run setup ---------------------------------------------------
 

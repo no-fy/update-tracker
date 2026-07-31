@@ -24,7 +24,7 @@
     data: null, tab: "containers",
     status: "", query: "",            // containers tab
     severity: "", osQuery: "",        // OS tab
-    host: "", open: {}, canAddHosts: false
+    host: "", open: {}, picked: {}, osJobs: {}, canAddHosts: false
   };
   var el = {};
   var pollTimer = null;
@@ -368,10 +368,140 @@
 
     if (updates.length) {
       var body = text("div", "os-panel");
-      body.appendChild(osTable(updates));
+      body.appendChild(updateBar(host, updates));
+      body.appendChild(osTable(host, updates));
       card.appendChild(body);
     }
     return card;
+  }
+
+  function pickedFor(host) {
+    return Object.keys(state.picked).filter(function (key) {
+      return state.picked[key] && key.indexOf(host.name + "/") === 0;
+    }).map(function (key) { return key.slice(host.name.length + 1); });
+  }
+
+  function updateBar(host, updates) {
+    var bar = text("div", "os-actions");
+    bar.id = "os-actions-" + host.name;
+    var updating = (host.os && host.os.updating) || {};
+
+    if (!updating.can_update) {
+      bar.appendChild(text("span", "os-readonly", updating.reason ||
+        "This agent is read-only, so updates can only be installed on the host itself."));
+      return bar;
+    }
+
+    var job = state.osJobs[host.name];
+    if (job && job.status === "running") {
+      var busy = text("span", "os-running");
+      busy.appendChild(text("span", "spinner"));
+      busy.appendChild(text("span", null, "Installing " + job.packages.length + " " +
+        plural(job.packages.length, "package", "packages") + "…"));
+      bar.appendChild(busy);
+      bar.appendChild(logBox(job));
+      return bar;
+    }
+
+    var picked = pickedFor(host);
+    var security = updates.filter(function (u) { return u.severity === "security"; });
+
+    var selected = text("button", "button small");
+    selected.type = "button";
+    selected.textContent = picked.length
+      ? "Install " + picked.length + " selected"
+      : "Select packages to install";
+    selected.disabled = !picked.length;
+    selected.addEventListener("click", function () {
+      confirmAndRun(host, picked, null,
+        "Install " + picked.length + " " + plural(picked.length, "package", "packages") +
+        " on " + (host.label || host.name) + "?");
+    });
+    bar.appendChild(selected);
+
+    if (security.length) {
+      var sec = text("button", "button small primary");
+      sec.type = "button";
+      sec.textContent = "Install " + security.length + " security " +
+        plural(security.length, "update", "updates");
+      sec.addEventListener("click", function () {
+        confirmAndRun(host, null, "security",
+          "Install all " + security.length + " security " +
+          plural(security.length, "update", "updates") + " on " +
+          (host.label || host.name) + "?");
+      });
+      bar.appendChild(sec);
+    }
+
+    if (job && job.status && job.status !== "running") {
+      var done = text("span", job.status === "ok" ? "os-done" : "os-failed",
+        job.status === "ok"
+          ? "Installed " + job.packages.length + " " + plural(job.packages.length, "package", "packages")
+          : "Update failed");
+      bar.appendChild(done);
+      bar.appendChild(logBox(job));
+    }
+    return bar;
+  }
+
+  function logBox(job) {
+    var pre = text("pre", "joblog", (job.lines || []).join("\n"));
+    return pre;
+  }
+
+  function confirmAndRun(host, packages, severity, question) {
+    if (!window.confirm(question + "\n\nThis runs the package manager on that machine.")) return;
+    var body = {};
+    if (packages) body.packages = packages;
+    if (severity) body.severity = severity;
+
+    state.osJobs[host.name] = { status: "running", packages: packages || [], lines: [] };
+    render();
+
+    postJSON("/api/hosts/" + encodeURIComponent(host.name) + "/os/update", body)
+      .then(function (job) {
+        if (job.error) throw new Error(job.error);
+        state.osJobs[host.name] = job;
+        pickedFor(host).forEach(function (name) {
+          delete state.picked[host.name + "/" + name];
+        });
+        render();
+        watchOsJob(host, job.id);
+      })
+      .catch(function (err) {
+        state.osJobs[host.name] = {
+          status: "failed", packages: packages || [],
+          lines: [err.message || "The update could not be started."]
+        };
+        render();
+      });
+  }
+
+  function watchOsJob(host, jobId) {
+    fetch("/api/hosts/" + encodeURIComponent(host.name) + "/os/job/" + encodeURIComponent(jobId))
+      .then(function (r) { return r.json(); })
+      .then(function (job) {
+        state.osJobs[host.name] = job;
+        render();
+        if (job.status === "running") {
+          setTimeout(function () { watchOsJob(host, jobId); }, 1500);
+        } else {
+          // The package list is stale now; pull a fresh one.
+          fetch("/api/refresh", { method: "POST" }).then(function () {
+            setTimeout(load, 1500);
+          });
+        }
+      })
+      .catch(function () {
+        setTimeout(function () { watchOsJob(host, jobId); }, 3000);
+      });
+  }
+
+  function renderUpdateBar(host) {
+    var existing = document.getElementById("os-actions-" + host.name);
+    if (!existing || !existing.parentNode) return;
+    var updates = ((host.os || {}).updates || []).filter(matchesUpdate);
+    existing.parentNode.replaceChild(updateBar(host, updates), existing);
   }
 
   function renderFilters(data) {
@@ -517,11 +647,6 @@
     head.appendChild(meta);
     card.appendChild(head);
 
-    if (host.online) {
-      var osBlock = osPanel(host);
-      if (osBlock) card.appendChild(osBlock);
-    }
-
     if (!host.online) {
       var error = text("div", "host-error");
       error.appendChild(dot("error"));
@@ -562,73 +687,44 @@
     return card;
   }
 
-  function osPanel(host) {
-    var os = host.os;
-    if (!os) return null;
-
-    var panel = text("div", "os-panel");
-    var head = text("div", "os-head");
-
-    if (!os.available) {
-      head.appendChild(text("span", "os-title", "OS updates"));
-      head.appendChild(text("span", "os-note", os.error || "not reported"));
-      panel.appendChild(head);
-      return panel;
-    }
-
-    var counts = os.counts || {};
-    var total = OS_LEVELS.reduce(function (sum, level) {
-      return sum + (counts[level.key] || 0);
-    }, 0);
-
-    head.appendChild(text("span", "os-title", "OS updates"));
-    head.appendChild(text("span", "os-manager", os.manager));
-    if (total) {
-      OS_LEVELS.forEach(function (level) {
-        if (!counts[level.key]) return;
-        var chip = text("span", "os-count");
-        chip.appendChild(dot(level.status));
-        chip.appendChild(text("span", null, counts[level.key] + " " + level.label));
-        head.appendChild(chip);
-      });
-    } else {
-      head.appendChild(text("span", "os-note", "up to date"));
-    }
-    if (os.reboot_required) {
-      var reboot = text("span", "os-reboot");
-      reboot.appendChild(text("span", null, "reboot required"));
-      head.appendChild(reboot);
-    }
-    if (os.lists_updated) {
-      head.appendChild(text("span", "os-note", "lists " + relativeTime(os.lists_updated)));
-    }
-    panel.appendChild(head);
-
-    // The package list itself lives on the OS updates tab; this is just the
-    // headline so the containers view stays about containers.
-    if (total) {
-      var jump = text("button", "os-toggle");
-      jump.type = "button";
-      jump.textContent = "See " + total + " " + plural(total, "package", "packages");
-      jump.addEventListener("click", function () {
-        state.host = host.name;
-        selectTab("os");
-      });
-      panel.appendChild(jump);
-    }
-    return panel;
+  function bytes(value) {
+    if (!value) return null;
+    var units = ["B", "kB", "MB", "GB"];
+    var n = value, i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i += 1; }
+    return (n >= 10 || i === 0 ? Math.round(n) : n.toFixed(1)) + " " + units[i];
   }
 
-  function osTable(updates) {
+  function osTable(host, updates) {
+    var canUpdate = host.os && host.os.updating && host.os.updating.can_update;
     var table = text("table", "os-table");
+
     var head = text("tr");
+    if (canUpdate) head.appendChild(text("th", "os-pick", ""));
     ["Package", "Installed", "Available", "From"].forEach(function (label) {
       head.appendChild(text("th", null, label));
     });
     table.appendChild(head);
 
     updates.forEach(function (update) {
-      var row = text("tr");
+      var key = host.name + "/" + update.name;
+      var row = text("tr", "os-row");
+
+      if (canUpdate) {
+        var pick = text("td", "os-pick");
+        var box = document.createElement("input");
+        box.type = "checkbox";
+        box.checked = !!state.picked[key];
+        box.setAttribute("aria-label", "Select " + update.name);
+        box.addEventListener("click", function (event) { event.stopPropagation(); });
+        box.addEventListener("change", function () {
+          state.picked[key] = box.checked;
+          renderUpdateBar(host);
+        });
+        pick.appendChild(box);
+        row.appendChild(pick);
+      }
+
       var first = text("td", "os-pkg");
       var level = OS_LEVELS.filter(function (l) { return l.key === update.severity; })[0];
       first.appendChild(dot(level ? level.status : "unknown"));
@@ -637,9 +733,64 @@
       row.appendChild(text("td", "mono", update.installed));
       row.appendChild(text("td", "mono", update.candidate));
       row.appendChild(text("td", "os-src", update.source || ""));
+
+      row.tabIndex = 0;
+      row.addEventListener("click", function () {
+        state.open[key] = !state.open[key];
+        render();
+      });
+      row.addEventListener("keydown", function (event) {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          state.open[key] = !state.open[key];
+          render();
+        }
+      });
       table.appendChild(row);
+
+      if (state.open[key]) table.appendChild(osDetailRow(update, canUpdate));
     });
     return table;
+  }
+
+  function osDetailRow(update, canUpdate) {
+    var row = text("tr", "os-detail-row");
+    var cell = text("td");
+    cell.colSpan = canUpdate ? 5 : 4;
+
+    var box = text("div", "os-detail");
+    if (update.description) box.appendChild(text("p", "os-desc", update.description));
+
+    var facts = text("dl", "os-facts");
+    function fact(label, value) {
+      if (!value) return;
+      facts.appendChild(text("dt", null, label));
+      facts.appendChild(text("dd", null, value));
+    }
+    fact("Severity", update.severity);
+    fact("Section", update.section);
+    fact("Priority", update.priority);
+    fact("Architecture", update.architecture);
+    if (update.source_package && update.source_package !== update.name) {
+      fact("Source package", update.source_package);
+    }
+    fact("Download", bytes(update.download_bytes));
+    fact("Installed size", bytes(update.installed_bytes));
+    fact("Repository", update.source);
+    box.appendChild(facts);
+
+    if (update.homepage) {
+      var link = document.createElement("a");
+      link.href = update.homepage;
+      link.textContent = update.homepage;
+      link.rel = "noreferrer noopener";
+      link.target = "_blank";
+      link.className = "os-link";
+      box.appendChild(link);
+    }
+    cell.appendChild(box);
+    row.appendChild(cell);
+    return row;
   }
 
   function renderHosts(data) {

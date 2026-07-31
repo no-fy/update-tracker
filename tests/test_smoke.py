@@ -32,6 +32,7 @@ from dashboard import collector, config as config_mod, registry as registry_mod 
 from dashboard import server as server_mod  # noqa: E402
 from dashboard import enroll  # noqa: E402
 import ospackages  # noqa: E402
+import osupdate  # noqa: E402
 from fake_docker import FakeDocker, make_fixtures  # noqa: E402
 
 PASSED = []
@@ -49,6 +50,16 @@ def check(name, condition, detail=""):
 
 def section(title):
     print("\n\033[1m%s\033[0m" % title)
+
+
+def _raises(exception, func, *args, **kwargs):
+    try:
+        func(*args, **kwargs)
+    except exception:
+        return True
+    except Exception:
+        return False
+    return False
 
 
 def live_digests(refs):
@@ -490,6 +501,73 @@ def main(argv):
               none_result["manager"] is None and not none_result["available"])
         check("the error explains the mount",
               "CUD_HOST_ROOT" in (none_result["error"] or ""))
+
+        section("OS updates: lz4 indexes (Debian's default)")
+
+        def lz4_frame(payload_blocks):
+            out = bytearray(b"\x04\x22\x4d\x18")
+            out += bytes([0x60, 0x70, 0x00])          # FLG, BD, header checksum
+            for block, raw in payload_blocks:
+                size = len(block) | (0x80000000 if raw else 0)
+                out += size.to_bytes(4, "little") + block
+            out += (0).to_bytes(4, "little")          # end mark
+            return bytes(out)
+
+        # A hand-built compressed block: literals "abc", then a match of 9
+        # bytes at offset 3 -- an overlapping run, the case a naive slice copy
+        # gets wrong.
+        compressed = bytes([0x35]) + b"abc" + bytes([0x03, 0x00])
+        check("lz4 decodes an overlapping match",
+              ospackages.lz4_decompress(lz4_frame([(compressed, False)])) == b"abcabcabcabc",
+              ospackages.lz4_decompress(lz4_frame([(compressed, False)])))
+        check("lz4 decodes a stored block",
+              ospackages.lz4_decompress(lz4_frame([(b"plain bytes", True)])) == b"plain bytes")
+        check("lz4 rejects a non-frame",
+              _raises(ValueError, ospackages.lz4_decompress, b"not lz4 at all"))
+
+        lz4_root = os.path.join(workdir, "lz4root")
+        os.makedirs(os.path.join(lz4_root, "var/lib/dpkg"))
+        os.makedirs(os.path.join(lz4_root, "var/lib/apt/lists"))
+        with open(os.path.join(lz4_root, "var/lib/dpkg/status"), "w") as handle:
+            handle.write("Package: curl\nStatus: install ok installed\nVersion: 7.88.1-1\n\n")
+        stanza = b"Package: curl\nVersion: 7.88.1-2\nDescription: transfer a URL\nSection: web\n\n"
+        with open(os.path.join(lz4_root,
+                  "var/lib/apt/lists/deb.debian.org_debian_dists_bookworm_main_binary-amd64_Packages.lz4"),
+                  "wb") as handle:
+            handle.write(lz4_frame([(stanza, True)]))
+        lz4_result = ospackages.collect(lz4_root)
+        check("an lz4 index is read, not skipped",
+              [u["name"] for u in lz4_result["updates"]] == ["curl"],
+              lz4_result.get("error") or lz4_result["updates"])
+        if lz4_result["updates"]:
+            check("metadata survives decompression",
+                  lz4_result["updates"][0]["description"] == "transfer a URL")
+
+        section("OS updates: installing them")
+        check("updates are allowed unless switched off", osupdate.updates_allowed())
+        os.environ["CUD_ALLOW_UPDATES"] = "0"
+        check("CUD_ALLOW_UPDATES=0 turns them off", not osupdate.updates_allowed())
+        check("and says why", "CUD_ALLOW_UPDATES=0" in (osupdate.capability()["reason"] or ""))
+        del os.environ["CUD_ALLOW_UPDATES"]
+
+        argv, env = osupdate.build_command("apt", ["openssl", "libc6"])
+        check("apt command upgrades only the named packages",
+              argv[:6] == ["apt-get", "-y", "-o", "Dpkg::Options::=--force-confold",
+                           "--only-upgrade", "install"] and argv[-2:] == ["openssl", "libc6"], argv)
+        check("apt runs non-interactively", env.get("DEBIAN_FRONTEND") == "noninteractive")
+        check("the command is argv, never a shell string",
+              not any(ch in " ".join(argv) for ch in "|&;<>$`"))
+
+        check("a package that is not pending is refused",
+              _raises(osupdate.UpdateError, osupdate.RUNNER.start,
+                      "apt", ["nosuchpkg"], {"openssl"}))
+        check("a name with shell metacharacters is refused",
+              _raises(osupdate.UpdateError, osupdate.RUNNER.start,
+                      "apt", ["openssl; rm -rf /"], {"openssl", "openssl; rm -rf /"}))
+        check("an empty selection is refused",
+              _raises(osupdate.UpdateError, osupdate.RUNNER.start, "apt", [], {"openssl"}))
+        check("an unsupported manager is refused",
+              _raises(osupdate.UpdateError, osupdate.build_command, "rpm", ["x"]))
 
         section("Local host by default")
         shared = config_mod.load_config(os.path.join(workdir, "nope-1.json"))[0]

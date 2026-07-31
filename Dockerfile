@@ -1,8 +1,9 @@
 FROM python:3.12-alpine
 
-# su-exec is the only package in the image: the entrypoint uses it to drop root
-# once the socket group is sorted. Everything else is the standard library.
-RUN apk add --no-cache su-exec
+# su-exec lets the entrypoint drop root once the socket group is sorted;
+# nsenter (util-linux-misc) runs OS updates in the host's namespaces.
+# Everything else is the standard library.
+RUN apk add --no-cache su-exec util-linux-misc
 
 RUN adduser -S -u 10001 -H cud
 

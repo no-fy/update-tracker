@@ -1,10 +1,10 @@
 FROM python:3.12-alpine
 
-# The agent is stdlib-only. su-exec is only here so the entrypoint can
-# drop root once the socket group is sorted out.
-RUN apk add --no-cache su-exec
+# The agent is stdlib-only. su-exec lets the entrypoint drop root; nsenter
+# (util-linux-misc) runs OS updates in the host's namespaces.
+RUN apk add --no-cache su-exec util-linux-misc
 
-COPY agent/agent.py agent/ospackages.py /app/
+COPY agent/agent.py agent/ospackages.py agent/osupdate.py /app/
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 

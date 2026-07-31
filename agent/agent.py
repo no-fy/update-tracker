@@ -187,6 +187,11 @@ def os_updates(force=False):
     return data
 
 
+def _osupdate():
+    import osupdate
+    return osupdate
+
+
 def collect_snapshot(client, include_stopped=True):
     """Return ``{"info": {...}, "containers": [...]}`` for one Docker host."""
     try:
@@ -318,13 +323,65 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             elif path == "/v1/info":
                 self._send(200, {"agent_version": AGENT_VERSION, "info": client.info()})
             elif path == "/v1/os":
-                self._send(200, os_updates())
+                payload = dict(os_updates())
+                payload["updating"] = _osupdate().capability()
+                self._send(200, payload)
+            elif path.startswith("/v1/os/job/"):
+                job = _osupdate().RUNNER.get(path[len("/v1/os/job/"):])
+                if job is None:
+                    self._send(404, {"error": "no such job"})
+                else:
+                    self._send(200, job.snapshot())
             else:
                 self._send(404, {"error": "no such endpoint", "path": path})
         except DockerError as exc:
             self._send(503, {"error": str(exc)})
         except Exception as exc:  # pragma: no cover - defensive
             self._send(500, {"error": "%s: %s" % (type(exc).__name__, exc)})
+
+
+    def do_POST(self):  # noqa: N802 - stdlib naming
+        path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
+
+        if not self._authorized():
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Bearer realm="container-update-agent"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        if path != "/v1/os/update":
+            self._send(404, {"error": "no such endpoint", "path": path})
+            return
+
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+        except ValueError:
+            body = {}
+
+        osupdate = _osupdate()
+        snapshot = os_updates()
+        upgradable = {u["name"] for u in (snapshot.get("updates") or [])}
+        requested = body.get("packages")
+        if body.get("severity"):
+            requested = [u["name"] for u in (snapshot.get("updates") or [])
+                         if u.get("severity") == body["severity"]]
+        elif requested is None:
+            requested = sorted(upgradable)
+
+        try:
+            job = osupdate.RUNNER.start(
+                snapshot.get("manager"),
+                requested,
+                upgradable,
+                # The package list is stale the moment an update succeeds.
+                on_finish=lambda job: os_updates(force=True),
+            )
+        except osupdate.UpdateError as exc:
+            self._send(400, {"error": str(exc)})
+            return
+        self._send(202, job.snapshot())
 
 
 class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):

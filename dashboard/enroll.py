@@ -79,12 +79,16 @@ class Enrollment(object):
 def agent_command(enrollment, dashboard_url, socket_path="/var/run/docker.sock"):
     """The line to paste on the remote host.
 
-    `/:/host:ro` is what lets the agent read the host's package databases for
-    OS updates. Drop that line and the `CUD_HOST_ROOT` one to watch containers
-    only -- everything else keeps working.
+    `/:/host:ro` lets the agent read the host's package databases; `--pid=host
+    --privileged` is what lets it install them, by running the package manager
+    in the host's own namespaces.
+
+    For an agent that only ever reports, drop those two and add
+    `-e CUD_ALLOW_UPDATES=0`. Everything except installing keeps working.
     """
     return (
         "docker run -d --name {name} --restart unless-stopped \\\n"
+        "  --pid=host --privileged \\\n"
         "  -v {socket}:{socket}:ro \\\n"
         "  -v /:/host:ro \\\n"
         "  -p {port}:{port} \\\n"
