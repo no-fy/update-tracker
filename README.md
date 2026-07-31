@@ -210,7 +210,14 @@ dashboard holds no credentials for your machines at all.
 
 ## OS package updates
 
-Each host also reports its pending OS package updates, ranked so the ones that
+The dashboard has two tabs. **Containers** is the image view; **OS updates**
+lists pending packages per host. Each tab has its own status filter, host
+filter and search — the search box follows whichever tab you are on and keeps a
+separate query for each, so switching never applies a search meant for the
+other list. On the containers tab each host still shows a one-line OS summary,
+and *See N packages* jumps straight to that host on the OS tab.
+
+Each host reports its pending OS package updates, ranked so the ones that
 matter are not buried:
 
 | Rank | What lands here |

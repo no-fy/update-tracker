@@ -14,8 +14,18 @@
     "up-to-date":       { label: "Up to date",       glyph: "✓", order: 6 }
   };
   var ATTENTION = ["update-available", "restart-pending"];
+  var OS_LEVELS = [
+    { key: "security",  label: "security",  status: "error" },
+    { key: "important", label: "important", status: "update-available" },
+    { key: "routine",   label: "routine",   status: "unknown" }
+  ];
 
-  var state = { data: null, status: "", host: "", query: "", open: {}, canAddHosts: false };
+  var state = {
+    data: null, tab: "containers",
+    status: "", query: "",            // containers tab
+    severity: "", osQuery: "",        // OS tab
+    host: "", open: {}, canAddHosts: false
+  };
   var el = {};
   var pollTimer = null;
 
@@ -105,6 +115,22 @@
     return true;
   }
 
+  function matchesUpdate(update) {
+    if (state.severity && update.severity !== state.severity) return false;
+    if (state.osQuery) {
+      var haystack = [update.name, update.installed, update.candidate, update.source]
+        .join(" ").toLowerCase();
+      if (haystack.indexOf(state.osQuery) === -1) return false;
+    }
+    return true;
+  }
+
+  function osHosts(data) {
+    return (data.hosts || []).filter(function (host) {
+      return host.os && (host.os.available || host.os.error);
+    });
+  }
+
   function statusRank(status) {
     var meta = STATUS[status];
     return meta ? meta.order : 99;
@@ -114,6 +140,10 @@
 
   function renderHero(data) {
     var summary = data.summary || {};
+    if (state.tab === "os") {
+      renderOsHero(data, summary);
+      return;
+    }
     var needs = summary.needs_attention || 0;
     el.heroValue.textContent = data.generated_at ? needs : "—";
     el.heroLabel.textContent = needs === 1
@@ -130,6 +160,29 @@
     }
     if (!notes.length && data.generated_at) {
       notes.push("Everything checked is running its tag's current image.");
+    }
+    el.heroNote.textContent = notes.join(" · ");
+  }
+
+  function renderOsHero(data, summary) {
+    var counts = summary.os_counts || {};
+    var security = counts.security || 0;
+    el.heroValue.textContent = data.generated_at ? security : "—";
+    el.heroLabel.textContent = security === 1
+      ? "security update waiting"
+      : "security updates waiting";
+
+    var notes = [];
+    if (counts.important) notes.push(counts.important + " important");
+    if (counts.routine) notes.push(counts.routine + " routine");
+    if (summary.os_reboots_required) {
+      notes.push(summary.os_reboots_required + " " +
+        plural(summary.os_reboots_required, "host needs", "hosts need") + " a reboot");
+    }
+    if (!notes.length && data.generated_at) {
+      notes.push(summary.os_hosts_reporting
+        ? "Every host reporting packages is up to date."
+        : "No host is reporting OS packages yet.");
     }
     el.heroNote.textContent = notes.join(" · ");
   }
@@ -181,6 +234,144 @@
       summary.containers_total + " " + plural(summary.containers_total, "container", "containers") +
         ", " + (summary.containers_running || 0) + " running"
     ));
+  }
+
+  function renderTabs(data) {
+    var summary = data.summary || {};
+    el.tabContainersCount.textContent = summary.containers_total || 0;
+    el.tabOsCount.textContent = summary.os_updates_total || 0;
+    el.tabContainers.setAttribute("aria-selected", state.tab === "containers" ? "true" : "false");
+    el.tabOs.setAttribute("aria-selected", state.tab === "os" ? "true" : "false");
+    el.tabOs.hidden = !summary.os_hosts_reporting && !osHosts(data).length;
+    el.search.placeholder = state.tab === "os"
+      ? "Search package or version…"
+      : "Search name or image…";
+  }
+
+  function selectTab(tab) {
+    if (state.tab === tab) return;
+    state.tab = tab;
+    // Each tab keeps its own query, so switching never applies a search that
+    // was meant for the other list.
+    el.search.value = tab === "os" ? state.osQuery : state.query;
+    render();
+  }
+
+  function chipRow(container, options, current, onPick) {
+    container.textContent = "";
+    options.forEach(function (option) {
+      var chip = text("button", "chip");
+      chip.type = "button";
+      chip.setAttribute("aria-pressed", current === option.key ? "true" : "false");
+      if (option.status) chip.appendChild(dot(option.status));
+      chip.appendChild(text("span", null, option.label));
+      chip.appendChild(text("span", "count", option.count));
+      chip.addEventListener("click", function () { onPick(option.key); });
+      container.appendChild(chip);
+    });
+  }
+
+  function renderOsFilters(data) {
+    var counts = (data.summary || {}).os_counts || {};
+    var total = (data.summary || {}).os_updates_total || 0;
+    var options = [{ key: "", label: "All", count: total }];
+    OS_LEVELS.forEach(function (level) {
+      if (counts[level.key]) {
+        options.push({
+          key: level.key, label: level.label,
+          count: counts[level.key], status: level.status
+        });
+      }
+    });
+    chipRow(el.statusFilters, options, state.severity, function (key) {
+      state.severity = state.severity === key ? "" : key;
+      render();
+    });
+    fillHostFilter(osHosts(data));
+  }
+
+  function fillHostFilter(hosts) {
+    var previous = state.host;
+    el.hostFilter.textContent = "";
+    var all = text("option", null, "All hosts");
+    all.value = "";
+    el.hostFilter.appendChild(all);
+    var known = false;
+    hosts.forEach(function (host) {
+      var option = text("option", null, host.label || host.name);
+      option.value = host.name;
+      if (host.name === previous) known = true;
+      el.hostFilter.appendChild(option);
+    });
+    el.hostFilter.value = known ? previous : "";
+    if (!known) state.host = "";
+  }
+
+  function renderOsHosts(data) {
+    el.hosts.textContent = "";
+    var hosts = osHosts(data).filter(function (host) {
+      return !state.host || host.name === state.host;
+    });
+
+    var shown = 0;
+    hosts.forEach(function (host) {
+      var os = host.os || {};
+      var updates = (os.updates || []).filter(matchesUpdate);
+      shown += updates.length;
+      if (!updates.length && os.available && (state.severity || state.osQuery)) return;
+      el.hosts.appendChild(osCard(host, updates));
+    });
+
+    if (!hosts.length) {
+      el.empty.hidden = false;
+      el.empty.textContent = "";
+      el.empty.appendChild(text("span", null, "No host is reporting OS packages. Give the agent a read-only view of the host with "));
+      el.empty.appendChild(text("code", null, "-v /:/host:ro -e CUD_HOST_ROOT=/host"));
+      el.empty.appendChild(text("span", null, "."));
+    } else if (!shown && !el.hosts.children.length) {
+      el.empty.hidden = false;
+      el.empty.textContent = "No packages match the current filter.";
+    } else {
+      el.empty.hidden = true;
+    }
+  }
+
+  function osCard(host, updates) {
+    var card = text("section", "host");
+    var head = text("div", "host-head");
+    var title = text("div", "host-title");
+    var os = host.os || {};
+
+    title.appendChild(dot(
+      !os.available ? "error" : ((os.counts || {}).security ? "error" : "up-to-date")
+    ));
+    title.appendChild(text("span", "name", host.label || host.name));
+    title.appendChild(text("span", "tag", os.manager || "unknown"));
+    head.appendChild(title);
+
+    var meta = text("div", "host-meta");
+    var bits = [];
+    if (os.available) {
+      bits.push(updates.length + " " + plural(updates.length, "package", "packages") + " shown");
+      if (os.packages_installed) bits.push(os.packages_installed + " installed");
+      if (os.lists_updated) bits.push("lists " + relativeTime(os.lists_updated));
+      if (os.reboot_required) bits.push("reboot required");
+    } else {
+      bits.push(os.error || "not reported");
+    }
+    bits.forEach(function (bit, index) {
+      if (index) meta.appendChild(text("span", "sep", "·"));
+      meta.appendChild(text("span", null, bit));
+    });
+    head.appendChild(meta);
+    card.appendChild(head);
+
+    if (updates.length) {
+      var body = text("div", "os-panel");
+      body.appendChild(osTable(updates));
+      card.appendChild(body);
+    }
+    return card;
   }
 
   function renderFilters(data) {
@@ -371,12 +562,6 @@
     return card;
   }
 
-  var OS_LEVELS = [
-    { key: "security",  label: "security",  status: "error" },
-    { key: "important", label: "important", status: "update-available" },
-    { key: "routine",   label: "routine",   status: "unknown" }
-  ];
-
   function osPanel(host) {
     var os = host.os;
     if (!os) return null;
@@ -419,18 +604,17 @@
     }
     panel.appendChild(head);
 
+    // The package list itself lives on the OS updates tab; this is just the
+    // headline so the containers view stays about containers.
     if (total) {
-      var key = "os:" + host.name;
-      var toggle = text("button", "os-toggle");
-      toggle.type = "button";
-      toggle.textContent = state.open[key] ? "Hide packages" : "Show " + total + " " + plural(total, "package", "packages");
-      toggle.addEventListener("click", function () {
-        state.open[key] = !state.open[key];
-        render();
+      var jump = text("button", "os-toggle");
+      jump.type = "button";
+      jump.textContent = "See " + total + " " + plural(total, "package", "packages");
+      jump.addEventListener("click", function () {
+        state.host = host.name;
+        selectTab("os");
       });
-      panel.appendChild(toggle);
-
-      if (state.open[key]) panel.appendChild(osTable(os.updates || []));
+      panel.appendChild(jump);
     }
     return panel;
   }
@@ -503,8 +687,14 @@
     if (!data) return;
     renderHero(data);
     renderKpis(data);
-    renderFilters(data);
-    renderHosts(data);
+    renderTabs(data);
+    if (state.tab === "os") {
+      renderOsFilters(data);
+      renderOsHosts(data);
+    } else {
+      renderFilters(data);
+      renderHosts(data);
+    }
 
     if (data.refreshing) {
       el.subtitle.textContent = "Checking hosts and registries…";
@@ -753,6 +943,10 @@
       footerMeta: $("footer-meta"),
       legend: $("legend"),
       addHost: $("add-host"),
+      tabContainers: $("tab-containers"),
+      tabOs: $("tab-os"),
+      tabContainersCount: $("tab-containers-count"),
+      tabOsCount: $("tab-os-count"),
       setupDialog: $("setup-dialog"),
       setupForm: $("setup-form"),
       setupUsername: $("setup-username"),
@@ -781,6 +975,8 @@
 
     el.refresh.addEventListener("click", refresh);
     el.addHost.addEventListener("click", openHostDialog);
+    el.tabContainers.addEventListener("click", function () { selectTab("containers"); });
+    el.tabOs.addEventListener("click", function () { selectTab("os"); });
     el.setupForm.addEventListener("submit", submitSetup);
     el.hostForm.addEventListener("submit", submitHost);
     el.hostCancel.addEventListener("click", function () { el.hostDialog.close(); });
@@ -799,7 +995,8 @@
     el.search.addEventListener("input", function () {
       if (searchTimer) clearTimeout(searchTimer);
       searchTimer = setTimeout(function () {
-        state.query = el.search.value.trim().toLowerCase();
+        var value = el.search.value.trim().toLowerCase();
+        if (state.tab === "os") state.osQuery = value; else state.query = value;
         render();
       }, 120);
     });
