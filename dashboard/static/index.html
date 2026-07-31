@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Container updates</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='14'>📦</text></svg>">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-main">
+    <h1>Container updates</h1>
+    <p class="subtitle" id="subtitle">Loading…</p>
+  </div>
+  <div class="topbar-actions">
+    <button id="refresh" class="button primary">
+      <span class="spinner" aria-hidden="true"></span>
+      <span class="button-label">Refresh</span>
+    </button>
+    <button id="theme" class="button icon" title="Switch theme" aria-label="Switch theme">◐</button>
+  </div>
+</header>
+
+<main>
+  <section class="lede" aria-labelledby="hero-label">
+    <div class="hero">
+      <p class="hero-value" id="hero-value">—</p>
+      <p class="hero-label" id="hero-label">containers need an update</p>
+      <p class="hero-note" id="hero-note"></p>
+    </div>
+    <div class="kpis" id="kpis"></div>
+  </section>
+
+  <section class="controls" aria-label="Filters">
+    <div class="chips" id="status-filters" role="group" aria-label="Filter by status"></div>
+    <div class="controls-right">
+      <label class="field">
+        <span class="visually-hidden">Filter by host</span>
+        <select id="host-filter"><option value="">All hosts</option></select>
+      </label>
+      <label class="field">
+        <span class="visually-hidden">Search containers</span>
+        <input id="search" type="search" placeholder="Search name or image…" autocomplete="off">
+      </label>
+    </div>
+  </section>
+
+  <section id="hosts" class="hosts"></section>
+
+  <p id="empty" class="empty" hidden></p>
+</main>
+
+<footer class="footer">
+  <span id="footer-meta"></span>
+  <span class="footer-legend" id="legend"></span>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

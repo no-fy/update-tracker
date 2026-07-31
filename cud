@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""cud -- container update dashboard.
+
+    cud serve                 start the web dashboard
+    cud check                 print an update report to the terminal
+    cud hosts                 list configured hosts
+    cud add root@nas.lan      install the agent on a host and register it
+    cud add --local           register this machine
+    cud remove nas            forget a host (does not touch the remote agent)
+"""
+
+import argparse
+import os
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+from dashboard import collector, config as config_mod  # noqa: E402
+from dashboard import server as server_mod  # noqa: E402
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+COLOURS = {
+    "update-available": "\033[33m",
+    "restart-pending": "\033[33m",
+    "error": "\033[31m",
+    "unknown": "\033[90m",
+    "pinned": "\033[36m",
+    "ignored": "\033[90m",
+    "up-to-date": "\033[32m",
+}
+GLYPHS = {
+    "update-available": "^",
+    "restart-pending": "~",
+    "error": "!",
+    "unknown": "?",
+    "pinned": "=",
+    "ignored": "-",
+    "up-to-date": ".",
+}
+
+
+def _tty():
+    return sys.stdout.isatty()
+
+
+def paint(text, colour):
+    if not _tty():
+        return text
+    return "%s%s%s" % (colour, text, RESET)
+
+
+def cmd_serve(args):
+    return server_mod.run(args.config, args.bind, args.port, args.verbose)
+
+
+def cmd_check(args):
+    config, config_path = config_mod.load_config(args.config)
+    hosts = config.get("hosts", [])
+    if not hosts:
+        print("No hosts configured. Add one with:  ./cud add --local")
+        print("                              or:  ./cud add root@your-server")
+        return 1
+
+    settings = config.get("dashboard", {})
+    started = time.time()
+    results = collector.poll_hosts(
+        hosts,
+        timeout=settings.get("poll_timeout_seconds", 20),
+        max_workers=settings.get("max_parallel_hosts", 8),
+        include_stopped=settings.get("include_stopped", True),
+    )
+    client = server_mod.make_registry_client(
+        config, cache_path=config_mod.default_cache_path(config_path)
+    )
+    collector.enrich_with_registry(
+        results, client, max_workers=settings.get("max_parallel_registry_lookups", 6)
+    )
+    summary = collector.summarise(results)
+
+    for host in results:
+        header = "%s (%s)" % (host["label"], host["name"])
+        if not host["online"]:
+            print("\n%s  %s" % (paint(header, BOLD), paint("offline: " + (host["error"] or "?"), COLOURS["error"])))
+            continue
+        info_bits = [
+            b for b in (
+                host["info"].get("docker_version") and "docker " + host["info"]["docker_version"],
+                host["info"].get("os"),
+            ) if b
+        ]
+        print("\n%s  %s" % (paint(header, BOLD), paint(" | ".join(info_bits), DIM)))
+
+        rows = host["containers"]
+        if args.updates_only:
+            rows = [c for c in rows if c["update_status"] in collector.NEEDS_ATTENTION]
+        if not rows:
+            print("  %s" % paint("nothing to report", DIM))
+            continue
+
+        width = max(len(c["name"]) for c in rows)
+        for container in sorted(rows, key=lambda c: (
+            collector.STATUS_ORDER.index(c["update_status"])
+            if c["update_status"] in collector.STATUS_ORDER else 99, c["name"])
+        ):
+            status = container["update_status"]
+            colour = COLOURS.get(status, "")
+            line = "  %s %-*s  %s" % (
+                paint(GLYPHS.get(status, "?"), colour),
+                width,
+                container["name"],
+                container["image_display"],
+            )
+            print(line)
+            if status in collector.NEEDS_ATTENTION or status == "error":
+                print("      %s" % paint(container["detail"], colour))
+
+    counts = summary["counts"]
+    print("\n" + paint("Summary", BOLD))
+    print("  %d containers on %d/%d hosts online" % (
+        summary["containers_total"], summary["hosts_online"], summary["hosts_total"]))
+    for status in collector.STATUS_ORDER:
+        if counts.get(status):
+            print("  %s %-17s %d" % (
+                paint(GLYPHS.get(status, "?"), COLOURS.get(status, "")), status, counts[status]))
+    print("  checked in %.1fs  (config: %s)" % (time.time() - started, config_path))
+
+    return 1 if summary["needs_attention"] and args.exit_code else 0
+
+
+def cmd_hosts(args):
+    config, config_path = config_mod.load_config(args.config)
+    hosts = config.get("hosts", [])
+    if not hosts:
+        print("No hosts configured (%s)" % config_path)
+        return 0
+    width = max(len(h.get("name", "")) for h in hosts)
+    for host in hosts:
+        target = "local socket %s" % host.get("docker_socket") if host.get("mode") == "local" \
+            else "%s:%s" % (host.get("address"), host.get("port"))
+        flags = [] if host.get("enabled", True) else ["disabled"]
+        print("  %-*s  %-32s %s" % (width, host.get("name"), target, " ".join(flags)))
+    print("\n  %s" % paint(config_path, DIM))
+    return 0
+
+
+def _setup_host_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("setup_host", os.path.join(HERE, "setup-host.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def cmd_add(args):
+    return _setup_host_module().main(args.rest)
+
+
+def split_add(argv):
+    """Detect `cud [--config X] add …` so setup-host.py gets its flags intact.
+
+    argparse would otherwise claim `--local`, `--port` and friends for itself
+    before REMAINDER ever sees them.
+    """
+    config = None
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "add":
+            return config, argv[index + 1:]
+        if token == "--config" and index + 1 < len(argv):
+            config = argv[index + 1]
+            index += 2
+            continue
+        if token.startswith("--config="):
+            config = token.split("=", 1)[1]
+            index += 1
+            continue
+        return None, None
+    return None, None
+
+
+def cmd_remove(args):
+    config, config_path = config_mod.load_config(args.config)
+    removed = config_mod.remove_host(config, args.name)
+    if not removed:
+        print("No host named '%s'" % args.name)
+        return 1
+    config_mod.save_config(config, config_path)
+    print("Removed '%s' from %s" % (args.name, config_path))
+    if removed.get("ssh"):
+        print("The agent is still installed on it. To remove it too:")
+        print("  ./setup-host.py %s --uninstall" % removed["ssh"])
+    return 0
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    config_path, add_args = split_add(argv)
+    if add_args is not None:
+        if config_path:
+            add_args = ["--config", config_path] + add_args
+        return _setup_host_module().main(add_args)
+
+    parser = argparse.ArgumentParser(
+        prog="cud",
+        description="Container update dashboard",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("--config", help="path to config.json")
+    sub = parser.add_subparsers(dest="command")
+
+    p_serve = sub.add_parser("serve", help="start the web dashboard")
+    p_serve.add_argument("--bind")
+    p_serve.add_argument("--port", type=int)
+    p_serve.add_argument("--verbose", action="store_true")
+    p_serve.set_defaults(func=cmd_serve)
+
+    p_check = sub.add_parser("check", help="print an update report")
+    p_check.add_argument("--updates-only", action="store_true", help="hide up-to-date containers")
+    p_check.add_argument("--exit-code", action="store_true",
+                         help="exit 1 when something needs an update (for cron)")
+    p_check.set_defaults(func=cmd_check)
+
+    p_hosts = sub.add_parser("hosts", help="list configured hosts")
+    p_hosts.set_defaults(func=cmd_hosts)
+
+    p_add = sub.add_parser("add", help="install the agent on a host (see setup-host.py --help)")
+    p_add.add_argument("rest", nargs=argparse.REMAINDER)
+    p_add.set_defaults(func=cmd_add)
+
+    p_remove = sub.add_parser("remove", help="forget a host")
+    p_remove.add_argument("name")
+    p_remove.set_defaults(func=cmd_remove)
+
+    args = parser.parse_args(argv)
+    if not args.command:
+        parser.print_help()
+        return 0
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

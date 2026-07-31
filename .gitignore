@@ -1,0 +1,5 @@
+config/config.json
+config/registry-cache.json
+__pycache__/
+*.pyc
+.claude/settings.local.json

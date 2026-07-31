@@ -1,0 +1,36 @@
+{
+  "dashboard": {
+    "bind": "0.0.0.0",
+    "port": 8500,
+    "password": null,
+    "refresh_interval_minutes": 30,
+    "registry_cache_hours": 6,
+    "registry_failure_cache_minutes": 20,
+    "poll_timeout_seconds": 20,
+    "include_stopped": true,
+    "fetch_remote_metadata": true
+  },
+  "registries": {
+    "ghcr.io": { "username": "your-user", "password": "your-token" }
+  },
+  "insecure_registries": [],
+  "hosts": [
+    {
+      "name": "local",
+      "mode": "local",
+      "label": "This machine",
+      "docker_socket": "/var/run/docker.sock",
+      "enabled": true
+    },
+    {
+      "name": "nas",
+      "mode": "agent",
+      "label": "nas.lan",
+      "address": "nas.lan",
+      "port": 9713,
+      "token": "generated-by-setup-host.py",
+      "tls": false,
+      "enabled": true
+    }
+  ]
+}

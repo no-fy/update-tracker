@@ -1,0 +1,8 @@
+.git
+config/config.json
+config/registry-cache.json
+__pycache__/
+*.pyc
+tests/
+contrib/
+README.md

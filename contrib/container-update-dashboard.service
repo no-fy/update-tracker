@@ -1,0 +1,22 @@
+# Run the dashboard itself as a service.
+#   sudo cp contrib/container-update-dashboard.service /etc/systemd/system/
+#   sudo systemctl enable --now container-update-dashboard
+[Unit]
+Description=Container update dashboard
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=youruser
+WorkingDirectory=/opt/container-update-dashboard
+ExecStart=/usr/bin/python3 /opt/container-update-dashboard/cud serve
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

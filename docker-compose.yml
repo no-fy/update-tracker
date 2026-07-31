@@ -1,0 +1,24 @@
+services:
+  dashboard:
+    build: .
+    image: container-update-dashboard:1.0.0
+    container_name: container-update-dashboard
+    restart: unless-stopped
+    ports:
+      - "8500:8500"
+    volumes:
+      - cud-config:/config
+      # Watching *this* machine's containers (`cud add --local`) additionally
+      # needs the Docker socket, read-only, plus the socket's group below.
+      # Dashboards that only poll remote agents need neither.
+      # - /var/run/docker.sock:/var/run/docker.sock:ro
+    # group_add:
+    #   - "999"   # the host's docker gid: stat -c %g /var/run/docker.sock
+    environment:
+      # There is no auth by default. Set this if the port is reachable beyond
+      # a trusted LAN; any username then works with this password.
+      # CUD_PASSWORD: change-me
+      TZ: UTC
+
+volumes:
+  cud-config:

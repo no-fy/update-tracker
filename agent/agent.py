@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""Container-update agent.
+
+A read-only collector that reports the containers on one Docker host. It is a
+single stdlib-only file so it can be scp'd to any machine with Python 3.8+ and
+run under systemd. It never writes to Docker -- the only API calls it makes are
+GETs against the container, image and info endpoints.
+
+It is also importable: the dashboard uses ``DockerClient`` and
+``collect_snapshot`` directly for the host it runs on, so local and remote hosts
+go through exactly the same collection code.
+
+Run:
+    agent.py --config /etc/container-update-agent/config.json
+    agent.py --token SECRET --port 9713
+"""
+
+import argparse
+import hmac
+import http.client
+import http.server
+import json
+import os
+import socket
+import socketserver
+import ssl
+import sys
+import threading
+import time
+import urllib.parse
+
+AGENT_VERSION = "1.0.0"
+API_VERSION = "v1.41"
+DEFAULT_PORT = 9713
+DEFAULT_SOCKET = "/var/run/docker.sock"
+
+# Labels that opt a container out of update checks.
+IGNORE_LABELS = {
+    "container-update-dashboard.ignore": ("true", "1", "yes"),
+    "com.centurylinklabs.watchtower.enable": ("false", "0", "no"),
+}
+COMPOSE_PROJECT = "com.docker.compose.project"
+COMPOSE_SERVICE = "com.docker.compose.service"
+COMPOSE_WORKDIR = "com.docker.compose.project.working_dir"
+COMPOSE_CONFIG = "com.docker.compose.project.config_files"
+
+
+class DockerError(Exception):
+    pass
+
+
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    """http.client over a unix domain socket."""
+
+    def __init__(self, socket_path, timeout=15):
+        super().__init__("localhost", timeout=timeout)
+        self.socket_path = socket_path
+
+    def connect(self):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        try:
+            sock.connect(self.socket_path)
+        except OSError as exc:
+            raise DockerError(
+                "cannot connect to Docker at %s: %s" % (self.socket_path, exc)
+            ) from exc
+        self.sock = sock
+
+
+class DockerClient:
+    """Minimal read-only Docker Engine API client.
+
+    Accepts a unix socket path or a ``tcp://host:port`` / ``http://`` endpoint
+    (DOCKER_HOST style). No TLS client-cert support -- for remote daemons use
+    the agent rather than exposing the Docker socket.
+    """
+
+    def __init__(self, endpoint=None, timeout=15):
+        self.endpoint = endpoint or os.environ.get("DOCKER_HOST") or DEFAULT_SOCKET
+        self.timeout = timeout
+
+    def _connect(self):
+        ep = self.endpoint
+        if ep.startswith("unix://"):
+            return _UnixHTTPConnection(ep[len("unix://"):], self.timeout)
+        if ep.startswith("/"):
+            return _UnixHTTPConnection(ep, self.timeout)
+        parsed = urllib.parse.urlparse(ep)
+        host = parsed.hostname or "localhost"
+        port = parsed.port or (2376 if parsed.scheme == "https" else 2375)
+        if parsed.scheme == "https":
+            return http.client.HTTPSConnection(host, port, timeout=self.timeout)
+        return http.client.HTTPConnection(host, port, timeout=self.timeout)
+
+    def get(self, path):
+        conn = self._connect()
+        try:
+            conn.request("GET", path, headers={"Host": "docker", "Accept": "application/json"})
+            resp = conn.getresponse()
+            body = resp.read()
+            if resp.status == 404:
+                raise DockerError("not found: %s" % path)
+            if resp.status >= 400:
+                raise DockerError(
+                    "docker API %s returned %s: %s"
+                    % (path, resp.status, body.decode("utf-8", "replace")[:200])
+                )
+            if not body:
+                return None
+            return json.loads(body.decode("utf-8"))
+        except (OSError, http.client.HTTPException) as exc:
+            raise DockerError("docker API request failed: %s" % exc) from exc
+        finally:
+            conn.close()
+
+    def ping(self):
+        self.get("/_ping")
+        return True
+
+    def info(self):
+        return self.get("/%s/info" % API_VERSION)
+
+    def version(self):
+        return self.get("/%s/version" % API_VERSION)
+
+    def containers(self, all_containers=True):
+        return self.get(
+            "/%s/containers/json?all=%d" % (API_VERSION, 1 if all_containers else 0)
+        )
+
+    def image(self, ref):
+        return self.get("/%s/images/%s/json" % (API_VERSION, urllib.parse.quote(ref, safe="")))
+
+
+def _format_ports(raw_ports):
+    out = []
+    seen = set()
+    for port in raw_ports or []:
+        private = port.get("PrivatePort")
+        public = port.get("PublicPort")
+        proto = port.get("Type", "tcp")
+        if public:
+            text = "%s:%s->%s/%s" % (port.get("IP") or "0.0.0.0", public, private, proto)
+        else:
+            text = "%s/%s" % (private, proto)
+        if text not in seen:
+            seen.add(text)
+            out.append(text)
+    return out
+
+
+def _ignored_by_label(labels):
+    for key, truthy in IGNORE_LABELS.items():
+        value = labels.get(key)
+        if value is not None and str(value).strip().lower() in truthy:
+            return key
+    return None
+
+
+def collect_snapshot(client, include_stopped=True):
+    """Return ``{"info": {...}, "containers": [...]}`` for one Docker host."""
+    try:
+        info = client.info() or {}
+    except DockerError:
+        info = {}
+    host_info = {
+        "hostname": info.get("Name"),
+        "docker_version": info.get("ServerVersion"),
+        "os": info.get("OperatingSystem"),
+        "kernel": info.get("KernelVersion"),
+        "architecture": info.get("Architecture"),
+        "cpus": info.get("NCPU"),
+        "memory_bytes": info.get("MemTotal"),
+        "containers_total": info.get("Containers"),
+        "containers_running": info.get("ContainersRunning"),
+        "images_total": info.get("Images"),
+    }
+
+    image_cache = {}
+
+    def image_details(ref):
+        """Look up an image by id or by tag, memoised for this snapshot."""
+        if ref not in image_cache:
+            try:
+                image_cache[ref] = client.image(ref) or {}
+            except DockerError:
+                image_cache[ref] = {}
+        return image_cache[ref]
+
+    containers = []
+    for raw in client.containers(all_containers=include_stopped) or []:
+        labels = raw.get("Labels") or {}
+        image_id = raw.get("ImageID") or ""
+        details = image_details(image_id) if image_id else {}
+        repo_tags = details.get("RepoTags") or []
+        repo_digests = details.get("RepoDigests") or []
+
+        image_ref = raw.get("Image") or ""
+        if not image_ref or image_ref.startswith("sha256:"):
+            image_ref = repo_tags[0] if repo_tags else image_ref
+
+        # The image the *tag* currently points at may differ from the image the
+        # container was started from -- that means "pulled but not recreated".
+        current_image_id = image_id
+        if image_ref and not image_ref.startswith("sha256:") and "<none>" not in image_ref:
+            current_image_id = image_details(image_ref).get("Id") or image_id
+
+        names = [n.lstrip("/") for n in (raw.get("Names") or []) if n]
+        containers.append(
+            {
+                "id": (raw.get("Id") or "")[:12],
+                "name": names[0] if names else (raw.get("Id") or "")[:12],
+                "names": names,
+                "image_ref": image_ref,
+                "image_id": image_id,
+                "current_image_id": current_image_id,
+                "repo_digests": repo_digests,
+                "repo_tags": repo_tags,
+                "image_created": details.get("Created"),
+                "image_size": details.get("Size"),
+                "state": raw.get("State"),
+                "status": raw.get("Status"),
+                "created": raw.get("Created"),
+                "ports": _format_ports(raw.get("Ports")),
+                "compose_project": labels.get(COMPOSE_PROJECT),
+                "compose_service": labels.get(COMPOSE_SERVICE),
+                "compose_workdir": labels.get(COMPOSE_WORKDIR),
+                "compose_config": labels.get(COMPOSE_CONFIG),
+                "ignored_by": _ignored_by_label(labels),
+            }
+        )
+
+    containers.sort(key=lambda c: (c.get("compose_project") or "~", c["name"]))
+    return {
+        "agent_version": AGENT_VERSION,
+        "collected_at": time.time(),
+        "info": host_info,
+        "containers": containers,
+    }
+
+
+class _Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "container-update-agent/" + AGENT_VERSION
+    sys_version = ""
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        if self.server.verbose:
+            sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+    def _send(self, status, payload):
+        body = json.dumps(payload, default=str).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _authorized(self):
+        token = self.server.token
+        if not token:
+            return True
+        header = self.headers.get("Authorization", "")
+        prefix = "Bearer "
+        if not header.startswith(prefix):
+            return False
+        return hmac.compare_digest(header[len(prefix):].strip(), token)
+
+    def do_GET(self):  # noqa: N802 - stdlib naming
+        path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
+
+        if path in ("/healthz", "/"):
+            self._send(200, {"ok": True, "agent_version": AGENT_VERSION})
+            return
+
+        if not self._authorized():
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Bearer realm="container-update-agent"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        client = DockerClient(self.server.docker_endpoint)
+        try:
+            if path == "/v1/containers":
+                self._send(200, collect_snapshot(client))
+            elif path == "/v1/info":
+                self._send(200, {"agent_version": AGENT_VERSION, "info": client.info()})
+            else:
+                self._send(404, {"error": "no such endpoint", "path": path})
+        except DockerError as exc:
+            self._send(503, {"error": str(exc)})
+        except Exception as exc:  # pragma: no cover - defensive
+            self._send(500, {"error": "%s: %s" % (type(exc).__name__, exc)})
+
+
+class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    address_family = socket.AF_INET
+
+
+def serve(token, bind="0.0.0.0", port=DEFAULT_PORT, docker_endpoint=None,
+          verbose=False, certfile=None, keyfile=None):
+    if ":" in bind:
+        _Server.address_family = socket.AF_INET6
+    httpd = _Server((bind, port), _Handler)
+    httpd.token = token
+    httpd.docker_endpoint = docker_endpoint
+    httpd.verbose = verbose
+    if certfile:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certfile, keyfile or certfile)
+        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+    scheme = "https" if certfile else "http"
+    sys.stderr.write(
+        "container-update-agent %s listening on %s://%s:%s (docker=%s)\n"
+        % (AGENT_VERSION, scheme, bind, port, docker_endpoint or DEFAULT_SOCKET)
+    )
+    sys.stderr.flush()
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        thread.join()
+    except KeyboardInterrupt:
+        httpd.shutdown()
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Read-only Docker container update agent")
+    parser.add_argument("--config", help="JSON config file")
+    parser.add_argument("--token", help="shared bearer token (required unless --no-auth)")
+    parser.add_argument("--no-auth", action="store_true", help="disable token auth (loopback only)")
+    parser.add_argument("--bind", default=None, help="bind address (default 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=None, help="port (default %d)" % DEFAULT_PORT)
+    parser.add_argument("--docker", default=None, help="docker socket path or tcp:// endpoint")
+    parser.add_argument("--tls-cert", default=None, help="serve HTTPS with this certificate")
+    parser.add_argument("--tls-key", default=None, help="private key for --tls-cert")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--check", action="store_true", help="print one snapshot and exit")
+    args = parser.parse_args(argv)
+
+    cfg = {}
+    if args.config:
+        try:
+            with open(args.config) as handle:
+                cfg = json.load(handle)
+        except FileNotFoundError:
+            sys.stderr.write("config not found: %s\n" % args.config)
+            return 2
+        except ValueError as exc:
+            sys.stderr.write("invalid config %s: %s\n" % (args.config, exc))
+            return 2
+
+    token = args.token or cfg.get("token") or os.environ.get("AGENT_TOKEN")
+    bind = args.bind or cfg.get("bind") or "0.0.0.0"
+    port = args.port or cfg.get("port") or DEFAULT_PORT
+    docker_endpoint = args.docker or cfg.get("docker_socket") or None
+    certfile = args.tls_cert or cfg.get("tls_cert")
+    keyfile = args.tls_key or cfg.get("tls_key")
+
+    if args.check:
+        snapshot = collect_snapshot(DockerClient(docker_endpoint))
+        json.dump(snapshot, sys.stdout, indent=2, default=str)
+        sys.stdout.write("\n")
+        return 0
+
+    if not token and not args.no_auth:
+        sys.stderr.write("refusing to start without a token (use --token or --no-auth)\n")
+        return 2
+
+    return serve(
+        token if not args.no_auth else None,
+        bind=bind,
+        port=int(port),
+        docker_endpoint=docker_endpoint,
+        verbose=args.verbose or bool(cfg.get("verbose")),
+        certfile=certfile,
+        keyfile=keyfile,
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())
