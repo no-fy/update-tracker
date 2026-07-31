@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · Container updates</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='14'>📦</text></svg>">
+</head>
+<body class="login-page">
+
+<main class="login-shell">
+  <form class="login-card" id="login-form" autocomplete="on">
+    <div class="login-mark" aria-hidden="true">📦</div>
+    <h1>Container updates</h1>
+    <p class="login-lede">Sign in to see what needs updating.</p>
+
+    <label class="stack">
+      <span>Username</span>
+      <input id="username" name="username" autocomplete="username" autofocus required>
+    </label>
+
+    <label class="stack">
+      <span>Password</span>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+    </label>
+
+    <p class="dialog-error" id="error" hidden></p>
+
+    <button class="button primary login-submit" id="submit" type="submit">
+      <span class="spinner" aria-hidden="true"></span>
+      <span class="button-label">Sign in</span>
+    </button>
+  </form>
+
+  <p class="login-foot">Container update dashboard</p>
+</main>
+
+<script>
+(function () {
+  "use strict";
+  var form = document.getElementById("login-form");
+  var error = document.getElementById("error");
+  var submit = document.getElementById("submit");
+
+  form.addEventListener("submit", function (event) {
+    event.preventDefault();
+    error.hidden = true;
+    submit.classList.add("busy");
+    submit.disabled = true;
+
+    fetch("/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: document.getElementById("username").value.trim(),
+        password: document.getElementById("password").value
+      })
+    })
+      .then(function (response) {
+        return response.json().catch(function () { return {}; });
+      })
+      .then(function (body) {
+        if (body && body.ok) {
+          window.location.replace("/");
+          return;
+        }
+        throw new Error((body && body.error) || "Could not sign in.");
+      })
+      .catch(function (err) {
+        error.textContent = err.message;
+        error.hidden = false;
+        submit.classList.remove("busy");
+        submit.disabled = false;
+        document.getElementById("password").select();
+      });
+  });
+})();
+</script>
+</body>
+</html>

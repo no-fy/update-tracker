@@ -275,6 +275,22 @@ def main(argv):
         check("settings never expose the credential",
               "password" not in settings and settings["password_set"] is True)
 
+        section("Sessions and sign-in")
+        sessions = server_mod.SessionStore(ttl_hours=12)
+        session_token = sessions.create("admin")
+        check("a session resolves to its user",
+              sessions.get(session_token)["username"] == "admin")
+        check("an unknown session is nobody", sessions.get("made-up") is None)
+        check("no cookie is nobody", sessions.get(None) is None)
+        check("logout destroys the session",
+              sessions.destroy(session_token) and sessions.get(session_token) is None)
+
+        brief = server_mod.SessionStore(ttl_hours=0)
+        stale = brief.create("admin")
+        check("an expired session is rejected", brief.get(stale) is None)
+        check("two sessions are never the same token",
+              sessions.create("a") != sessions.create("a"))
+
         section("Enrolment")
         store = enroll.EnrollmentStore(config_path)
         item = store.create(name="nas", port=9713)

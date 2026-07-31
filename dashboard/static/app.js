@@ -427,6 +427,12 @@
   function load() {
     return fetch("/api/state", { headers: { Accept: "application/json" } })
       .then(function (response) {
+        // The session ran out, or the server restarted. Go and sign in again
+        // rather than sitting here showing a stale snapshot.
+        if (response.status === 401) {
+          window.location.replace("/login");
+          throw new Error("signed out");
+        }
         if (!response.ok) throw new Error("HTTP " + response.status);
         return response.json();
       })
@@ -464,6 +470,7 @@
       .then(function (info) {
         if (!info) return null;
         state.canAddHosts = info.can_add_hosts;
+        el.signout.hidden = !info.can_add_hosts;
         if (info.needs_setup && !info.env_password) openSetup();
         return info;
       })
@@ -489,6 +496,8 @@
         if (result.error) throw new Error(result.error);
         // The browser has no credentials for the realm yet, so the next request
         // would 401. A reload lets it prompt once, cleanly.
+        // The server signed this browser in as part of saving, so there is
+        // nothing to log into -- just show the dashboard.
         el.setupDialog.close();
         window.location.reload();
       })
@@ -628,6 +637,7 @@
       subtitle: $("subtitle"),
       refresh: $("refresh"),
       theme: $("theme"),
+      signout: $("signout"),
       heroValue: $("hero-value"),
       heroLabel: $("hero-label"),
       heroNote: $("hero-note"),
@@ -672,6 +682,11 @@
     el.hostForm.addEventListener("submit", submitHost);
     el.hostCancel.addEventListener("click", function () { el.hostDialog.close(); });
     el.hostCopy.addEventListener("click", copyCommand);
+    el.signout.addEventListener("click", function () {
+      fetch("/api/logout", { method: "POST" })
+        .then(function () { window.location.replace("/login"); })
+        .catch(function () { window.location.replace("/login"); });
+    });
     el.hostFilter.addEventListener("change", function () {
       state.host = el.hostFilter.value;
       render();

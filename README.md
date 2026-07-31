@@ -36,9 +36,13 @@ Grab `docker-compose.yml` from this repo and:
 docker compose up -d          # http://localhost:8500
 ```
 
-It picks up the Docker socket of the machine it runs on, asks you to choose a
-username and password, and from there **Add host** gives you a command to paste
-on each other machine you want to watch.
+It asks you to choose a username and password, and from there **Add host**
+gives you a command to paste on each machine you want to watch.
+
+To also watch the containers on the machine running the dashboard, you have to
+hand it the Docker socket — see [Watching the machine the dashboard runs
+on](#watching-the-machine-the-dashboard-runs-on). Everything else works without
+it.
 
 The image is published to the GitHub Container Registry for amd64 and arm64, so
 it runs on a NAS or a Pi as happily as on a server:
@@ -84,11 +88,78 @@ a host that can never be read.
 Then it asks you to pick a username and password before anything else. There is
 no default login and no way to skip it from the UI: anyone who can reach the
 page can see every container on every host you add. The password is stored as a
-PBKDF2-SHA256 hash, never in the clear, and the API never returns it.
+PBKDF2-SHA256 hash, never in the clear, and the API never returns it. Choosing
+it signs you straight in — being asked for a password you just set would be a
+silly first impression.
+
+After that you get a proper sign-in page at `/login`, backed by a session
+cookie (`HttpOnly`, `SameSite=Lax`, 12 hours by default —
+`dashboard.session_hours` changes it). Sessions live in memory, so restarting
+the dashboard signs everyone out.
+
+HTTP basic auth still works for `curl`, cron and monitoring, but the server
+never *asks* for it: no `WWW-Authenticate` header is ever sent, which is what
+keeps browsers from popping up their own grey login box.
+
+```bash
+curl -u admin:… http://localhost:8500/api/state    # still fine
+```
 
 A plaintext `dashboard.password` still works if you would rather hand-edit the
 config, and `$CUD_PASSWORD` still overrides both — setting either one skips the
-prompt.
+first-run prompt but not the login page.
+
+## Watching the machine the dashboard runs on
+
+This is the one case that needs a decision from you, because the dashboard has
+to read `/var/run/docker.sock` — and how it gets that depends on how you run it.
+
+**From a checkout**, nothing to configure. The user running `./cud serve` needs
+read access to the socket, which normally means being in the `docker` group:
+
+```bash
+sudo usermod -aG docker "$USER"   # then log out and back in
+groups | grep docker              # confirm it took
+./cud serve                       # registers the local socket by itself
+```
+
+**In a container**, the socket is not there unless you put it there, and the
+container user must be in the group that owns it. Both lines are already in
+`docker-compose.yml`, commented out — uncomment them and fill in the group id:
+
+```bash
+stat -c %g /var/run/docker.sock   # commonly 999 or 998, but check — it varies
+```
+
+```yaml
+services:
+  dashboard:
+    volumes:
+      - cud-config:/config
+      - /var/run/docker.sock:/var/run/docker.sock:ro    # ← uncomment
+    group_add:
+      - "999"                                           # ← put the number here
+```
+
+Then `docker compose up -d`. The `:ro` is not decoration: the dashboard only
+ever issues GETs, and read-only mounting means a bug cannot become a container
+being stopped.
+
+Docker Desktop on macOS and Windows is the exception — the socket has no
+meaningful group there. Use `group_add: ["0"]`, or skip the local host and
+enrol the machine like any other.
+
+**How to tell it worked.** The host list shows *This machine*, online, with
+your containers under it.
+
+| What you see | What it means |
+|---|---|
+| *This machine*, online | Working. |
+| *This machine*, offline: `cannot connect to Docker at /var/run/docker.sock: [Errno 13] Permission denied` | The mount is there but `group_add` is wrong or missing. Re-run `stat -c %g`. |
+| No local host at all | The socket was not mounted. The dashboard will not invent a host it cannot read. |
+
+To watch a machine that is *not* the one running the dashboard, do not mount
+anything — use **Add host** below.
 
 ## Adding a host from the dashboard
 
@@ -209,6 +280,7 @@ agent tokens.
     "port": 8500,
     "username": null,
     "password": null,
+    "session_hours": 12,
     "refresh_interval_minutes": 30,
     "registry_cache_hours": 6,
     "include_stopped": true
@@ -231,6 +303,7 @@ Notable settings:
   works if you set it by hand. Also readable from `$CUD_PASSWORD`.
 - **`dashboard.username`** — the username that must accompany it. Left unset,
   any username is accepted, which is how this behaved before usernames existed.
+- **`dashboard.session_hours`** — how long a sign-in lasts, 12 by default.
 - **`registries`** — credentials for private images, keyed by registry host.
   Use `docker.io` for Docker Hub. Without these, private images report
   *Check failed*.
@@ -357,6 +430,8 @@ tokens are never returned.
 | GET | `/api/enrollments/<id>` | one enrolment, to watch for the agent checking in |
 | DELETE | `/api/enrollments/<id>` | cancel one |
 | POST | `/api/enroll` | **the agent calls this** — no password, enrolment token instead |
+| POST | `/api/login` | sign in, sets the session cookie |
+| POST | `/api/logout` | sign out, clears it |
 | GET | `/api/setup` | whether credentials still need choosing |
 | POST | `/api/setup` | set the username and password, once |
 | GET | `/api/meta` | version, config path, effective settings |
@@ -415,6 +490,6 @@ dashboard/registry.py     tag → digest, via the OCI distribution API
 dashboard/collector.py    polls hosts, classifies containers
 dashboard/server.py       web server and JSON API
 dashboard/enroll.py       enrolment tokens, and the agent's self-registration
-dashboard/static/         the UI (no build step)
+dashboard/static/         the UI and the sign-in page (no build step)
 tests/                    fake Docker daemon + smoke test
 ```

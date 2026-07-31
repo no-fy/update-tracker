@@ -10,7 +10,10 @@ import argparse
 import base64
 import functools
 import hmac
+import http.cookies
 import http.server
+import secrets
+import time
 import json
 import mimetypes
 import os
@@ -60,6 +63,54 @@ def sanitise_host(host):
     return out
 
 
+SESSION_COOKIE = "cud_session"
+
+
+class SessionStore(object):
+    """Signed-in browsers, in memory.
+
+    A restart signs everyone out, which is the right trade for a tool with no
+    database: nothing about a session is worth persisting.
+    """
+
+    def __init__(self, ttl_hours=12):
+        self.ttl = float(ttl_hours) * 3600
+        self._sessions = {}
+        self._lock = threading.Lock()
+
+    def create(self, username):
+        token = secrets.token_urlsafe(32)
+        with self._lock:
+            self._prune()
+            self._sessions[token] = {"username": username, "expires": time.time() + self.ttl}
+        return token
+
+    def get(self, token):
+        if not token:
+            return None
+        with self._lock:
+            session = self._sessions.get(token)
+            if not session:
+                return None
+            if session["expires"] < time.time():
+                del self._sessions[token]
+                return None
+            return session
+
+    def destroy(self, token):
+        with self._lock:
+            return self._sessions.pop(token, None) is not None
+
+    def clear(self):
+        with self._lock:
+            self._sessions.clear()
+
+    def _prune(self):
+        now = time.time()
+        for token in [t for t, s in self._sessions.items() if s["expires"] < now]:
+            del self._sessions[token]
+
+
 def sanitise_settings(settings):
     """Everything about the dashboard except the credential itself."""
     out = {k: v for k, v in (settings or {}).items() if k != "password"}
@@ -87,10 +138,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _cookie(self, name):
+        raw = self.headers.get("Cookie")
+        if not raw:
+            return None
+        try:
+            jar = http.cookies.SimpleCookie(raw)
+        except http.cookies.CookieError:
+            return None
+        morsel = jar.get(name)
+        return morsel.value if morsel else None
+
+    def _session(self):
+        return self.server.sessions.get(self._cookie(SESSION_COOKIE))
+
     def _authorised(self):
         password = self.server.password
         if not password:
             return True
+        if self._session():
+            return True
+        # Basic is still accepted so `curl -u`, cron jobs and monitoring keep
+        # working. Browsers never see a challenge for it, so they never get the
+        # native popup -- they get the login page instead.
         header = self.headers.get("Authorization", "")
         if header.startswith("Basic "):
             try:
@@ -107,10 +177,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return False
 
     def _challenge(self):
-        self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="Container updates"')
+        """401 without WWW-Authenticate: no browser popup, just a JSON no."""
+        self._json(401, {"error": "not signed in"})
+
+    def _redirect(self, location):
+        self.send_response(302)
+        self.send_header("Location", location)
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def _set_session_cookie(self, token):
+        cookie = http.cookies.SimpleCookie()
+        cookie[SESSION_COOKIE] = token
+        cookie[SESSION_COOKIE]["path"] = "/"
+        cookie[SESSION_COOKIE]["httponly"] = True
+        # Lax keeps the cookie off cross-site POSTs, which is the CSRF cover
+        # this app needs. Secure is not set: the dashboard is usually plain
+        # HTTP on a LAN, and a Secure cookie would simply never be sent.
+        cookie[SESSION_COOKIE]["samesite"] = "Lax"
+        cookie[SESSION_COOKIE]["max-age"] = int(self.server.sessions.ttl)
+        self.send_header("Set-Cookie", cookie[SESSION_COOKIE].OutputString())
+
+    def _clear_session_cookie(self):
+        self.send_header(
+            "Set-Cookie",
+            "%s=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" % SESSION_COOKIE,
+        )
+
+    def _json_with_session(self, status, payload, token=None, clear=False):
+        body = json.dumps(payload, default=str).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if token:
+            self._set_session_cookie(token)
+        if clear:
+            self._clear_session_cookie()
+        self.end_headers()
+        self.wfile.write(body)
 
     def _read_body(self):
         length = int(self.headers.get("Content-Length") or 0)
@@ -148,15 +253,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(200, {"ok": True, "version": VERSION})
             return
 
+        # The login page needs its stylesheet before anyone is signed in, and
+        # nothing in here is a secret.
+        if path.startswith("/static/"):
+            self._serve_static(path[len("/static/"):])
+            return
+
+        if path == "/login":
+            if not self.server.password:
+                self._redirect("/")  # nothing to log into yet
+            elif self._authorised():
+                self._redirect("/")
+            else:
+                self._serve_static("login.html")
+            return
+
         if not self._authorised():
-            self._challenge()
+            # A browser asking for a page gets the page; an API caller gets JSON.
+            if path == "/" or "text/html" in (self.headers.get("Accept") or ""):
+                self._redirect("/login")
+            else:
+                self._challenge()
             return
 
         if path == "/":
             self._serve_static("index.html")
-            return
-        if path.startswith("/static/"):
-            self._serve_static(path[len("/static/"):])
             return
 
         if path == "/api/state":
@@ -220,8 +341,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_enroll_callback()
             return
 
+        if path == "/api/login":
+            self._handle_login()
+            return
+
         if not self._authorised():
             self._challenge()
+            return
+
+        if path == "/api/logout":
+            self.server.sessions.destroy(self._cookie(SESSION_COOKIE))
+            self._json_with_session(200, {"ok": True}, clear=True)
             return
 
         if path == "/api/refresh":
@@ -253,6 +383,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         self._json(404, {"error": "no such endpoint", "path": path})
 
+    # -- signing in --------------------------------------------------------
+
+    def _handle_login(self):
+        if not self.server.password:
+            self._json(409, {"error": "no credentials are configured yet"})
+            return
+
+        body = self._read_body()
+        username = (body.get("username") or "").strip()
+        password = body.get("password") or ""
+
+        expected_user = self.server.username
+        user_ok = True if not expected_user else hmac.compare_digest(username, expected_user)
+        # Check the password either way, so a wrong username and a wrong
+        # password take the same time to fail.
+        password_ok = config_mod.verify_password(self.server.password, password)
+
+        if not (user_ok and password_ok):
+            self._json(401, {"error": "That username and password do not match."})
+            return
+
+        token = self.server.sessions.create(username or "admin")
+        self._json_with_session(200, {"ok": True, "username": username or "admin"}, token=token)
+
     # -- first-run setup ---------------------------------------------------
 
     def _handle_setup(self):
@@ -278,10 +432,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         settings["password"] = config_mod.hash_password(password)
         config_mod.save_config(config, config_path)
 
-        # Take effect immediately: the next request is already authenticated.
+        # Take effect immediately, and sign this browser in: having just chosen
+        # the password, being asked for it is a silly first impression.
         self.server.username = username
         self.server.password = settings["password"]
-        self._json(200, {"ok": True, "username": username})
+        token = self.server.sessions.create(username)
+        self._json_with_session(200, {"ok": True, "username": username}, token=token)
 
     # -- adding hosts ------------------------------------------------------
 
@@ -414,6 +570,7 @@ def build_server(config_path=None, bind=None, port=None, verbose=False):
     httpd.load_config = loader
     httpd.password = settings.get("password") or os.environ.get("CUD_PASSWORD")
     httpd.username = settings.get("username")
+    httpd.sessions = SessionStore(ttl_hours=float(settings.get("session_hours", 12)))
     httpd.enrollments = enroll_mod.EnrollmentStore(
         config_path, on_registered=lambda item: poller.refresh_async()
     )
