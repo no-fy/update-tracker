@@ -569,6 +569,14 @@ def main(argv):
         check("an unsupported manager is refused",
               _raises(osupdate.UpdateError, osupdate.build_command, "rpm", ["x"]))
 
+        able = osupdate.capability()
+        check("capability reports whether it is the same machine",
+              "same_machine" in able and "mode" in able, sorted(able))
+        check("host pid namespace detection never raises",
+              isinstance(osupdate.in_host_pid_namespace(), bool))
+        check("a refusal always carries a reason",
+              able["can_update"] or bool(able["reason"]))
+
         section("Local host by default")
         shared = config_mod.load_config(os.path.join(workdir, "nope-1.json"))[0]
         shared.setdefault("hosts", []).append({"name": "leak", "mode": "local"})

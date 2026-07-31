@@ -445,6 +445,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 packages=body.get("packages"),
                 severity=body.get("severity"),
             )
+        except collector.OsUpdateRefused as exc:
+            self._json(400, {"error": str(exc)})
+            return
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")
             try:

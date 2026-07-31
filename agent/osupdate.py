@@ -44,13 +44,30 @@ def _host_root():
     return os.environ.get("CUD_HOST_ROOT") or "/"
 
 
+def in_host_pid_namespace():
+    """True when PID 1 is the host's init rather than this container's.
+
+    Compared by namespace link rather than by reading /proc/1/ns/mnt, which is
+    root-only -- an unprivileged process would otherwise conclude "no host
+    namespaces" when the real problem is that it is unprivileged.
+    """
+    try:
+        return os.readlink("/proc/1/ns/mnt") != os.readlink("/proc/self/ns/mnt")
+    except OSError:
+        return False
+
+
 def execution_mode():
     """How, if at all, this agent can reach the host's package manager."""
     if _host_root() in ("/", ""):
         return "direct"  # the agent is on the host itself
-    if os.path.exists("/proc/1/ns/mnt") and _which("nsenter"):
-        return "nsenter"
-    return None
+    if os.geteuid() != 0:
+        return None
+    if not in_host_pid_namespace():
+        return None
+    if not _which("nsenter"):
+        return None
+    return "nsenter"
 
 
 def _which(binary):
@@ -61,26 +78,83 @@ def _which(binary):
     return None
 
 
+def _read_first_line(path):
+    try:
+        with open(path, "r") as handle:
+            return handle.read().strip().split("\n")[0]
+    except OSError:
+        return ""
+
+
+def same_machine():
+    """Is the system we would write to the same one we are reading from?
+
+    On Docker Desktop, --pid=host puts you in *its* Linux VM, while -v /:/host
+    is the machine you actually care about. Installing then upgrades the wrong
+    system entirely, so compare machine-ids before offering to.
+
+    None means "cannot tell", which is not treated as a failure.
+    """
+    if execution_mode() != "nsenter":
+        return True
+    read_id = _read_first_line(os.path.join(_host_root(), "etc/machine-id"))
+    if not read_id:
+        return None
+    try:
+        result = subprocess.run(
+            _wrap_for_host(["cat", "/etc/machine-id"], {}),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    run_id = (result.stdout or b"").decode("utf-8", "replace").strip()
+    if not run_id:
+        return None
+    return read_id == run_id
+
+
 def capability():
-    """What the dashboard should show, without trying anything."""
+    """What the dashboard should show, without changing anything."""
     mode = execution_mode()
+    matches = same_machine() if (updates_allowed() and mode) else True
+    can_update = bool(updates_allowed() and mode and matches is not False)
+    reason = _reason(mode)
+    if reason is None and matches is False:
+        reason = (
+            "The packages listed are read from this host's filesystem, but "
+            "commands would run on a different machine -- on Docker Desktop, "
+            "--pid=host is Docker's own Linux VM, not the machine you mounted. "
+            "Installing from here would upgrade the wrong system, so it is "
+            "disabled. Run the agent on the machine itself to install updates."
+        )
     return {
         "allowed": updates_allowed(),
         "mode": mode,
-        "can_update": bool(updates_allowed() and mode),
-        "reason": _reason(mode),
+        "can_update": can_update,
+        "same_machine": matches,
+        "reason": reason,
     }
 
 
 def _reason(mode):
+    """Say which condition actually failed, not a generic 'add these flags'."""
     if not updates_allowed():
         return ("This agent was started with CUD_ALLOW_UPDATES=0, so it only "
                 "reports updates and will not install them.")
-    if mode is None:
-        return ("The agent cannot reach the host's package manager. Re-run it "
-                "with --privileged --pid=host so it can run commands in the "
-                "host's namespaces.")
-    return None
+    if mode is not None:
+        return None
+    if not in_host_pid_namespace():
+        return ("This agent shares no namespaces with the host, so it cannot "
+                "run the host's package manager. Re-run it with --pid=host "
+                "--privileged.")
+    if os.geteuid() != 0:
+        return ("This agent has the host's namespaces but is running as uid %d. "
+                "Entering them needs root, so it cannot install updates."
+                % os.geteuid())
+    if not _which("nsenter"):
+        return ("nsenter is missing from this image, so the agent cannot run "
+                "commands in the host's namespaces.")
+    return "The agent cannot reach the host's package manager."
 
 
 def build_command(manager, packages):
@@ -159,11 +233,11 @@ class Runner(object):
             return [self._jobs[i].snapshot() for i in self._order[-limit:] if i in self._jobs]
 
     def start(self, manager, requested, upgradable, on_finish=None):
-        if not updates_allowed():
-            raise UpdateError(_reason(execution_mode()))
-        mode = execution_mode()
-        if mode is None:
-            raise UpdateError(_reason(mode))
+        # Re-checked here, not just in the UI: the API is reachable directly.
+        able = capability()
+        if not able["can_update"]:
+            raise UpdateError(able["reason"] or "This agent cannot install updates.")
+        mode = able["mode"]
 
         upgradable = set(upgradable or [])
         packages = []

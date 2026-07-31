@@ -129,19 +129,21 @@ machine with nothing else set. **No group id to look up, no `group_add`, no
 `user:`, no environment variable.** Delete the socket line if you only want to
 watch remote hosts.
 
-There is no `PUID`/`PGID` to set either, and the container is not running as
-root to get away with it. It starts as root, reads the group that owns the
-socket you mounted — whatever number that is on your host — joins it, takes
-ownership of the config volume, and then drops to an unprivileged user with
-`su-exec`. The server itself runs as uid 10001 for its whole life:
+There is no `PUID`/`PGID` to set either. The container starts as root, reads
+the group that owns the socket you mounted — whatever number that is on your
+host — joins it, takes ownership of the config volume, and then drops to an
+unprivileged user with `su-exec`.
 
-```console
-$ docker compose exec dashboard ps -o user,args
-USER     COMMAND
-cud      python3 /app/cud serve
+**The exception is installing OS updates.** Entering the host's namespaces
+needs root, so when the container has them (`pid: host`) and updates are not
+switched off, it stays root and says so in the log:
+
+```
+note: staying root so OS updates can run on the host (set CUD_ALLOW_UPDATES=0 to drop to cud)
 ```
 
-If you would rather it never start as root, set `user:` yourself — the
+Set `CUD_ALLOW_UPDATES=0`, or remove `pid: host`, and it drops to uid 10001 for
+the rest of its life as before. Setting `user:` yourself also works — the
 entrypoint sees it is not root, changes nothing, and leaves the socket group to
 you via `group_add`.
 
@@ -306,6 +308,15 @@ precise about what it needs and what it will not do:
 To take this away from an agent, add `-e CUD_ALLOW_UPDATES=0`, or drop
 `--pid=host --privileged`. Either makes it report-only, and the dashboard
 explains why the buttons are absent instead of failing when you press them.
+
+**Docker Desktop cannot do this, and the agent will tell you so.** On Mac and
+Windows, `--pid=host` puts you inside Docker's own Linux VM, while `-v /:/host`
+is the machine you actually mean — so the packages listed and the machine that
+would be changed are two different systems. The agent compares
+`/etc/machine-id` on both sides and refuses when they differ, rather than
+upgrading the wrong box. Reporting still works fine; only installing is
+disabled. On a normal Linux host the two are the same machine and it just
+works.
 
 `docker compose up -d` gives the dashboard's own machine the same ability
 through `pid: host` and `privileged: true` in `docker-compose.yml`. Remove

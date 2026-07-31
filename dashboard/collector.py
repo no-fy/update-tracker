@@ -146,6 +146,10 @@ def _poll_os(host, timeout):
         return {"available": False, "error": "%s: %s" % (type(exc).__name__, exc)}
 
 
+class OsUpdateRefused(Exception):
+    """The agent declined, for a reason worth showing the user verbatim."""
+
+
 def start_os_update(host, packages=None, severity=None, timeout=30):
     """Ask a host's agent to install updates. Raises on refusal."""
     if host.get("mode") == "local":
@@ -159,10 +163,13 @@ def start_os_update(host, packages=None, severity=None, timeout=30):
                          if u.get("severity") == severity]
         elif requested is None:
             requested = sorted(upgradable)
-        job = osupdate.RUNNER.start(
-            snapshot.get("manager"), requested, upgradable,
-            on_finish=lambda job: agent_module.os_updates(force=True),
-        )
+        try:
+            job = osupdate.RUNNER.start(
+                snapshot.get("manager"), requested, upgradable,
+                on_finish=lambda job: agent_module.os_updates(force=True),
+            )
+        except osupdate.UpdateError as exc:
+            raise OsUpdateRefused(str(exc))
         return job.snapshot()
 
     scheme = "https" if host.get("tls") else "http"
