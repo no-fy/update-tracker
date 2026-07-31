@@ -26,14 +26,14 @@ if __package__ in (None, ""):  # allow `python3 dashboard/server.py`
     from dashboard import (
         collector,
         config as config_mod,
-        provision as provision_mod,
+        enroll as enroll_mod,
         registry as registry_mod,
     )
 else:
     from . import (
         collector,
         config as config_mod,
-        provision as provision_mod,
+        enroll as enroll_mod,
         registry as registry_mod,
     )
 
@@ -193,20 +193,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             )
             return
 
-        if path == "/api/keys":
-            self._json(200, {"keys": self.server.provisioner.keys.names()})
+        if path == "/api/enrollments":
+            self._json(200, {"enrollments": self.server.enrollments.list()})
             return
 
-        if path == "/api/jobs":
-            self._json(200, {"jobs": self.server.provisioner.recent()})
-            return
-
-        if path.startswith("/api/jobs/"):
-            job = self.server.provisioner.get(urllib.parse.unquote(path[len("/api/jobs/"):]))
-            if not job:
-                self._json(404, {"error": "no such job"})
+        if path.startswith("/api/enrollments/"):
+            item = self.server.enrollments.get(
+                urllib.parse.unquote(path[len("/api/enrollments/"):])
+            )
+            if not item:
+                self._json(404, {"error": "no such enrolment"})
                 return
-            self._json(200, job.snapshot())
+            self._json(200, item.snapshot())
             return
 
         self._json(404, {"error": "no such endpoint", "path": path})
@@ -214,6 +212,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
+
+        # The agent calls this one, and it has no dashboard password. Its
+        # single-use enrolment token is the credential, and the dashboard still
+        # verifies the agent by connecting back before believing any of it.
+        if path == "/api/enroll":
+            self._handle_enroll_callback()
+            return
 
         if not self._authorised():
             self._challenge()
@@ -228,8 +233,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_setup()
             return
 
-        if path == "/api/hosts":
-            self._handle_add_host()
+        if path == "/api/enrollments":
+            self._handle_new_enrollment()
             return
 
         if path.startswith("/api/hosts/") and path.endswith("/enabled"):
@@ -280,7 +285,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # -- adding hosts ------------------------------------------------------
 
-    def _handle_add_host(self):
+    def _dashboard_url(self):
+        """The URL the remote host should call back on.
+
+        Taken from the Host header, because that is by definition an address
+        that reached this dashboard from somewhere -- a better guess than
+        whatever the server happens to be bound to.
+        """
+        host = self.headers.get("Host")
+        if not host:
+            bound, port = self.server.server_address[:2]
+            if bound in ("0.0.0.0", "::", ""):
+                bound = socket.gethostname()
+            host = "%s:%s" % (bound, port)
+        return "http://%s" % host
+
+    def _handle_new_enrollment(self):
         if not self.server.password:
             self._json(
                 403,
@@ -293,11 +313,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         body = self._read_body()
         try:
-            job = self.server.provisioner.start(body)
-        except provision_mod.ProvisionError as exc:
+            enrollment = self.server.enrollments.create(
+                name=body.get("name"),
+                port=body.get("port") or enroll_mod.DEFAULT_AGENT_PORT,
+                ttl_minutes=body.get("ttl_minutes") or enroll_mod.DEFAULT_TTL_MINUTES,
+            )
+        except enroll_mod.EnrollError as exc:
             self._json(400, {"error": str(exc)})
             return
-        self._json(202, job.snapshot())
+
+        url = (body.get("dashboard_url") or "").strip() or self._dashboard_url()
+        payload = enrollment.snapshot(include_token=True)
+        payload["command"] = enroll_mod.agent_command(enrollment, url)
+        payload["dashboard_url"] = url
+        self._json(201, payload)
+
+    def _handle_enroll_callback(self):
+        body = self._read_body()
+        source = self.client_address[0]
+        try:
+            enrollment = self.server.enrollments.claim(body.get("token"), source, body)
+        except enroll_mod.EnrollError as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        self.server.poller.refresh_async()
+        self._json(200, {"ok": True, "name": enrollment.host.get("name")})
 
     def do_DELETE(self):  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
@@ -307,10 +347,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._challenge()
             return
 
-        if path.startswith("/api/keys/"):
-            name = urllib.parse.unquote(path[len("/api/keys/"):])
-            removed = self.server.provisioner.keys.delete(name)
-            self._json(200 if removed else 404, {"removed": removed, "key": name})
+        if path.startswith("/api/enrollments/"):
+            item_id = urllib.parse.unquote(path[len("/api/enrollments/"):])
+            removed = self.server.enrollments.delete(item_id)
+            self._json(200 if removed else 404, {"removed": removed, "id": item_id})
             return
 
         if path.startswith("/api/hosts/"):
@@ -374,8 +414,8 @@ def build_server(config_path=None, bind=None, port=None, verbose=False):
     httpd.load_config = loader
     httpd.password = settings.get("password") or os.environ.get("CUD_PASSWORD")
     httpd.username = settings.get("username")
-    httpd.provisioner = provision_mod.Provisioner(
-        config_path, on_finish=lambda job: poller.refresh_async()
+    httpd.enrollments = enroll_mod.EnrollmentStore(
+        config_path, on_registered=lambda item: poller.refresh_async()
     )
     httpd.verbose = verbose
     return httpd, config, config_path

@@ -3,10 +3,10 @@
 A web dashboard that shows which Docker containers are running an outdated
 image, across as many servers as you like.
 
-- **One command per server.** `./setup-host.py root@nas.lan` connects over SSH,
-  checks the box can run the agent, installs it as a hardened systemd service
-  with a freshly generated token, starts it, verifies the dashboard can actually
-  reach it, and registers it. No manual config file editing.
+- **One command per server, and the dashboard never logs in.** It hands you a
+  `docker run` to paste on the host. The agent starts there, registers itself,
+  and the dashboard verifies it by connecting back before saving anything. No
+  SSH key ever reaches the dashboard, and no config file editing.
 - **No pulls.** "Needs an update" is decided by asking the registry what digest
   the tag points at right now and comparing it to the digest the container is
   running. One HTTP request per unique image, not one image download.
@@ -33,11 +33,12 @@ The dashboard ships as a container image, which is the easiest way to run it.
 Grab `docker-compose.yml` from this repo and:
 
 ```bash
-docker compose up -d                                    # http://localhost:8500
-
-docker compose run --rm dashboard add root@nas.lan      # a server, over SSH
-docker compose run --rm dashboard add deploy@10.0.0.5:2222   # other SSH port
+docker compose up -d          # http://localhost:8500
 ```
+
+It picks up the Docker socket of the machine it runs on, asks you to choose a
+username and password, and from there **Add host** gives you a command to paste
+on each other machine you want to watch.
 
 The image is published to the GitHub Container Registry for amd64 and arm64, so
 it runs on a NAS or a Pi as happily as on a server:
@@ -60,12 +61,10 @@ library are the only requirements.
 ```bash
 cd container-update-dashboard
 
-./cud add --local              # the machine the dashboard runs on
-./cud add root@nas.lan         # a remote server, over SSH
-./cud add deploy@10.0.0.5:2222 # non-standard SSH port
-
-./cud serve                    # http://localhost:8500
+./cud serve                    # http://localhost:8500, registers itself
 ./cud check                    # the same report, in the terminal
+
+./cud add root@nas.lan         # optional: push an agent over SSH instead
 ```
 
 This is the better path if you want the dashboard to watch its own machine,
@@ -93,31 +92,51 @@ prompt.
 
 ## Adding a host from the dashboard
 
-**Add host** takes an SSH destination and a private key, then runs the same
-provisioning `./setup-host.py` does: connect, check the host, install the agent
-as a hardened systemd service, verify it answers, register it. The installer's
-output streams into the dialog as it goes, so a failure tells you which step
-broke rather than just "failed".
+**Add host** gives you one command to run on the machine you want to watch. The
+dashboard never logs into that machine, never holds an SSH key, and never has
+credentials for anything but itself.
 
-Because the browser cannot answer prompts, this path is stricter than the CLI:
+```bash
+docker run -d --name container-update-agent --restart unless-stopped \
+  -v /var/run/docker.sock:/var/run/docker.sock:ro \
+  -p 9713:9713 \
+  -e CUD_AGENT_TOKEN=… \
+  -e CUD_ENROLL_URL=http://your-dashboard:8500/api/enroll \
+  -e CUD_ENROLL_TOKEN=… \
+  ghcr.io/no-fy/update-tracker-agent:latest
+```
 
-- The key must have **no passphrase**, and it is rejected with an explanation if
-  it does. Paste the private key, not the `.pub`.
-- **sudo must not ask for a password.** Connect as root, or give the user
-  passwordless sudo. Otherwise the job stops with that as the error instead of
-  hanging on a prompt you cannot see.
-- The host key is accepted on first contact (`StrictHostKeyChecking=accept-new`),
-  because there is no way to confirm a fingerprint from a web form. The CLI is
-  unchanged and still strict.
+The agent starts, registers itself with the dashboard, and the host appears.
+You do not type an address anywhere: the dashboard takes it from where the
+call came from.
 
-Keys are written to `config/keys/`, directory `0700` and each file `0600`, never
-into `config.json` and never returned by the API. By default a key is used once
-and deleted the moment the job finishes; tick **keep this key** only if you want
-it retained to manage that host later. A key is only ever needed to *install* an
-agent — once a host is registered the dashboard talks to it over HTTP with a
-bearer token, so keeping one is optional.
+How it stays honest:
 
-One install runs at a time, which keeps config writes serialised.
+- **Two separate secrets.** The enrolment token authorises one registration;
+  the agent token is what the dashboard uses to poll afterwards. Neither is
+  reusable as the other.
+- **Single use, and it expires.** An hour by default. Registering burns it
+  immediately — a replay gets *"already-used enrolment token"* even if the
+  registration that burned it went on to fail.
+- **A claim is not believed.** Before writing anything, the dashboard connects
+  back to the agent with the agent token and requires a valid answer. A host
+  that cannot be reached is not registered, and the token is spent regardless.
+- **In memory only.** Pending enrolments never touch the disk, so a restart
+  cancels them rather than leaving unclaimed secrets lying around.
+- **The token is shown once**, to the person who generated it. It is not in
+  `GET /api/enrollments`.
+
+`POST /api/enroll` is the one endpoint that does not need the dashboard
+password — the agent has no reason to know it. The enrolment token is its
+credential, and the connect-back is the proof.
+
+If the host is behind NAT or has several addresses, set
+`-e CUD_ADVERTISE_ADDRESS=10.0.0.4` and the agent will ask to be registered on
+that address instead of the one the dashboard sees.
+
+Hosts without Docker still work the old way, from a terminal:
+`./setup-host.py root@nas.lan` installs the agent as a systemd service over
+SSH. That path is unchanged and is not exposed to the browser.
 
 ## What the statuses mean
 
@@ -296,9 +315,10 @@ dashboard is deployed.
 ### How the image is built
 
 `.github/workflows/docker.yml` runs the offline smoke test on Python 3.12, and
-only then builds `linux/amd64` and `linux/arm64` and pushes to
-`ghcr.io/no-fy/update-tracker`. Pull requests build the image to prove the
-Dockerfile still works but publish nothing.
+only then builds `linux/amd64` and `linux/arm64` for **both** images —
+`ghcr.io/no-fy/update-tracker` and `ghcr.io/no-fy/update-tracker-agent` — and
+pushes them. Pull requests build to prove the Dockerfiles still work but
+publish nothing.
 
 | Trigger | Tags |
 |---|---|
@@ -332,18 +352,19 @@ tokens are never returned.
 | GET | `/api/hosts` | configured hosts, tokens redacted |
 | POST | `/api/hosts/<name>/enabled` | `{"enabled": false}` to pause a host |
 | DELETE | `/api/hosts/<name>` | unregister a host |
-| POST | `/api/hosts` | install an agent on a host and register it (returns a job) |
-| GET | `/api/jobs/<id>` | that job's status and streamed output |
-| GET | `/api/keys` | names of stored SSH keys — never the key material |
-| DELETE | `/api/keys/<name>` | forget a stored key |
+| POST | `/api/enrollments` | mint an enrolment and return the command to run |
+| GET | `/api/enrollments` | pending and finished enrolments, tokens omitted |
+| GET | `/api/enrollments/<id>` | one enrolment, to watch for the agent checking in |
+| DELETE | `/api/enrollments/<id>` | cancel one |
+| POST | `/api/enroll` | **the agent calls this** — no password, enrolment token instead |
 | GET | `/api/setup` | whether credentials still need choosing |
 | POST | `/api/setup` | set the username and password, once |
 | GET | `/api/meta` | version, config path, effective settings |
 | GET | `/healthz` | unauthenticated liveness check |
 
-`POST /api/setup` is refused once credentials exist, and `POST /api/hosts` is
-refused until they do — an unauthenticated dashboard will not run SSH for
-anyone who can reach the port.
+`POST /api/setup` is refused once credentials exist, and `POST /api/enrollments`
+is refused until they do — an unauthenticated dashboard will not hand out
+enrolment tokens to whoever can reach the port.
 
 The agent's own API is `/healthz` (open) plus `/v1/containers` and `/v1/info`
 (bearer token).
@@ -386,14 +407,14 @@ python3 tests/fake_docker.py /tmp/fake.sock &
 cud                       CLI: serve, check, hosts, add, remove
 setup-host.py             SSH provisioner for a remote host
 Dockerfile                the dashboard as a container
+Dockerfile.agent          the agent as a container, for enrolment
 docker-compose.yml        socket mount and password, commented out
 .github/workflows/        test, then build and push the image to ghcr.io
 agent/agent.py            the agent — one stdlib-only file, also imported for local hosts
 dashboard/registry.py     tag → digest, via the OCI distribution API
 dashboard/collector.py    polls hosts, classifies containers
 dashboard/server.py       web server and JSON API
-dashboard/provision.py    runs setup-host.py as a background job for the UI
-dashboard/keystore.py     0600 storage for SSH keys, never exposed by the API
+dashboard/enroll.py       enrolment tokens, and the agent's self-registration
 dashboard/static/         the UI (no build step)
 tests/                    fake Docker daemon + smoke test
 ```

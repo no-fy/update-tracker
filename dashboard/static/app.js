@@ -500,87 +500,89 @@
 
   // ---- adding a host -----------------------------------------------------
 
+  var enrollTimer = null;
+
   function openHostDialog() {
     if (!state.canAddHosts) {
       openSetup();
       return;
     }
-    hide(el.hostError);
-    hide(el.hostLog);
-    el.hostLog.textContent = "";
-    el.hostSubmit.disabled = false;
-    loadStoredKeys();
+    resetHostDialog();
     if (typeof el.hostDialog.showModal === "function") el.hostDialog.showModal();
   }
 
-  function loadStoredKeys() {
-    fetch("/api/keys")
-      .then(function (r) { return r.json(); })
-      .then(function (data) {
-        var keys = (data && data.keys) || [];
-        el.storedKeyWrap.hidden = keys.length === 0;
-        el.storedKey.innerHTML = '<option value="">Paste a new key</option>';
-        keys.forEach(function (name) {
-          var option = document.createElement("option");
-          option.value = name;
-          option.textContent = name;
-          el.storedKey.appendChild(option);
-        });
-      })
-      .catch(function () { el.storedKeyWrap.hidden = true; });
+  function resetHostDialog() {
+    if (enrollTimer) { clearTimeout(enrollTimer); enrollTimer = null; }
+    hide(el.hostError);
+    el.hostStep1.hidden = false;
+    el.hostStep2.hidden = true;
+    el.hostCopy.hidden = true;
+    el.hostSubmit.hidden = false;
+    el.hostSubmit.disabled = false;
+    el.hostCommand.textContent = "";
   }
 
   function submitHost(event) {
     event.preventDefault();
     hide(el.hostError);
-    var payload = {
-      target: el.hostTarget.value.trim(),
-      ssh_key: el.hostKey.value,
-      stored_key: el.storedKey.value,
-      name: el.hostName.value.trim(),
-      port: el.hostPort.value,
-      remember_key: el.hostRemember.checked
-    };
     el.hostSubmit.disabled = true;
-    el.hostLog.hidden = false;
-    el.hostLog.textContent = "Connecting…";
-    postJSON("/api/hosts", payload)
-      .then(function (job) {
-        if (job.error) throw new Error(job.error);
-        // The key has left the browser; do not keep it in the DOM.
-        el.hostKey.value = "";
-        pollJob(job.id);
+    postJSON("/api/enrollments", {
+      name: el.hostName.value.trim(),
+      port: el.hostPort.value
+    })
+      .then(function (enrollment) {
+        if (enrollment.error) throw new Error(enrollment.error);
+        showCommand(enrollment);
+        watchEnrollment(enrollment.id);
       })
       .catch(function (err) {
-        hide(el.hostLog);
-        showError(el.hostError, err.message || "Could not start the install.");
+        showError(el.hostError, err.message || "Could not create an enrolment.");
         el.hostSubmit.disabled = false;
       });
   }
 
-  function pollJob(jobId) {
-    fetch("/api/jobs/" + encodeURIComponent(jobId))
+  function showCommand(enrollment) {
+    el.hostStep1.hidden = true;
+    el.hostStep2.hidden = false;
+    el.hostSubmit.hidden = true;
+    el.hostCopy.hidden = false;
+    el.hostCommand.textContent = enrollment.command;
+    el.hostExpiry.textContent =
+      "Single use. Expires in " + Math.round(enrollment.expires_in / 60) + " minutes.";
+  }
+
+  function watchEnrollment(id) {
+    fetch("/api/enrollments/" + encodeURIComponent(id))
       .then(function (r) { return r.json(); })
-      .then(function (job) {
-        el.hostLog.hidden = false;
-        el.hostLog.textContent = (job.lines || []).join("\n");
-        el.hostLog.scrollTop = el.hostLog.scrollHeight;
-        if (job.status === "running") {
-          setTimeout(function () { pollJob(jobId); }, 900);
+      .then(function (item) {
+        if (item.status === "registered") {
+          el.hostStatus.innerHTML = "";
+          el.hostStatus.textContent =
+            "Registered " + ((item.host && item.host.name) || "the host") + ".";
+          el.hostStatus.classList.add("done");
+          load();
           return;
         }
-        el.hostSubmit.disabled = false;
-        if (job.status === "failed") {
-          showError(el.hostError, job.error || "The install failed.");
-        } else {
-          el.hostTarget.value = "";
-          load();
+        if (item.status === "expired" || item.status === "failed") {
+          hide(el.hostStatus);
+          showError(el.hostError, item.error || "That command expired. Close and try again.");
+          return;
         }
+        enrollTimer = setTimeout(function () { watchEnrollment(id); }, 2000);
       })
       .catch(function () {
-        el.hostSubmit.disabled = false;
-        showError(el.hostError, "Lost contact with the dashboard.");
+        enrollTimer = setTimeout(function () { watchEnrollment(id); }, 4000);
       });
+  }
+
+  function copyCommand() {
+    var text = el.hostCommand.textContent;
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(text).then(function () {
+        el.hostCopy.textContent = "Copied";
+        setTimeout(function () { el.hostCopy.textContent = "Copy command"; }, 1500);
+      });
+    }
   }
 
   // ---- small helpers -----------------------------------------------------
@@ -647,17 +649,17 @@
       setupError: $("setup-error"),
       hostDialog: $("host-dialog"),
       hostForm: $("host-form"),
-      hostTarget: $("host-target"),
-      hostKey: $("host-key"),
-      storedKeyWrap: $("stored-key-wrap"),
-      storedKey: $("host-stored-key"),
+      hostStep1: $("host-step-1"),
+      hostStep2: $("host-step-2"),
+      hostCommand: $("host-command"),
+      hostExpiry: $("host-expiry"),
+      hostStatus: $("host-status"),
+      hostCopy: $("host-copy"),
       hostName: $("host-name"),
       hostPort: $("host-port"),
-      hostRemember: $("host-remember"),
       hostSubmit: $("host-submit"),
       hostCancel: $("host-cancel"),
-      hostError: $("host-error"),
-      hostLog: $("host-log")
+      hostError: $("host-error")
     };
 
     initTheme();
@@ -669,6 +671,7 @@
     el.setupForm.addEventListener("submit", submitSetup);
     el.hostForm.addEventListener("submit", submitHost);
     el.hostCancel.addEventListener("click", function () { el.hostDialog.close(); });
+    el.hostCopy.addEventListener("click", copyCommand);
     el.hostFilter.addEventListener("change", function () {
       state.host = el.hostFilter.value;
       render();

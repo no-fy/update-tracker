@@ -1,0 +1,19 @@
+FROM python:3.12-alpine
+
+# The agent is one stdlib-only file. Nothing to install.
+COPY agent/agent.py /app/agent.py
+
+# It only ever issues GETs to the Docker API, so it needs no write access and
+# no privileges -- just membership of the socket's group at run time, which
+# `docker run --group-add` supplies.
+RUN adduser -S -u 10001 -H cudagent
+USER cudagent
+
+EXPOSE 9713
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 CMD \
+  python3 -c "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9713/healthz', timeout=4).status == 200 else 1)"
+
+# CUD_AGENT_TOKEN is the bearer token. CUD_ENROLL_URL and CUD_ENROLL_TOKEN, when
+# set, make the agent register itself with the dashboard on startup.
+ENTRYPOINT ["python3", "/app/agent.py"]

@@ -27,7 +27,9 @@ import ssl
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 
 AGENT_VERSION = "1.0.0"
 API_VERSION = "v1.41"
@@ -329,6 +331,42 @@ def serve(token, bind="0.0.0.0", port=DEFAULT_PORT, docker_endpoint=None,
     return 0
 
 
+def announce(enroll_url, enroll_token, port, attempts=12, delay=5.0):
+    """Tell the dashboard we exist, so it can register this host itself.
+
+    Runs in the background while the HTTP service comes up, because the
+    dashboard verifies us by connecting back before it saves anything. Retries
+    for a minute: the dashboard may still be starting, or the network may not
+    be up yet on a freshly booted box.
+    """
+    payload = json.dumps({
+        "token": enroll_token,
+        "port": port,
+        "hostname": socket.gethostname(),
+        "address": os.environ.get("CUD_ADVERTISE_ADDRESS") or None,
+    }).encode("utf-8")
+
+    for attempt in range(attempts):
+        time.sleep(delay if attempt else 1.0)
+        request = urllib.request.Request(
+            enroll_url, data=payload, headers={"Content-Type": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                body = json.loads(response.read().decode("utf-8"))
+            sys.stderr.write("enrolled with the dashboard as %r\n" % body.get("name"))
+            return True
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:200]
+            sys.stderr.write("enrolment refused (HTTP %s): %s\n" % (exc.code, detail))
+            if exc.code < 500:
+                return False  # a bad or spent token will not get better
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            sys.stderr.write("enrolment attempt %d failed: %s\n" % (attempt + 1, exc))
+    sys.stderr.write("giving up on enrolment; the agent keeps serving normally\n")
+    return False
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Read-only Docker container update agent")
     parser.add_argument("--config", help="JSON config file")
@@ -355,7 +393,8 @@ def main(argv=None):
             sys.stderr.write("invalid config %s: %s\n" % (args.config, exc))
             return 2
 
-    token = args.token or cfg.get("token") or os.environ.get("AGENT_TOKEN")
+    token = (args.token or cfg.get("token") or os.environ.get("AGENT_TOKEN")
+             or os.environ.get("CUD_AGENT_TOKEN"))
     bind = args.bind or cfg.get("bind") or "0.0.0.0"
     port = args.port or cfg.get("port") or DEFAULT_PORT
     docker_endpoint = args.docker or cfg.get("docker_socket") or None
@@ -371,6 +410,15 @@ def main(argv=None):
     if not token and not args.no_auth:
         sys.stderr.write("refusing to start without a token (use --token or --no-auth)\n")
         return 2
+
+    enroll_url = os.environ.get("CUD_ENROLL_URL")
+    enroll_token = os.environ.get("CUD_ENROLL_TOKEN")
+    if enroll_url and enroll_token:
+        threading.Thread(
+            target=announce,
+            args=(enroll_url, enroll_token, int(port)),
+            daemon=True,
+        ).start()
 
     return serve(
         token if not args.no_auth else None,

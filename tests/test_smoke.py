@@ -8,6 +8,7 @@ Registry lookups hit the real registries, so this needs outbound HTTPS; pass
     python3 tests/test_smoke.py
 """
 
+import http.server
 import json
 import os
 import shutil
@@ -27,7 +28,7 @@ sys.path.insert(0, os.path.join(ROOT, "agent"))
 import agent as agent_module  # noqa: E402
 from dashboard import collector, config as config_mod, registry as registry_mod  # noqa: E402
 from dashboard import server as server_mod  # noqa: E402
-from dashboard import keystore, provision  # noqa: E402
+from dashboard import enroll  # noqa: E402
 from fake_docker import FakeDocker, make_fixtures  # noqa: E402
 
 PASSED = []
@@ -274,37 +275,94 @@ def main(argv):
         check("settings never expose the credential",
               "password" not in settings and settings["password_set"] is True)
 
-        section("SSH key store")
-        store = keystore.KeyStore(os.path.join(workdir, "keys"))
-        key_path = store.save("nas", "-----BEGIN OPENSSH PRIVATE KEY-----\nx\n")
-        key_mode = stat.S_IMODE(os.stat(key_path).st_mode)
-        check("key written 0600", key_mode == 0o600, "got %o" % key_mode)
-        dir_mode = stat.S_IMODE(os.stat(store.directory).st_mode)
-        check("key directory 0700", dir_mode == 0o700, "got %o" % dir_mode)
-        escaped = store.path_for("../../etc/passwd")
-        check("key names cannot escape the directory",
-              os.path.dirname(os.path.abspath(escaped)) == os.path.abspath(store.directory))
-        check("stored keys listed by name only", store.names() == ["nas"])
-        check("key deleted on request", store.delete("nas") and not store.has("nas"))
+        section("Enrolment")
+        store = enroll.EnrollmentStore(config_path)
+        item = store.create(name="nas", port=9713)
+        check("enrolment mints two distinct secrets",
+              item.token != item.agent_token and len(item.token) > 30)
+        listed = store.list()[0]
+        check("listing never carries the enrolment token", "token" not in listed)
+        check("the token is only shown to its creator",
+              store.get(item.id).snapshot(include_token=True)["token"] == item.token)
 
-        section("Provisioning input")
+        command = enroll.agent_command(item, "http://dash.lan:8500")
+        check("command mounts the socket read-only", ":/var/run/docker.sock:ro" in command)
+        check("command carries both tokens",
+              item.agent_token in command and item.token in command)
+        check("command points back at the dashboard",
+              "CUD_ENROLL_URL=http://dash.lan:8500/api/enroll" in command)
 
-        def rejects(label, ssh_key="-----BEGIN OPENSSH PRIVATE KEY-----\nx\n", target="root@nas"):
-            try:
-                provision.validate_key(ssh_key)
-                provision.validate_target(target)
-            except provision.ProvisionError:
-                check(label, True)
-            else:
-                check(label, False, "accepted")
+        try:
+            store.claim("not-a-real-token", "10.0.0.9", {})
+            check("an unknown token is refused", False, "accepted")
+        except enroll.EnrollError:
+            check("an unknown token is refused", True)
 
-        rejects("public key rejected", ssh_key="ssh-ed25519 AAAAC3 me@host")
-        rejects("passphrase-protected key rejected",
-                ssh_key="-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n")
-        rejects("empty key rejected", ssh_key="")
-        rejects("target with a space rejected", target="root@a b")
-        check("a real private key is accepted",
-              provision.validate_key("-----BEGIN OPENSSH PRIVATE KEY-----\nx\n").startswith("---"))
+        expired = store.create(name="old", ttl_minutes=0)
+        expired.expires = time.time() - 1
+        try:
+            store.claim(expired.token, "10.0.0.9", {})
+            check("an expired token is refused", False, "accepted")
+        except enroll.EnrollError:
+            check("an expired token is refused", True)
+
+        # A claim that cannot be verified must not register anything, and must
+        # still burn the token so a second attempt gets nowhere.
+        doomed = store.create(name="unreachable", port=19997)
+        try:
+            store.claim(doomed.token, "127.0.0.1", {"port": 19997})
+            check("unverifiable agent is not registered", False, "accepted")
+        except enroll.EnrollError:
+            after, _ = config_mod.load_config(config_path)
+            check("unverifiable agent is not registered",
+                  config_mod.find_host(after, "unreachable") is None)
+        try:
+            store.claim(doomed.token, "127.0.0.1", {"port": 19997})
+            check("a spent token cannot be replayed", False, "accepted")
+        except enroll.EnrollError:
+            check("a spent token cannot be replayed", True)
+
+        # The happy path. A stub agent rather than the fixture one: this
+        # exercises claim() itself, and must prove the token is checked.
+        seen = {}
+
+        class StubAgent(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                seen["auth"] = self.headers.get("Authorization")
+                if seen["auth"] != "Bearer " + live.agent_token:
+                    self.send_response(401)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                body = json.dumps({"hostname": "pi.lan"}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        live = store.create(name="enrolled", port=19714)
+        stub = http.server.HTTPServer(("127.0.0.1", 19714), StubAgent)
+        threading.Thread(target=stub.serve_forever, daemon=True).start()
+        try:
+            registered = store.claim(live.token, "127.0.0.1", {"port": 19714})
+            check("verified agent is registered", registered.status == "registered")
+            check("verification presented the agent token",
+                  seen.get("auth") == "Bearer " + live.agent_token)
+            saved, _ = config_mod.load_config(config_path)
+            entry = config_mod.find_host(saved, "enrolled")
+            check("registered host keeps the agent's token",
+                  entry is not None and entry["token"] == live.agent_token)
+            check("registered host points at the caller",
+                  entry is not None and entry["address"] == "127.0.0.1"
+                  and entry["port"] == 19714)
+            check("label comes from the agent's own hostname",
+                  entry is not None and entry["label"] == "pi.lan")
+        finally:
+            stub.shutdown()
 
         section("Local host by default")
         fresh_path = os.path.join(workdir, "auto", "config.json")

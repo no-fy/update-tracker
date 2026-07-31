@@ -89,44 +89,45 @@
   <form method="dialog" id="host-form">
     <h2>Add a host</h2>
     <p class="dialog-lede">
-      The dashboard connects over SSH, installs the agent as a systemd service
-      and registers it. Nothing is pulled and nothing is changed on your
-      containers.
+      Run one command on the machine you want to watch. It starts the agent
+      there, and the agent registers itself here — the dashboard never needs a
+      login on that machine.
     </p>
-    <label class="stack">
-      <span>Host</span>
-      <input id="host-target" placeholder="root@nas.lan" required autocomplete="off">
-      <small>Optionally <code>user@host:sshport</code>.</small>
-    </label>
-    <label class="stack">
-      <span>SSH private key</span>
-      <textarea id="host-key" rows="5" spellcheck="false" autocomplete="off"
-                placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
-      <small>Needs a key with no passphrase — the install runs unattended.</small>
-    </label>
-    <label class="stack" id="stored-key-wrap" hidden>
-      <span>Or reuse a stored key</span>
-      <select id="host-stored-key"><option value="">Paste a new key</option></select>
-    </label>
-    <div class="dialog-row">
-      <label class="stack">
-        <span>Name <small>optional</small></span>
-        <input id="host-name" placeholder="from the hostname" autocomplete="off">
-      </label>
-      <label class="stack">
-        <span>Agent port</span>
-        <input id="host-port" type="number" value="9713" min="1" max="65535">
-      </label>
+
+    <div id="host-step-1">
+      <div class="dialog-row">
+        <label class="stack">
+          <span>Name <small>optional</small></span>
+          <input id="host-name" placeholder="from its hostname" autocomplete="off">
+        </label>
+        <label class="stack">
+          <span>Agent port</span>
+          <input id="host-port" type="number" value="9713" min="1" max="65535">
+        </label>
+      </div>
+      <p class="dialog-note">
+        The dashboard must be able to reach that port on the host. Nothing is
+        pulled and no container is ever started, stopped or changed by the agent.
+      </p>
     </div>
-    <label class="check">
-      <input type="checkbox" id="host-remember">
-      <span>Keep this key to manage the host later. Off means it is used once and deleted.</span>
-    </label>
+
+    <div id="host-step-2" hidden>
+      <label class="stack">
+        <span>Run this on the host</span>
+        <pre class="command" id="host-command"></pre>
+        <small id="host-expiry"></small>
+      </label>
+      <p class="dialog-status" id="host-status">
+        <span class="spinner" aria-hidden="true"></span>
+        Waiting for the agent to check in…
+      </p>
+    </div>
+
     <p class="dialog-error" id="host-error" hidden></p>
-    <pre class="joblog" id="host-log" hidden></pre>
     <div class="dialog-actions">
       <button type="button" class="button" id="host-cancel">Close</button>
-      <button class="button primary" id="host-submit" value="add">Install agent</button>
+      <button type="button" class="button" id="host-copy" hidden>Copy command</button>
+      <button class="button primary" id="host-submit" value="add">Generate command</button>
     </div>
   </form>
 </dialog>

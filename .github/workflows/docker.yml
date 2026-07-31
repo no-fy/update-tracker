@@ -22,6 +22,14 @@ jobs:
     permissions:
       contents: read
       packages: write
+    strategy:
+      matrix:
+        include:
+          # The dashboard, and the agent people paste onto their hosts.
+          - name: update-tracker
+            dockerfile: Dockerfile
+          - name: update-tracker-agent
+            dockerfile: Dockerfile.agent
     steps:
       - uses: actions/checkout@v7
 
@@ -39,7 +47,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}
@@ -49,6 +57,7 @@ jobs:
       - uses: docker/build-push-action@v7
         with:
           context: .
+          file: ${{ matrix.dockerfile }}
           platforms: linux/amd64,linux/arm64
           # Pull requests build to prove the Dockerfile still works, but publish
           # nothing: a fork's token cannot write packages anyway.

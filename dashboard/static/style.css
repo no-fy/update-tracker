@@ -499,3 +499,41 @@ tr.detail td { padding: 0 18px 14px; background: transparent; }
 @media (max-width: 520px) {
   .dialog-row { flex-direction: column; }
 }
+
+/* ---- enrolment: the command you paste on the host --------------------- */
+
+.command {
+  margin: 0;
+  padding: 12px 13px;
+  border: 1px solid var(--hairline);
+  border-radius: 7px;
+  background: var(--plane);
+  color: var(--text-primary);
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: all;
+}
+
+.dialog-note, .dialog-status {
+  margin: 10px 0 0;
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+
+.dialog-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dialog-status .spinner {
+  display: inline-block;
+  animation: spin 700ms linear infinite;
+}
+
+.dialog-status.done { color: var(--good); font-weight: 550; }
+.dialog-status.done .spinner { display: none; }
