@@ -160,6 +160,33 @@ def _ignored_by_label(labels):
     return None
 
 
+_OS_CACHE = {"at": 0.0, "data": None}
+_OS_CACHE_LOCK = threading.Lock()
+OS_CACHE_SECONDS = float(os.environ.get("CUD_OS_CACHE_SECONDS") or 900)
+
+
+def os_updates(force=False):
+    """Pending OS package updates, cached -- a full scan costs about a second."""
+    with _OS_CACHE_LOCK:
+        fresh = _OS_CACHE["data"] is not None and \
+            (time.time() - _OS_CACHE["at"]) < OS_CACHE_SECONDS
+        if fresh and not force:
+            return _OS_CACHE["data"]
+    try:
+        import ospackages
+        data = ospackages.collect()
+    except Exception as exc:  # never take the agent down over this
+        data = {
+            "available": False, "manager": None, "supported": False,
+            "updates": [], "counts": {}, "reboot_required": False,
+            "error": "%s: %s" % (type(exc).__name__, exc),
+        }
+    with _OS_CACHE_LOCK:
+        _OS_CACHE["at"] = time.time()
+        _OS_CACHE["data"] = data
+    return data
+
+
 def collect_snapshot(client, include_stopped=True):
     """Return ``{"info": {...}, "containers": [...]}`` for one Docker host."""
     try:
@@ -290,6 +317,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._send(200, collect_snapshot(client))
             elif path == "/v1/info":
                 self._send(200, {"agent_version": AGENT_VERSION, "info": client.info()})
+            elif path == "/v1/os":
+                self._send(200, os_updates())
             else:
                 self._send(404, {"error": "no such endpoint", "path": path})
         except DockerError as exc:

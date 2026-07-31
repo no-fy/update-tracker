@@ -164,6 +164,17 @@
       "Check failed", "error", counts["error"] || 0,
       (counts["error"] || 0) ? "registry unreachable or private" : "no registry errors"
     ));
+    if (summary.os_hosts_reporting) {
+      var osCounts = summary.os_counts || {};
+      el.kpis.appendChild(kpi(
+        "OS updates", osCounts.security ? "error" : "unknown",
+        summary.os_updates_total || 0,
+        osCounts.security
+          ? osCounts.security + " security" + (summary.os_reboots_required
+              ? ", " + summary.os_reboots_required + " need a reboot" : "")
+          : "no security updates pending"
+      ));
+    }
     el.kpis.appendChild(kpi(
       "Hosts online", null,
       (summary.hosts_online || 0) + "/" + (summary.hosts_total || 0),
@@ -315,6 +326,11 @@
     head.appendChild(meta);
     card.appendChild(head);
 
+    if (host.online) {
+      var osBlock = osPanel(host);
+      if (osBlock) card.appendChild(osBlock);
+    }
+
     if (!host.online) {
       var error = text("div", "host-error");
       error.appendChild(dot("error"));
@@ -355,6 +371,93 @@
     return card;
   }
 
+  var OS_LEVELS = [
+    { key: "security",  label: "security",  status: "error" },
+    { key: "important", label: "important", status: "update-available" },
+    { key: "routine",   label: "routine",   status: "unknown" }
+  ];
+
+  function osPanel(host) {
+    var os = host.os;
+    if (!os) return null;
+
+    var panel = text("div", "os-panel");
+    var head = text("div", "os-head");
+
+    if (!os.available) {
+      head.appendChild(text("span", "os-title", "OS updates"));
+      head.appendChild(text("span", "os-note", os.error || "not reported"));
+      panel.appendChild(head);
+      return panel;
+    }
+
+    var counts = os.counts || {};
+    var total = OS_LEVELS.reduce(function (sum, level) {
+      return sum + (counts[level.key] || 0);
+    }, 0);
+
+    head.appendChild(text("span", "os-title", "OS updates"));
+    head.appendChild(text("span", "os-manager", os.manager));
+    if (total) {
+      OS_LEVELS.forEach(function (level) {
+        if (!counts[level.key]) return;
+        var chip = text("span", "os-count");
+        chip.appendChild(dot(level.status));
+        chip.appendChild(text("span", null, counts[level.key] + " " + level.label));
+        head.appendChild(chip);
+      });
+    } else {
+      head.appendChild(text("span", "os-note", "up to date"));
+    }
+    if (os.reboot_required) {
+      var reboot = text("span", "os-reboot");
+      reboot.appendChild(text("span", null, "reboot required"));
+      head.appendChild(reboot);
+    }
+    if (os.lists_updated) {
+      head.appendChild(text("span", "os-note", "lists " + relativeTime(os.lists_updated)));
+    }
+    panel.appendChild(head);
+
+    if (total) {
+      var key = "os:" + host.name;
+      var toggle = text("button", "os-toggle");
+      toggle.type = "button";
+      toggle.textContent = state.open[key] ? "Hide packages" : "Show " + total + " " + plural(total, "package", "packages");
+      toggle.addEventListener("click", function () {
+        state.open[key] = !state.open[key];
+        render();
+      });
+      panel.appendChild(toggle);
+
+      if (state.open[key]) panel.appendChild(osTable(os.updates || []));
+    }
+    return panel;
+  }
+
+  function osTable(updates) {
+    var table = text("table", "os-table");
+    var head = text("tr");
+    ["Package", "Installed", "Available", "From"].forEach(function (label) {
+      head.appendChild(text("th", null, label));
+    });
+    table.appendChild(head);
+
+    updates.forEach(function (update) {
+      var row = text("tr");
+      var first = text("td", "os-pkg");
+      var level = OS_LEVELS.filter(function (l) { return l.key === update.severity; })[0];
+      first.appendChild(dot(level ? level.status : "unknown"));
+      first.appendChild(text("span", null, update.name));
+      row.appendChild(first);
+      row.appendChild(text("td", "mono", update.installed));
+      row.appendChild(text("td", "mono", update.candidate));
+      row.appendChild(text("td", "os-src", update.source || ""));
+      table.appendChild(row);
+    });
+    return table;
+  }
+
   function renderHosts(data) {
     el.hosts.textContent = "";
     var hosts = (data.hosts || []).filter(function (host) {
@@ -372,10 +475,10 @@
     if (!data.hosts || !data.hosts.length) {
       el.empty.hidden = false;
       el.empty.textContent = "";
-      el.empty.appendChild(text("span", null, "No hosts configured yet. Add one with "));
+      el.empty.appendChild(text("span", null, "No hosts configured yet. Use "));
+      el.empty.appendChild(text("strong", null, "Add host"));
+      el.empty.appendChild(text("span", null, " above, or register this machine with "));
       el.empty.appendChild(text("code", null, "./cud add --local"));
-      el.empty.appendChild(text("span", null, " or "));
-      el.empty.appendChild(text("code", null, "./cud add root@your-server"));
       el.empty.appendChild(text("span", null, "."));
     } else if (!shown && !el.hosts.children.length) {
       el.empty.hidden = false;

@@ -15,7 +15,12 @@ services:
       # need: the container works out the socket's group id itself at startup.
       # Drop this line if you only want to watch remote hosts.
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Read-only view of the host so OS package updates can be read from the
+      # package manager's own database. Drop this and CUD_HOST_ROOT below to
+      # track containers only.
+      - /:/host:ro
     environment:
+      CUD_HOST_ROOT: /host
       # There is no auth by default. Set this if the port is reachable beyond
       # a trusted LAN; any username then works with this password.
       # CUD_PASSWORD: change-me

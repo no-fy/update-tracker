@@ -1,10 +1,10 @@
 FROM python:3.12-alpine
 
-# The agent is one stdlib-only file. su-exec is only here so the entrypoint can
+# The agent is stdlib-only. su-exec is only here so the entrypoint can
 # drop root once the socket group is sorted out.
 RUN apk add --no-cache su-exec
 
-COPY agent/agent.py /app/agent.py
+COPY agent/agent.py agent/ospackages.py /app/
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 

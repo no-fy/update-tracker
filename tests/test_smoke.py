@@ -9,11 +9,13 @@ Registry lookups hit the real registries, so this needs outbound HTTPS; pass
 """
 
 import http.server
+import io
 import json
 import os
 import shutil
 import stat
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -29,6 +31,7 @@ import agent as agent_module  # noqa: E402
 from dashboard import collector, config as config_mod, registry as registry_mod  # noqa: E402
 from dashboard import server as server_mod  # noqa: E402
 from dashboard import enroll  # noqa: E402
+import ospackages  # noqa: E402
 from fake_docker import FakeDocker, make_fixtures  # noqa: E402
 
 PASSED = []
@@ -377,6 +380,116 @@ def main(argv):
                   entry is not None and entry["label"] == "pi.lan")
         finally:
             stub.shutdown()
+
+        section("OS updates: version ordering")
+        for left, right, want in [
+            ("1.9", "1.10", -1), ("1.10", "1.9", 1), ("1.0", "1.0", 0),
+            ("1:1.0", "2.0", 1), ("1.0~rc1", "1.0", -1), ("1.0-1", "1.0-2", -1),
+            ("2.39-0ubuntu8.7", "2.39-0ubuntu8.8", -1),
+        ]:
+            got = ospackages.compare_versions(left, right)
+            check("%s vs %s" % (left, right), got == want, "got %d" % got)
+
+        section("OS updates: apt")
+        apt_root = os.path.join(workdir, "aptroot")
+        os.makedirs(os.path.join(apt_root, "var/lib/dpkg"))
+        os.makedirs(os.path.join(apt_root, "var/lib/apt/lists"))
+        with open(os.path.join(apt_root, "var/lib/dpkg/status"), "w") as handle:
+            handle.write(
+                "Package: openssl\nStatus: install ok installed\nVersion: 3.0.13-1\n\n"
+                "Package: nano\nStatus: install ok installed\nVersion: 7.2-1\n\n"
+                "Package: cowsay\nStatus: install ok installed\nVersion: 3.03-1\n\n"
+                "Package: gone\nStatus: deinstall ok not-installed\nVersion: 1.0\n\n"
+            )
+        lists = os.path.join(apt_root, "var/lib/apt/lists")
+        with open(os.path.join(lists, "archive.ubuntu.com_ubuntu_dists_noble-updates_main_binary-amd64_Packages"), "w") as handle:
+            handle.write(
+                "Package: openssl\nVersion: 3.0.13-2\n\n"
+                "Package: nano\nVersion: 7.2-2\n\n"
+                "Package: cowsay\nVersion: 3.03-1\n\n"
+            )
+        with open(os.path.join(lists, "security.ubuntu.com_ubuntu_dists_noble-security_main_binary-amd64_Packages"), "w") as handle:
+            # Same version as -updates: the security origin must still win.
+            handle.write("Package: openssl\nVersion: 3.0.13-2\n\n")
+
+        apt_result = ospackages.collect(apt_root)
+        by_name = {u["name"]: u for u in apt_result["updates"]}
+        check("apt detected", apt_result["manager"] == "apt" and apt_result["available"])
+        check("only upgradable packages reported",
+              sorted(by_name) == ["nano", "openssl"], sorted(by_name))
+        check("uninstalled packages ignored", "gone" not in by_name)
+        check("same version is not an update", "cowsay" not in by_name)
+        check("security suite wins over updates at equal version",
+              by_name["openssl"]["severity"] == "security", by_name["openssl"]["source"])
+        check("non-security update is routine or important",
+              by_name["nano"]["severity"] == "routine", by_name["nano"]["severity"])
+        check("counts add up", apt_result["counts"]["security"] == 1)
+        check("origin is readable",
+              "noble-security" in by_name["openssl"]["source"], by_name["openssl"]["source"])
+
+        section("OS updates: kernel and reboot")
+        with open(os.path.join(apt_root, "var/lib/dpkg/status"), "a") as handle:
+            handle.write("Package: linux-image-generic\nStatus: install ok installed\nVersion: 6.8.0-31\n\n")
+        with open(os.path.join(lists, "archive.ubuntu.com_ubuntu_dists_noble-updates_main_binary-amd64_Packages"), "a") as handle:
+            handle.write("Package: linux-image-generic\nVersion: 6.8.0-32\n\n")
+        os.makedirs(os.path.join(apt_root, "var/run"), exist_ok=True)
+        open(os.path.join(apt_root, "var/run/reboot-required"), "w").close()
+        kernel_result = ospackages.collect(apt_root)
+        kernel = [u for u in kernel_result["updates"] if u["name"].startswith("linux-image")][0]
+        check("kernel update ranked important", kernel["severity"] == "important", kernel["severity"])
+        check("reboot-required is reported", kernel_result["reboot_required"])
+        check("security still sorts first",
+              kernel_result["updates"][0]["severity"] == "security")
+
+        section("OS updates: apk and pacman")
+        apk_root = os.path.join(workdir, "apkroot")
+        os.makedirs(os.path.join(apk_root, "lib/apk/db"))
+        os.makedirs(os.path.join(apk_root, "var/cache/apk"))
+        with open(os.path.join(apk_root, "lib/apk/db/installed"), "w") as handle:
+            handle.write("P:busybox\nV:1.36.1-r5\n\nP:musl\nV:1.2.4-r2\n\n")
+        index = io.BytesIO(b"P:busybox\nV:1.36.1-r7\n\nP:musl\nV:1.2.4-r2\n\n")
+        with tarfile.open(os.path.join(apk_root, "var/cache/apk/APKINDEX.abc.tar.gz"), "w:gz") as archive:
+            entry = tarfile.TarInfo("APKINDEX")
+            entry.size = len(index.getvalue())
+            archive.addfile(entry, io.BytesIO(index.getvalue()))
+        apk_result = ospackages.collect(apk_root)
+        check("apk detected", apk_result["manager"] == "apk" and apk_result["available"])
+        check("apk finds the upgradable package",
+              [u["name"] for u in apk_result["updates"]] == ["busybox"],
+              [u["name"] for u in apk_result["updates"]])
+
+        pac_root = os.path.join(workdir, "pacroot")
+        os.makedirs(os.path.join(pac_root, "var/lib/pacman/local/vim-9.0-1"))
+        os.makedirs(os.path.join(pac_root, "var/lib/pacman/sync"))
+        with open(os.path.join(pac_root, "var/lib/pacman/local/vim-9.0-1/desc"), "w") as handle:
+            handle.write("%NAME%\nvim\n\n%VERSION%\n9.0-1\n")
+        with tarfile.open(os.path.join(pac_root, "var/lib/pacman/sync/core.db"), "w:gz") as archive:
+            payload = b"%NAME%\nvim\n\n%VERSION%\n9.1-1\n"
+            entry = tarfile.TarInfo("vim-9.1-1/desc")
+            entry.size = len(payload)
+            archive.addfile(entry, io.BytesIO(payload))
+        pac_result = ospackages.collect(pac_root)
+        check("pacman detected", pac_result["manager"] == "pacman" and pac_result["available"])
+        check("pacman finds the upgradable package",
+              [u["name"] for u in pac_result["updates"]] == ["vim"])
+
+        section("OS updates: honest about what it cannot read")
+        rpm_root = os.path.join(workdir, "rpmroot")
+        os.makedirs(os.path.join(rpm_root, "var/lib/rpm"))
+        open(os.path.join(rpm_root, "var/lib/rpm/rpmdb.sqlite"), "w").close()
+        rpm_result = ospackages.collect(rpm_root)
+        check("rpm host is detected", rpm_result["manager"] == "rpm")
+        check("rpm reports unsupported rather than zero updates",
+              not rpm_result["available"] and "rpm" in (rpm_result["error"] or ""))
+        check("no fake 'all clear' for rpm", rpm_result["updates"] == [])
+
+        empty_root = os.path.join(workdir, "emptyroot")
+        os.makedirs(empty_root)
+        none_result = ospackages.collect(empty_root)
+        check("no package manager is reported, not guessed",
+              none_result["manager"] is None and not none_result["available"])
+        check("the error explains the mount",
+              "CUD_HOST_ROOT" in (none_result["error"] or ""))
 
         section("Local host by default")
         shared = config_mod.load_config(os.path.join(workdir, "nope-1.json"))[0]

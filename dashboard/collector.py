@@ -70,6 +70,7 @@ def poll_host(host, timeout=20, include_stopped=True):
         containers=[],
         agent_version=None,
         poll_seconds=0.0,
+        os=None,
     )
 
     if not host.get("enabled", True):
@@ -100,6 +101,7 @@ def poll_host(host, timeout=20, include_stopped=True):
         if not include_stopped:
             containers = [c for c in containers if c.get("state") == "running"]
         result["containers"] = containers
+        result["os"] = _poll_os(host, timeout)
     except agent_module.DockerError as exc:
         result["error"] = str(exc)
     except urllib.error.HTTPError as exc:
@@ -114,6 +116,29 @@ def poll_host(host, timeout=20, include_stopped=True):
 
     result["poll_seconds"] = round(time.time() - started, 2)
     return result
+
+
+def _poll_os(host, timeout):
+    """Pending OS updates for a host. Optional: an agent may not expose them."""
+    try:
+        if host.get("mode") == "local":
+            return agent_module.os_updates()
+        scheme = "https" if host.get("tls") else "http"
+        url = "%s://%s:%s/v1/os" % (scheme, host.get("address"), host.get("port", 9713))
+        return _http_get_json(
+            url,
+            token=host.get("token"),
+            timeout=timeout,
+            verify_tls=host.get("verify_tls", True),
+        )
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            # An older agent. Containers still work; say so rather than
+            # showing the host as having no OS updates.
+            return {"available": False, "error": "this agent is too old to report OS updates"}
+        return {"available": False, "error": "agent returned HTTP %s" % exc.code}
+    except Exception as exc:
+        return {"available": False, "error": "%s: %s" % (type(exc).__name__, exc)}
 
 
 def poll_hosts(hosts, timeout=20, max_workers=8, include_stopped=True):
@@ -254,6 +279,19 @@ def summarise(host_results):
         host["counts"] = host_counts
         host["needs_attention"] = sum(host_counts.get(s, 0) for s in NEEDS_ATTENTION)
 
+    os_counts = {"security": 0, "important": 0, "routine": 0}
+    os_hosts = 0
+    reboots = 0
+    for host in host_results:
+        os_data = host.get("os") or {}
+        if not os_data.get("available"):
+            continue
+        os_hosts += 1
+        for level, value in (os_data.get("counts") or {}).items():
+            os_counts[level] = os_counts.get(level, 0) + value
+        if os_data.get("reboot_required"):
+            reboots += 1
+
     return {
         "containers_total": total,
         "containers_running": running,
@@ -262,6 +300,10 @@ def summarise(host_results):
         "hosts_offline": sum(1 for h in host_results if not h.get("online")),
         "needs_attention": sum(counts.get(s, 0) for s in NEEDS_ATTENTION),
         "counts": counts,
+        "os_updates_total": sum(os_counts.values()),
+        "os_counts": os_counts,
+        "os_hosts_reporting": os_hosts,
+        "os_reboots_required": reboots,
     }
 
 

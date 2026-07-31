@@ -77,12 +77,19 @@ class Enrollment(object):
 
 
 def agent_command(enrollment, dashboard_url, socket_path="/var/run/docker.sock"):
-    """The line to paste on the remote host."""
+    """The line to paste on the remote host.
+
+    `/:/host:ro` is what lets the agent read the host's package databases for
+    OS updates. Drop that line and the `CUD_HOST_ROOT` one to watch containers
+    only -- everything else keeps working.
+    """
     return (
         "docker run -d --name {name} --restart unless-stopped \\\n"
         "  -v {socket}:{socket}:ro \\\n"
+        "  -v /:/host:ro \\\n"
         "  -p {port}:{port} \\\n"
         "  -e CUD_AGENT_TOKEN={agent_token} \\\n"
+        "  -e CUD_HOST_ROOT=/host \\\n"
         "  -e CUD_ENROLL_URL={url}/api/enroll \\\n"
         "  -e CUD_ENROLL_TOKEN={token} \\\n"
         "  {image}"

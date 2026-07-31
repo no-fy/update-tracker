@@ -7,6 +7,8 @@ image, across as many servers as you like.
   `docker run` to paste on the host. The agent starts there, registers itself,
   and the dashboard verifies it by connecting back before saving anything. No
   SSH key ever reaches the dashboard, and no config file editing.
+- **OS updates too.** Pending package updates for each host, read straight from
+  the package manager's own database and ranked security / important / routine.
 - **No pulls.** "Needs an update" is decided by asking the registry what digest
   the tag points at right now and comparing it to the digest the container is
   running. One HTTP request per unique image, not one image download.
@@ -205,6 +207,64 @@ that address instead of the one the dashboard sees.
 The host needs Docker and a reachable port; that is the whole requirement.
 There is no SSH path any more, from the browser or anywhere else — the
 dashboard holds no credentials for your machines at all.
+
+## OS package updates
+
+Each host also reports its pending OS package updates, ranked so the ones that
+matter are not buried:
+
+| Rank | What lands here |
+|---|---|
+| **security** | The update is published in a security suite — `bookworm-security`, `noble-security` and friends. |
+| **important** | Kernel, glibc/musl, systemd, OpenSSL, OpenSSH, Docker, containerd, dbus, grub. An update here usually means a reboot or a service restart. |
+| **routine** | Everything else. |
+
+A package published to both `-updates` and `-security` at the same version is
+counted as security, which is what `apt` itself would tell you. Debian, Ubuntu,
+Raspberry Pi OS and Proxmox all get this; Alpine ships security fixes in its
+normal repositories, so there is no suite to key off and only the package name
+ranks it.
+
+| Package manager | Support |
+|---|---|
+| **apt / dpkg** | Full — installed versions, candidates, security suites, `reboot-required`. |
+| **apk** | Installed versions against the cached `APKINDEX`. |
+| **pacman** | Installed versions against the synced databases. |
+| **rpm** (dnf/yum) | Detected and reported as unsupported. The rpm database is a binary format this agent cannot read without librpm, and answering "no updates" would be worse than saying so. |
+
+Nothing is executed and nothing is installed. The package manager's files are
+parsed directly, which is why this works from a container and needs no
+privileges — but it does mean the agent has to see the host's filesystem:
+
+```
+-v /:/host:ro -e CUD_HOST_ROOT=/host
+```
+
+That is in the command **Add host** gives you, and in `docker-compose.yml` for
+the dashboard's own machine. Drop both and everything else keeps working —
+containers are still tracked, OS updates just say they cannot be read.
+
+**A read-only mount of `/` is still the whole filesystem**, `/etc/shadow`
+included. If that is more trust than you want to extend, mount only the
+databases instead — same results, nothing else visible:
+
+```bash
+# Debian, Ubuntu, Raspberry Pi OS, Proxmox
+-v /var/lib/dpkg:/host/var/lib/dpkg:ro \
+-v /var/lib/apt/lists:/host/var/lib/apt/lists:ro \
+-e CUD_HOST_ROOT=/host
+```
+
+The only thing lost is the `reboot-required` flag, which lives in `/var/run`.
+
+**"Available" means what the host last fetched.** These files only change when
+something runs `apt update`, so a box that has not refreshed in a month will
+honestly report old data — the dashboard shows how stale the lists are rather
+than implying freshness it cannot check. Most systems refresh on a timer;
+if yours does not, that timestamp is the thing to watch.
+
+A scan costs about a second on a normal Debian box, so the agent caches it for
+15 minutes (`CUD_OS_CACHE_SECONDS`).
 
 ## What the statuses mean
 
@@ -414,8 +474,8 @@ tokens are never returned.
 is refused until they do — an unauthenticated dashboard will not hand out
 enrolment tokens to whoever can reach the port.
 
-The agent's own API is `/healthz` (open) plus `/v1/containers` and `/v1/info`
-(bearer token).
+The agent's own API is `/healthz` (open) plus `/v1/containers`, `/v1/info` and
+`/v1/os` (bearer token).
 
 ## Security notes
 
@@ -458,7 +518,8 @@ Dockerfile.agent          the agent as a container, for enrolment
 docker-compose.yml        socket bound, nothing else to fill in
 docker-entrypoint.sh      joins the socket's group, then drops root
 .github/workflows/        test, then build and push the image to ghcr.io
-agent/agent.py            the agent — one stdlib-only file, also imported for local hosts
+agent/agent.py            the agent, also imported for local hosts
+agent/ospackages.py       reads apt/apk/pacman databases for OS updates
 dashboard/registry.py     tag → digest, via the OCI distribution API
 dashboard/collector.py    polls hosts, classifies containers
 dashboard/server.py       web server and JSON API

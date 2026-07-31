@@ -609,3 +609,87 @@ tr.detail td { padding: 0 18px 14px; background: transparent; }
 :root[data-theme="dark"] .login-card {
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 14px 36px rgba(0, 0, 0, 0.5);
 }
+
+/* ---- OS package updates, per host ------------------------------------- */
+
+.os-panel {
+  padding: 11px 16px;
+  border-top: 1px solid var(--hairline);
+  background: var(--wash);
+}
+
+.os-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.81rem;
+  color: var(--text-secondary);
+}
+
+.os-title { font-weight: 600; color: var(--text-primary); }
+
+.os-manager {
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+}
+
+.os-count { display: inline-flex; align-items: center; gap: 5px; }
+.os-note { color: var(--text-muted); }
+
+.os-reboot {
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: rgba(208, 59, 59, 0.12);
+  color: var(--critical);
+  font-weight: 550;
+}
+
+.os-toggle {
+  margin-top: 9px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  font-size: 0.79rem;
+  cursor: pointer;
+}
+
+.os-toggle:hover { text-decoration: underline; }
+
+.os-table {
+  width: 100%;
+  margin-top: 10px;
+  border-collapse: collapse;
+  font-size: 0.78rem;
+}
+
+.os-table th {
+  padding: 5px 10px 5px 0;
+  border-bottom: 1px solid var(--hairline);
+  color: var(--text-muted);
+  font-weight: 550;
+  text-align: left;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.68rem;
+}
+
+.os-table td {
+  padding: 5px 10px 5px 0;
+  border-bottom: 1px solid var(--hairline);
+  vertical-align: top;
+}
+
+.os-table tr:last-child td { border-bottom: 0; }
+.os-pkg { display: flex; align-items: center; gap: 7px; font-weight: 550; }
+.os-table .mono { font-family: var(--mono); font-size: 0.73rem; color: var(--text-secondary); }
+.os-src { color: var(--text-muted); }
+
+@media (max-width: 640px) {
+  .os-table th:nth-child(4), .os-table td:nth-child(4) { display: none; }
+}
