@@ -2,7 +2,7 @@
 """Container-update agent.
 
 A read-only collector that reports the containers on one Docker host. It is a
-single stdlib-only file so it can be scp'd to any machine with Python 3.8+ and
+single stdlib-only file so it can be scp'd to any machine with Python 3.12+ and
 run under systemd. It never writes to Docker -- the only API calls it makes are
 GETs against the container, image and info endpoints.
 

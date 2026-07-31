@@ -12,7 +12,7 @@ image, across as many servers as you like.
   running. One HTTP request per unique image, not one image download.
 - **Read-only, everywhere.** The agent only ever issues GETs to the Docker API.
   Nothing in this tool can start, stop, pull or recreate a container.
-- **No dependencies.** Python 3.8+ standard library only, on both sides. No pip
+- **No dependencies.** Python 3.12+ standard library only, on both sides. No pip
   install, no node, no build step, no database.
 
 ```
@@ -54,7 +54,7 @@ socket and the password.
 <details>
 <summary>Running from a checkout instead</summary>
 
-There is nothing to build and nothing to install — Python 3.8+ and the standard
+There is nothing to build and nothing to install — Python 3.12+ and the standard
 library are the only requirements.
 
 ```bash
@@ -107,7 +107,7 @@ labels:
 ```
 
 Requirements on the remote host: SSH access (key-based — the script does not
-handle password logins), Python 3.8+, systemd, and a Docker socket. Root or
+handle password logins), Python 3.12+, systemd, and a Docker socket. Root or
 sudo is needed to install the service; if sudo asks for a password you will be
 prompted.
 
@@ -248,10 +248,8 @@ dashboard is deployed.
 
 ### How the image is built
 
-`.github/workflows/docker.yml` runs the offline smoke test on Python 3.8 and
-3.14 — the oldest version the project supports and the newest released, so both
-ends of the range stay honest — and only then builds `linux/amd64` and
-`linux/arm64` and pushes to
+`.github/workflows/docker.yml` runs the offline smoke test on Python 3.12, and
+only then builds `linux/amd64` and `linux/arm64` and pushes to
 `ghcr.io/no-fy/update-tracker`. Pull requests build the image to prove the
 Dockerfile still works but publish nothing.
 

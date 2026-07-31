@@ -10,11 +10,8 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        # The floor the project advertises, and the version the image ships.
-        python: ["3.8", "3.14"]
-    container: python:${{ matrix.python }}-slim
+    # The version the project targets and the image ships.
+    container: python:3.12-slim
     steps:
       - uses: actions/checkout@v7
       - run: python3 tests/test_smoke.py --offline

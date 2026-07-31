@@ -1,4 +1,4 @@
-FROM python:3.14-alpine
+FROM python:3.12-alpine
 
 # The only runtime dependency in the whole project: `cud add <host>` shells out
 # to ssh to provision a remote agent. Everything else is the standard library.

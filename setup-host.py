@@ -160,7 +160,7 @@ emit uid "$(id -u)"
 emit user "$(id -un)"
 emit hostname "$(hostname 2>/dev/null || echo unknown)"
 emit arch "$(uname -m 2>/dev/null || echo unknown)"
-for candidate in python3 python3.12 python3.11 python3.10 python3.9 python3.8 python; do
+for candidate in python3 python3.14 python3.13 python3.12 python; do
   if command -v "$candidate" >/dev/null 2>&1; then
     ver="$("$candidate" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo "")"
     if [ -n "$ver" ]; then emit python "$(command -v "$candidate")"; emit python_version "$ver"; break; fi
@@ -417,10 +417,10 @@ def add_remote(args, config, config_path):
     problems = []
 
     python = facts.get("python")
-    if python and _version_at_least(facts.get("python_version"), (3, 8)):
+    if python and _version_at_least(facts.get("python_version"), (3, 12)):
         ok("python %s at %s" % (facts.get("python_version"), python))
     else:
-        problems.append("Python 3.8+ is required but was not found (install python3).")
+        problems.append("Python 3.12+ is required but was not found (install python3).")
         fail("no usable python3")
 
     if facts.get("docker_socket"):
