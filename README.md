@@ -249,7 +249,9 @@ dashboard is deployed.
 ### How the image is built
 
 `.github/workflows/docker.yml` runs the offline smoke test on Python 3.8 and
-3.12, and only then builds `linux/amd64` and `linux/arm64` and pushes to
+3.14 — the oldest version the project supports and the newest released, so both
+ends of the range stay honest — and only then builds `linux/amd64` and
+`linux/arm64` and pushes to
 `ghcr.io/no-fy/update-tracker`. Pull requests build the image to prove the
 Dockerfile still works but publish nothing.
 
