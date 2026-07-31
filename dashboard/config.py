@@ -6,14 +6,21 @@ the list of hosts. It contains agent tokens, so it is created and rewritten
 with 0600 permissions.
 """
 
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import tempfile
+
+PASSWORD_SCHEME = "pbkdf2_sha256"
+PASSWORD_ROUNDS = 240000
 
 DEFAULT_CONFIG = {
     "dashboard": {
         "bind": "0.0.0.0",
         "port": 8500,
+        "username": None,
         "refresh_interval_minutes": 30,
         "registry_cache_hours": 6,
         "registry_failure_cache_minutes": 20,
@@ -80,6 +87,33 @@ def save_config(config, path=None):
             os.unlink(tmp)
         raise
     return path
+
+
+def hash_password(password, rounds=PASSWORD_ROUNDS, salt=None):
+    """Hash a password for storage in config.json.
+
+    The setup flow writes hashes; a plaintext `dashboard.password` still works,
+    because it is documented and people hand-edit this file.
+    """
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("ascii"), rounds)
+    return "%s$%d$%s$%s" % (PASSWORD_SCHEME, rounds, salt, digest.hex())
+
+
+def verify_password(stored, supplied):
+    if not stored or supplied is None:
+        return False
+    if stored.startswith(PASSWORD_SCHEME + "$"):
+        try:
+            _, rounds, salt, digest = stored.split("$", 3)
+            rounds = int(rounds)
+        except ValueError:
+            return False
+        computed = hashlib.pbkdf2_hmac(
+            "sha256", supplied.encode("utf-8"), salt.encode("ascii"), rounds
+        )
+        return hmac.compare_digest(computed.hex(), digest)
+    return hmac.compare_digest(stored, supplied)
 
 
 def find_host(config, name):

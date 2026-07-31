@@ -4,7 +4,10 @@ FROM python:3.12-alpine
 # to ssh to provision a remote agent. Everything else is the standard library.
 RUN apk add --no-cache openssh-client
 
-RUN adduser -S -u 10001 -h /home/cud cud
+RUN adduser -S -u 10001 -h /home/cud cud \
+ && mkdir -p /home/cud/.ssh \
+ && chown -R cud /home/cud \
+ && chmod 700 /home/cud/.ssh
 
 WORKDIR /app
 COPY agent/ agent/

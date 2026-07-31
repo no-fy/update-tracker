@@ -14,6 +14,7 @@
     <p class="subtitle" id="subtitle">Loading…</p>
   </div>
   <div class="topbar-actions">
+    <button id="add-host" class="button">Add host</button>
     <button id="refresh" class="button primary">
       <span class="spinner" aria-hidden="true"></span>
       <span class="button-label">Refresh</span>
@@ -55,6 +56,80 @@
   <span id="footer-meta"></span>
   <span class="footer-legend" id="legend"></span>
 </footer>
+
+<dialog id="setup-dialog" class="dialog">
+  <form method="dialog" id="setup-form">
+    <h2>Secure this dashboard</h2>
+    <p class="dialog-lede">
+      Anyone who can reach this page can see every container on every host you
+      add. Pick a username and password before going further.
+    </p>
+    <label class="stack">
+      <span>Username</span>
+      <input id="setup-username" name="username" autocomplete="username" required>
+    </label>
+    <label class="stack">
+      <span>Password</span>
+      <input id="setup-password" name="password" type="password"
+             autocomplete="new-password" minlength="8" required>
+      <small>At least 8 characters. Stored as a PBKDF2 hash, never in the clear.</small>
+    </label>
+    <label class="stack">
+      <span>Confirm password</span>
+      <input id="setup-confirm" type="password" autocomplete="new-password" required>
+    </label>
+    <p class="dialog-error" id="setup-error" hidden></p>
+    <div class="dialog-actions">
+      <button class="button primary" id="setup-submit" value="save">Save and continue</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="host-dialog" class="dialog">
+  <form method="dialog" id="host-form">
+    <h2>Add a host</h2>
+    <p class="dialog-lede">
+      The dashboard connects over SSH, installs the agent as a systemd service
+      and registers it. Nothing is pulled and nothing is changed on your
+      containers.
+    </p>
+    <label class="stack">
+      <span>Host</span>
+      <input id="host-target" placeholder="root@nas.lan" required autocomplete="off">
+      <small>Optionally <code>user@host:sshport</code>.</small>
+    </label>
+    <label class="stack">
+      <span>SSH private key</span>
+      <textarea id="host-key" rows="5" spellcheck="false" autocomplete="off"
+                placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
+      <small>Needs a key with no passphrase — the install runs unattended.</small>
+    </label>
+    <label class="stack" id="stored-key-wrap" hidden>
+      <span>Or reuse a stored key</span>
+      <select id="host-stored-key"><option value="">Paste a new key</option></select>
+    </label>
+    <div class="dialog-row">
+      <label class="stack">
+        <span>Name <small>optional</small></span>
+        <input id="host-name" placeholder="from the hostname" autocomplete="off">
+      </label>
+      <label class="stack">
+        <span>Agent port</span>
+        <input id="host-port" type="number" value="9713" min="1" max="65535">
+      </label>
+    </div>
+    <label class="check">
+      <input type="checkbox" id="host-remember">
+      <span>Keep this key to manage the host later. Off means it is used once and deleted.</span>
+    </label>
+    <p class="dialog-error" id="host-error" hidden></p>
+    <pre class="joblog" id="host-log" hidden></pre>
+    <div class="dialog-actions">
+      <button type="button" class="button" id="host-cancel">Close</button>
+      <button class="button primary" id="host-submit" value="add">Install agent</button>
+    </div>
+  </form>
+</dialog>
 
 <script src="/static/app.js"></script>
 </body>

@@ -11,6 +11,7 @@ Registry lookups hit the real registries, so this needs outbound HTTPS; pass
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import threading
@@ -26,6 +27,7 @@ sys.path.insert(0, os.path.join(ROOT, "agent"))
 import agent as agent_module  # noqa: E402
 from dashboard import collector, config as config_mod, registry as registry_mod  # noqa: E402
 from dashboard import server as server_mod  # noqa: E402
+from dashboard import keystore, provision  # noqa: E402
 from fake_docker import FakeDocker, make_fixtures  # noqa: E402
 
 PASSED = []
@@ -258,6 +260,64 @@ def main(argv):
             check("builds an install script",
                   "systemctl restart" in setup.build_install_script(
                       "print('x')", {"token": "t"}, {"socket_group": "docker"}, "cudagent", "/usr/bin/python3"))
+
+        section("Credentials")
+        hashed = config_mod.hash_password("correct-horse")
+        check("password stored as a hash",
+              hashed.startswith("pbkdf2_sha256$") and "correct-horse" not in hashed)
+        check("correct password verifies", config_mod.verify_password(hashed, "correct-horse"))
+        check("wrong password rejected", not config_mod.verify_password(hashed, "wrong"))
+        check("empty password rejected", not config_mod.verify_password(hashed, ""))
+        check("plaintext password still works (documented, hand-edited)",
+              config_mod.verify_password("plain", "plain"))
+        settings = server_mod.sanitise_settings({"password": hashed, "port": 8500})
+        check("settings never expose the credential",
+              "password" not in settings and settings["password_set"] is True)
+
+        section("SSH key store")
+        store = keystore.KeyStore(os.path.join(workdir, "keys"))
+        key_path = store.save("nas", "-----BEGIN OPENSSH PRIVATE KEY-----\nx\n")
+        key_mode = stat.S_IMODE(os.stat(key_path).st_mode)
+        check("key written 0600", key_mode == 0o600, "got %o" % key_mode)
+        dir_mode = stat.S_IMODE(os.stat(store.directory).st_mode)
+        check("key directory 0700", dir_mode == 0o700, "got %o" % dir_mode)
+        escaped = store.path_for("../../etc/passwd")
+        check("key names cannot escape the directory",
+              os.path.dirname(os.path.abspath(escaped)) == os.path.abspath(store.directory))
+        check("stored keys listed by name only", store.names() == ["nas"])
+        check("key deleted on request", store.delete("nas") and not store.has("nas"))
+
+        section("Provisioning input")
+
+        def rejects(label, ssh_key="-----BEGIN OPENSSH PRIVATE KEY-----\nx\n", target="root@nas"):
+            try:
+                provision.validate_key(ssh_key)
+                provision.validate_target(target)
+            except provision.ProvisionError:
+                check(label, True)
+            else:
+                check(label, False, "accepted")
+
+        rejects("public key rejected", ssh_key="ssh-ed25519 AAAAC3 me@host")
+        rejects("passphrase-protected key rejected",
+                ssh_key="-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n")
+        rejects("empty key rejected", ssh_key="")
+        rejects("target with a space rejected", target="root@a b")
+        check("a real private key is accepted",
+              provision.validate_key("-----BEGIN OPENSSH PRIVATE KEY-----\nx\n").startswith("---"))
+
+        section("Local host by default")
+        fresh_path = os.path.join(workdir, "auto", "config.json")
+        fresh, _ = config_mod.load_config(fresh_path)
+        added = server_mod.ensure_local_host_registered(fresh, fresh_path)
+        if os.path.exists("/var/run/docker.sock"):
+            check("local Docker registered without being asked",
+                  added is not None and added["mode"] == "local")
+        else:
+            check("no local host invented when there is no socket", added is None)
+        already = {"hosts": [{"name": "nas", "mode": "agent"}]}
+        check("existing hosts are left alone",
+              server_mod.ensure_local_host_registered(already, fresh_path) is None)
 
     finally:
         shutil.rmtree(workdir, ignore_errors=True)

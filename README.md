@@ -75,6 +75,50 @@ the systemd unit.
 
 </details>
 
+## First run
+
+The dashboard registers the Docker socket of the machine it runs on by itself,
+so a fresh install already has something to show. It only does this when no
+hosts are configured yet and the socket is actually there — it will not invent
+a host that can never be read.
+
+Then it asks you to pick a username and password before anything else. There is
+no default login and no way to skip it from the UI: anyone who can reach the
+page can see every container on every host you add. The password is stored as a
+PBKDF2-SHA256 hash, never in the clear, and the API never returns it.
+
+A plaintext `dashboard.password` still works if you would rather hand-edit the
+config, and `$CUD_PASSWORD` still overrides both — setting either one skips the
+prompt.
+
+## Adding a host from the dashboard
+
+**Add host** takes an SSH destination and a private key, then runs the same
+provisioning `./setup-host.py` does: connect, check the host, install the agent
+as a hardened systemd service, verify it answers, register it. The installer's
+output streams into the dialog as it goes, so a failure tells you which step
+broke rather than just "failed".
+
+Because the browser cannot answer prompts, this path is stricter than the CLI:
+
+- The key must have **no passphrase**, and it is rejected with an explanation if
+  it does. Paste the private key, not the `.pub`.
+- **sudo must not ask for a password.** Connect as root, or give the user
+  passwordless sudo. Otherwise the job stops with that as the error instead of
+  hanging on a prompt you cannot see.
+- The host key is accepted on first contact (`StrictHostKeyChecking=accept-new`),
+  because there is no way to confirm a fingerprint from a web form. The CLI is
+  unchanged and still strict.
+
+Keys are written to `config/keys/`, directory `0700` and each file `0600`, never
+into `config.json` and never returned by the API. By default a key is used once
+and deleted the moment the job finishes; tick **keep this key** only if you want
+it retained to manage that host later. A key is only ever needed to *install* an
+agent — once a host is registered the dashboard talks to it over HTTP with a
+bearer token, so keeping one is optional.
+
+One install runs at a time, which keeps config writes serialised.
+
 ## What the statuses mean
 
 | Status | Meaning |
@@ -144,6 +188,7 @@ agent tokens.
   "dashboard": {
     "bind": "0.0.0.0",
     "port": 8500,
+    "username": null,
     "password": null,
     "refresh_interval_minutes": 30,
     "registry_cache_hours": 6,
@@ -162,9 +207,11 @@ agent tokens.
 
 Notable settings:
 
-- **`dashboard.password`** — set it and the dashboard asks for HTTP basic auth
-  (any username). Also readable from `$CUD_PASSWORD`. There is no auth by
-  default, so treat an unset password as "LAN only".
+- **`dashboard.password`** — set it and the dashboard asks for HTTP basic auth.
+  Written as a PBKDF2 hash by the first-run prompt; a plaintext value still
+  works if you set it by hand. Also readable from `$CUD_PASSWORD`.
+- **`dashboard.username`** — the username that must accompany it. Left unset,
+  any username is accepted, which is how this behaved before usernames existed.
 - **`registries`** — credentials for private images, keyed by registry host.
   Use `docker.io` for Docker Hub. Without these, private images report
   *Check failed*.
@@ -285,8 +332,18 @@ tokens are never returned.
 | GET | `/api/hosts` | configured hosts, tokens redacted |
 | POST | `/api/hosts/<name>/enabled` | `{"enabled": false}` to pause a host |
 | DELETE | `/api/hosts/<name>` | unregister a host |
+| POST | `/api/hosts` | install an agent on a host and register it (returns a job) |
+| GET | `/api/jobs/<id>` | that job's status and streamed output |
+| GET | `/api/keys` | names of stored SSH keys — never the key material |
+| DELETE | `/api/keys/<name>` | forget a stored key |
+| GET | `/api/setup` | whether credentials still need choosing |
+| POST | `/api/setup` | set the username and password, once |
 | GET | `/api/meta` | version, config path, effective settings |
 | GET | `/healthz` | unauthenticated liveness check |
+
+`POST /api/setup` is refused once credentials exist, and `POST /api/hosts` is
+refused until they do — an unauthenticated dashboard will not run SSH for
+anyone who can reach the port.
 
 The agent's own API is `/healthz` (open) plus `/v1/containers` and `/v1/info`
 (bearer token).
@@ -335,6 +392,8 @@ agent/agent.py            the agent — one stdlib-only file, also imported for 
 dashboard/registry.py     tag → digest, via the OCI distribution API
 dashboard/collector.py    polls hosts, classifies containers
 dashboard/server.py       web server and JSON API
+dashboard/provision.py    runs setup-host.py as a background job for the UI
+dashboard/keystore.py     0600 storage for SSH keys, never exposed by the API
 dashboard/static/         the UI (no build step)
 tests/                    fake Docker daemon + smoke test
 ```

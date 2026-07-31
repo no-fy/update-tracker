@@ -83,8 +83,15 @@ def parse_target(target):
     return rest, hostname, ssh_port
 
 
+# Extra `ssh` options, set by the dashboard when it drives an install over the
+# web: the browser cannot answer a host key prompt. Empty for terminal use, so
+# the CLI keeps SSH's normal strict behaviour.
+EXTRA_SSH_OPTS = []
+
+
 def ssh_command(destination, ssh_port, identity, tty=False, extra_opts=()):
     cmd = ["ssh", "-o", "ConnectTimeout=10"]
+    cmd += list(EXTRA_SSH_OPTS)
     if not tty:
         cmd += ["-o", "BatchMode=yes"]
     else:

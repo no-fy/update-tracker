@@ -15,7 +15,7 @@
   };
   var ATTENTION = ["update-available", "restart-pending"];
 
-  var state = { data: null, status: "", host: "", query: "", open: {} };
+  var state = { data: null, status: "", host: "", query: "", open: {}, canAddHosts: false };
   var el = {};
   var pollTimer = null;
 
@@ -456,6 +456,152 @@
       .catch(function () { schedulePoll(2000); });
   }
 
+  // ---- first-run setup ---------------------------------------------------
+
+  function checkSetup() {
+    return fetch("/api/setup")
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (info) {
+        if (!info) return null;
+        state.canAddHosts = info.can_add_hosts;
+        if (info.needs_setup && !info.env_password) openSetup();
+        return info;
+      })
+      .catch(function () { return null; });
+  }
+
+  function openSetup() {
+    if (el.setupDialog.open) return;
+    if (typeof el.setupDialog.showModal === "function") el.setupDialog.showModal();
+  }
+
+  function submitSetup(event) {
+    event.preventDefault();
+    var username = el.setupUsername.value.trim();
+    var password = el.setupPassword.value;
+    if (password !== el.setupConfirm.value) {
+      showError(el.setupError, "The two passwords do not match.");
+      return;
+    }
+    el.setupSubmit.disabled = true;
+    postJSON("/api/setup", { username: username, password: password })
+      .then(function (result) {
+        if (result.error) throw new Error(result.error);
+        // The browser has no credentials for the realm yet, so the next request
+        // would 401. A reload lets it prompt once, cleanly.
+        el.setupDialog.close();
+        window.location.reload();
+      })
+      .catch(function (err) {
+        showError(el.setupError, err.message || "Could not save those credentials.");
+        el.setupSubmit.disabled = false;
+      });
+  }
+
+  // ---- adding a host -----------------------------------------------------
+
+  function openHostDialog() {
+    if (!state.canAddHosts) {
+      openSetup();
+      return;
+    }
+    hide(el.hostError);
+    hide(el.hostLog);
+    el.hostLog.textContent = "";
+    el.hostSubmit.disabled = false;
+    loadStoredKeys();
+    if (typeof el.hostDialog.showModal === "function") el.hostDialog.showModal();
+  }
+
+  function loadStoredKeys() {
+    fetch("/api/keys")
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        var keys = (data && data.keys) || [];
+        el.storedKeyWrap.hidden = keys.length === 0;
+        el.storedKey.innerHTML = '<option value="">Paste a new key</option>';
+        keys.forEach(function (name) {
+          var option = document.createElement("option");
+          option.value = name;
+          option.textContent = name;
+          el.storedKey.appendChild(option);
+        });
+      })
+      .catch(function () { el.storedKeyWrap.hidden = true; });
+  }
+
+  function submitHost(event) {
+    event.preventDefault();
+    hide(el.hostError);
+    var payload = {
+      target: el.hostTarget.value.trim(),
+      ssh_key: el.hostKey.value,
+      stored_key: el.storedKey.value,
+      name: el.hostName.value.trim(),
+      port: el.hostPort.value,
+      remember_key: el.hostRemember.checked
+    };
+    el.hostSubmit.disabled = true;
+    el.hostLog.hidden = false;
+    el.hostLog.textContent = "Connecting…";
+    postJSON("/api/hosts", payload)
+      .then(function (job) {
+        if (job.error) throw new Error(job.error);
+        // The key has left the browser; do not keep it in the DOM.
+        el.hostKey.value = "";
+        pollJob(job.id);
+      })
+      .catch(function (err) {
+        hide(el.hostLog);
+        showError(el.hostError, err.message || "Could not start the install.");
+        el.hostSubmit.disabled = false;
+      });
+  }
+
+  function pollJob(jobId) {
+    fetch("/api/jobs/" + encodeURIComponent(jobId))
+      .then(function (r) { return r.json(); })
+      .then(function (job) {
+        el.hostLog.hidden = false;
+        el.hostLog.textContent = (job.lines || []).join("\n");
+        el.hostLog.scrollTop = el.hostLog.scrollHeight;
+        if (job.status === "running") {
+          setTimeout(function () { pollJob(jobId); }, 900);
+          return;
+        }
+        el.hostSubmit.disabled = false;
+        if (job.status === "failed") {
+          showError(el.hostError, job.error || "The install failed.");
+        } else {
+          el.hostTarget.value = "";
+          load();
+        }
+      })
+      .catch(function () {
+        el.hostSubmit.disabled = false;
+        showError(el.hostError, "Lost contact with the dashboard.");
+      });
+  }
+
+  // ---- small helpers -----------------------------------------------------
+
+  function postJSON(url, body) {
+    return fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }).then(function (r) { return r.json().catch(function () { return {}; }); });
+  }
+
+  function showError(node, message) {
+    node.textContent = message;
+    node.hidden = false;
+  }
+
+  function hide(node) {
+    node.hidden = true;
+  }
+
   // ---- theme -------------------------------------------------------------
 
   function initTheme() {
@@ -490,13 +636,39 @@
       hosts: $("hosts"),
       empty: $("empty"),
       footerMeta: $("footer-meta"),
-      legend: $("legend")
+      legend: $("legend"),
+      addHost: $("add-host"),
+      setupDialog: $("setup-dialog"),
+      setupForm: $("setup-form"),
+      setupUsername: $("setup-username"),
+      setupPassword: $("setup-password"),
+      setupConfirm: $("setup-confirm"),
+      setupSubmit: $("setup-submit"),
+      setupError: $("setup-error"),
+      hostDialog: $("host-dialog"),
+      hostForm: $("host-form"),
+      hostTarget: $("host-target"),
+      hostKey: $("host-key"),
+      storedKeyWrap: $("stored-key-wrap"),
+      storedKey: $("host-stored-key"),
+      hostName: $("host-name"),
+      hostPort: $("host-port"),
+      hostRemember: $("host-remember"),
+      hostSubmit: $("host-submit"),
+      hostCancel: $("host-cancel"),
+      hostError: $("host-error"),
+      hostLog: $("host-log")
     };
 
     initTheme();
     renderLegend();
+    checkSetup();
 
     el.refresh.addEventListener("click", refresh);
+    el.addHost.addEventListener("click", openHostDialog);
+    el.setupForm.addEventListener("submit", submitSetup);
+    el.hostForm.addEventListener("submit", submitHost);
+    el.hostCancel.addEventListener("click", function () { el.hostDialog.close(); });
     el.hostFilter.addEventListener("change", function () {
       state.host = el.hostFilter.value;
       render();

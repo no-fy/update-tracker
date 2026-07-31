@@ -406,3 +406,96 @@ tr.detail td { padding: 0 18px 14px; background: transparent; }
   .field select, .field input { width: 100%; }
   thead th.optional, tbody td.optional { display: none; }
 }
+
+/* ---- dialogs: first-run setup, and adding a host ----------------------- */
+
+.dialog {
+  width: min(560px, calc(100vw - 32px));
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-1);
+  color: var(--text-primary);
+}
+
+.dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
+
+.dialog form { display: flex; flex-direction: column; gap: 14px; padding: 22px; }
+
+.dialog h2 { margin: 0; font-size: 1.15rem; letter-spacing: -0.01em; }
+
+.dialog-lede {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+
+.stack { display: flex; flex-direction: column; gap: 5px; font-size: 0.88rem; }
+.stack > span { font-weight: 550; }
+.stack small { color: var(--text-muted); font-size: 0.79rem; font-weight: 400; }
+
+.stack input, .stack select, .stack textarea {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--rule);
+  border-radius: 7px;
+  background: var(--plane);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 0.88rem;
+}
+
+.stack textarea { font-family: var(--mono); font-size: 0.78rem; resize: vertical; }
+
+.stack input:focus-visible,
+.stack select:focus-visible,
+.stack textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.dialog-row { display: flex; gap: 12px; }
+.dialog-row .stack { flex: 1; }
+
+.check {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  font-size: 0.83rem;
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+
+.check input { margin-top: 2px; }
+
+.dialog-error {
+  margin: 0;
+  padding: 9px 11px;
+  border-radius: 7px;
+  background: rgba(208, 59, 59, 0.10);
+  color: var(--critical);
+  font-size: 0.84rem;
+}
+
+.joblog {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  padding: 11px 12px;
+  border: 1px solid var(--hairline);
+  border-radius: 7px;
+  background: var(--plane);
+  color: var(--text-secondary);
+  font-family: var(--mono);
+  font-size: 0.76rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.dialog-actions { display: flex; justify-content: flex-end; gap: 9px; }
+
+@media (max-width: 520px) {
+  .dialog-row { flex-direction: column; }
+}

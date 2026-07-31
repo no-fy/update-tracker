@@ -23,9 +23,19 @@ import urllib.parse
 
 if __package__ in (None, ""):  # allow `python3 dashboard/server.py`
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from dashboard import collector, config as config_mod, registry as registry_mod
+    from dashboard import (
+        collector,
+        config as config_mod,
+        provision as provision_mod,
+        registry as registry_mod,
+    )
 else:
-    from . import collector, config as config_mod, registry as registry_mod
+    from . import (
+        collector,
+        config as config_mod,
+        provision as provision_mod,
+        registry as registry_mod,
+    )
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 VERSION = "1.0.0"
@@ -47,6 +57,13 @@ def make_registry_client(config, cache_path=None):
 def sanitise_host(host):
     out = {k: v for k, v in host.items() if k != "token"}
     out["has_token"] = bool(host.get("token"))
+    return out
+
+
+def sanitise_settings(settings):
+    """Everything about the dashboard except the credential itself."""
+    out = {k: v for k, v in (settings or {}).items() if k != "password"}
+    out["password_set"] = bool(settings.get("password"))
     return out
 
 
@@ -80,8 +97,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 decoded = base64.b64decode(header[6:]).decode("utf-8")
             except Exception:
                 return False
-            supplied = decoded.partition(":")[2]
-            return hmac.compare_digest(supplied, password)
+            user, _, supplied = decoded.partition(":")
+            expected_user = self.server.username
+            # No configured username means any username, which is how this
+            # behaved before usernames existed.
+            if expected_user and not hmac.compare_digest(user, expected_user):
+                return False
+            return config_mod.verify_password(password, supplied)
         return False
 
     def _challenge(self):
@@ -153,10 +175,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 {
                     "version": VERSION,
                     "config_path": config_path,
-                    "settings": config.get("dashboard", {}),
+                    "settings": sanitise_settings(config.get("dashboard", {})),
                     "registries_configured": sorted((config.get("registries") or {}).keys()),
                 },
             )
+            return
+
+        if path == "/api/setup":
+            self._json(
+                200,
+                {
+                    "needs_setup": not self.server.password,
+                    "username": self.server.username,
+                    "can_add_hosts": bool(self.server.password),
+                    "env_password": bool(os.environ.get("CUD_PASSWORD")),
+                },
+            )
+            return
+
+        if path == "/api/keys":
+            self._json(200, {"keys": self.server.provisioner.keys.names()})
+            return
+
+        if path == "/api/jobs":
+            self._json(200, {"jobs": self.server.provisioner.recent()})
+            return
+
+        if path.startswith("/api/jobs/"):
+            job = self.server.provisioner.get(urllib.parse.unquote(path[len("/api/jobs/"):]))
+            if not job:
+                self._json(404, {"error": "no such job"})
+                return
+            self._json(200, job.snapshot())
             return
 
         self._json(404, {"error": "no such endpoint", "path": path})
@@ -172,6 +222,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/refresh":
             started = self.server.poller.refresh_async()
             self._json(202, {"started": started, "refreshing": True})
+            return
+
+        if path == "/api/setup":
+            self._handle_setup()
+            return
+
+        if path == "/api/hosts":
+            self._handle_add_host()
             return
 
         if path.startswith("/api/hosts/") and path.endswith("/enabled"):
@@ -190,12 +248,69 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         self._json(404, {"error": "no such endpoint", "path": path})
 
+    # -- first-run setup ---------------------------------------------------
+
+    def _handle_setup(self):
+        """Set the username and password on a dashboard that has neither."""
+        if self.server.password:
+            self._json(409, {"error": "credentials are already configured"})
+            return
+
+        body = self._read_body()
+        username = (body.get("username") or "").strip()
+        password = body.get("password") or ""
+
+        if not username:
+            self._json(400, {"error": "A username is required."})
+            return
+        if len(password) < 8:
+            self._json(400, {"error": "The password must be at least 8 characters."})
+            return
+
+        config, config_path = self.server.load_config()
+        settings = config.setdefault("dashboard", {})
+        settings["username"] = username
+        settings["password"] = config_mod.hash_password(password)
+        config_mod.save_config(config, config_path)
+
+        # Take effect immediately: the next request is already authenticated.
+        self.server.username = username
+        self.server.password = settings["password"]
+        self._json(200, {"ok": True, "username": username})
+
+    # -- adding hosts ------------------------------------------------------
+
+    def _handle_add_host(self):
+        if not self.server.password:
+            self._json(
+                403,
+                {
+                    "error": "Set a username and password before adding hosts.",
+                    "needs_setup": True,
+                },
+            )
+            return
+
+        body = self._read_body()
+        try:
+            job = self.server.provisioner.start(body)
+        except provision_mod.ProvisionError as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        self._json(202, job.snapshot())
+
     def do_DELETE(self):  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
 
         if not self._authorised():
             self._challenge()
+            return
+
+        if path.startswith("/api/keys/"):
+            name = urllib.parse.unquote(path[len("/api/keys/"):])
+            removed = self.server.provisioner.keys.delete(name)
+            self._json(200 if removed else 404, {"removed": removed, "key": name})
             return
 
         if path.startswith("/api/hosts/"):
@@ -218,8 +333,29 @@ class DashboardServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 
+def ensure_local_host_registered(config, config_path):
+    """Watch the machine we run on, without being asked.
+
+    Only when nothing at all is configured yet, and only when the socket is
+    actually there -- registering a host that can never be read would just
+    produce a permanent error row.
+    """
+    if config.get("hosts"):
+        return None
+    socket_path = os.environ.get("DOCKER_HOST") or "/var/run/docker.sock"
+    if socket_path.startswith("unix://"):
+        socket_path = socket_path[len("unix://"):]
+    if not os.path.exists(socket_path):
+        return None
+    host, _ = config_mod.ensure_local_host(config)
+    host["docker_socket"] = socket_path
+    config_mod.save_config(config, config_path)
+    return host
+
+
 def build_server(config_path=None, bind=None, port=None, verbose=False):
     config, config_path = config_mod.load_config(config_path)
+    ensure_local_host_registered(config, config_path)
     settings = config.get("dashboard", {})
 
     loader = functools.partial(config_mod.load_config, config_path)
@@ -237,6 +373,10 @@ def build_server(config_path=None, bind=None, port=None, verbose=False):
     httpd.poller = poller
     httpd.load_config = loader
     httpd.password = settings.get("password") or os.environ.get("CUD_PASSWORD")
+    httpd.username = settings.get("username")
+    httpd.provisioner = provision_mod.Provisioner(
+        config_path, on_finish=lambda job: poller.refresh_async()
+    )
     httpd.verbose = verbose
     return httpd, config, config_path
 
@@ -254,7 +394,7 @@ def run(config_path=None, bind=None, port=None, verbose=False):
     print("  refresh   every %g minutes" % interval)
     print("  listening http://%s:%s" % (shown, port))
     if not httpd.password:
-        print("  note      no password set (dashboard.password in config adds one)")
+        print("  note      no password set -- the dashboard will ask you to pick one")
     sys.stdout.flush()
 
     httpd.poller.start_background(interval)
