@@ -248,19 +248,17 @@ def main(argv):
             mode = os.stat(config_path).st_mode & 0o777
             check("config written 0600", mode == 0o600, oct(mode))
 
-            section("Setup script argument parsing")
-            import importlib.util
-            spec = importlib.util.spec_from_file_location(
-                "setup_host", os.path.join(ROOT, "setup-host.py"))
-            setup = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(setup)
-            check("parses user@host", setup.parse_target("root@nas.lan") == ("root@nas.lan", "nas.lan", None))
-            check("parses user@host:port",
-                  setup.parse_target("deploy@10.0.0.5:2222") == ("deploy@10.0.0.5", "10.0.0.5", 2222))
-            check("parses a bare host", setup.parse_target("nas") == ("nas", "nas", None))
-            check("builds an install script",
-                  "systemctl restart" in setup.build_install_script(
-                      "print('x')", {"token": "t"}, {"socket_group": "docker"}, "cudagent", "/usr/bin/python3"))
+            section("Local host registration")
+            local_cfg = os.path.join(workdir, "local", "config.json")
+            cfg, _ = config_mod.load_config(local_cfg)
+            host, created = config_mod.upsert_host(cfg, {
+                "name": "local", "mode": "local",
+                "docker_socket": socket_path, "enabled": True})
+            config_mod.save_config(cfg, local_cfg)
+            check("local socket can be registered", created and host["mode"] == "local")
+            results_local = collector.poll_hosts(cfg["hosts"], timeout=10)
+            check("registered local socket is readable",
+                  results_local[0]["online"] and len(results_local[0]["containers"]) == 8)
 
         section("Credentials")
         hashed = config_mod.hash_password("correct-horse")
@@ -381,6 +379,11 @@ def main(argv):
             stub.shutdown()
 
         section("Local host by default")
+        shared = config_mod.load_config(os.path.join(workdir, "nope-1.json"))[0]
+        shared.setdefault("hosts", []).append({"name": "leak", "mode": "local"})
+        again = config_mod.load_config(os.path.join(workdir, "nope-2.json"))[0]
+        check("defaults are not shared between loaded configs", again.get("hosts") == [])
+
         fresh_path = os.path.join(workdir, "auto", "config.json")
         fresh, _ = config_mod.load_config(fresh_path)
         added = server_mod.ensure_local_host_registered(fresh, fresh_path)

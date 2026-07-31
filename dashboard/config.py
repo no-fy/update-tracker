@@ -6,6 +6,7 @@ the list of hosts. It contains agent tokens, so it is created and rewritten
 with 0600 permissions.
 """
 
+import copy
 import hashlib
 import hmac
 import json
@@ -52,7 +53,10 @@ def default_cache_path(config_path=None):
 
 
 def _merge(base, override):
-    out = dict(base)
+    # deepcopy, not dict(): DEFAULT_CONFIG's nested "hosts" list would otherwise
+    # be shared by every config loaded in the process, so registering a host
+    # against one config would quietly appear in the next one loaded.
+    out = copy.deepcopy(base)
     for key, value in (override or {}).items():
         if isinstance(value, dict) and isinstance(out.get(key), dict):
             out[key] = _merge(out[key], value)

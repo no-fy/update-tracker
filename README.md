@@ -64,8 +64,6 @@ cd container-update-dashboard
 
 ./cud serve                    # http://localhost:8500, registers itself
 ./cud check                    # the same report, in the terminal
-
-./cud add root@nas.lan         # optional: push an agent over SSH instead
 ```
 
 The user running it needs read access to `/var/run/docker.sock`, which normally
@@ -204,9 +202,9 @@ If the host is behind NAT or has several addresses, set
 `-e CUD_ADVERTISE_ADDRESS=10.0.0.4` and the agent will ask to be registered on
 that address instead of the one the dashboard sees.
 
-Hosts without Docker still work the old way, from a terminal:
-`./setup-host.py root@nas.lan` installs the agent as a systemd service over
-SSH. That path is unchanged and is not exposed to the browser.
+The host needs Docker and a reachable port; that is the whole requirement.
+There is no SSH path any more, from the browser or anywhere else — the
+dashboard holds no credentials for your machines at all.
 
 ## What the statuses mean
 
@@ -228,38 +226,28 @@ labels:
   # or: com.centurylinklabs.watchtower.enable: "false"
 ```
 
-## Adding servers
+## Managing an agent
+
+The agent is a container on the host, so there is no service to learn:
 
 ```bash
-./setup-host.py root@nas.lan                 # usual case
-./setup-host.py root@nas.lan --dry-run       # check the host, install nothing
-./setup-host.py root@nas.lan --name storage  # override the short name
-./setup-host.py root@nas.lan --port 9800     # different agent port
-./setup-host.py root@nas.lan --address 10.0.0.4  # connect on a different address than SSH
-./setup-host.py root@nas.lan --uninstall     # remove the agent and unregister
+docker logs container-update-agent          # did it enrol? is it serving?
+docker restart container-update-agent       # after a reboot, if not --restart
+docker rm -f container-update-agent         # remove it entirely
+docker pull ghcr.io/no-fy/update-tracker-agent:latest   # update it
 ```
 
-Requirements on the remote host: SSH access (key-based — the script does not
-handle password logins), Python 3.12+, systemd, and a Docker socket. Root or
-sudo is needed to install the service; if sudo asks for a password you will be
-prompted.
+Requirements on the host: Docker, a reachable port for the agent (9713 by
+default), and network access from the dashboard to that port. No Python, no
+systemd, no SSH, and no login of any kind for the dashboard.
 
-What it installs:
+Removing a host is two steps, because the dashboard cannot reach into a machine
+it has no credentials for: `./cud remove nas` (or the delete control in the UI)
+forgets it here, and `docker rm -f container-update-agent` on the host stops it
+there. `cud remove` reminds you of the second one.
 
-| Path | What |
-|---|---|
-| `/opt/container-update-agent/agent.py` | the agent, a single file |
-| `/etc/container-update-agent/config.json` | token, port, socket path (mode 0600) |
-| `/etc/systemd/system/container-update-agent.service` | the unit |
-
-The service runs as a dedicated `cudagent` system user in the Docker socket's
-group where possible (root only if the socket is root-owned), with
-`NoNewPrivileges`, `ProtectSystem=strict`, an empty capability bounding set and
-the rest of the usual systemd hardening.
-
-If the install succeeds but verification fails, the script checks whether the
-agent answers on the host itself and looks for ufw/firewalld, so you get told
-"a firewall is blocking port 9713" rather than "connection refused".
+If an agent's token is ever compromised, remove the host and enrol it again —
+that mints a fresh token and the old one stops being accepted.
 
 ### The local host
 
@@ -358,7 +346,6 @@ The image is the CLI, so host management is the same commands with
 ```bash
 docker compose run --rm dashboard hosts
 docker compose run --rm dashboard check --updates-only
-docker compose run --rm -v ~/.ssh:/home/cud/.ssh:ro dashboard add root@nas.lan
 ```
 
 `config.json` (which holds the agent tokens) and the registry cache live on the
@@ -370,11 +357,6 @@ of it at startup.
 
 `CUD_PASSWORD` is commented out in `docker-compose.yml`: setting it skips the
 first-run prompt and fixes the password from the environment instead.
-
-Adding a remote host from inside the container needs your SSH key mounted, as
-above; `setup-host.py` uses key-based auth only. Running it from a checkout on
-the host works equally well — the agent it installs is independent of how the
-dashboard is deployed.
 
 ### How the image is built
 
@@ -471,7 +453,6 @@ python3 tests/fake_docker.py /tmp/fake.sock &
 
 ```
 cud                       CLI: serve, check, hosts, add, remove
-setup-host.py             SSH provisioner for a remote host
 Dockerfile                the dashboard as a container
 Dockerfile.agent          the agent as a container, for enrolment
 docker-compose.yml        socket bound, nothing else to fill in

@@ -104,7 +104,7 @@ def poll_host(host, timeout=20, include_stopped=True):
         result["error"] = str(exc)
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
-            result["error"] = "agent rejected the token (re-run setup-host.py for this host)"
+            result["error"] = "agent rejected the token -- remove the host and enrol it again"
         else:
             result["error"] = "agent returned HTTP %s" % exc.code
     except urllib.error.URLError as exc:
