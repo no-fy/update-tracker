@@ -29,6 +29,34 @@ image, across as many servers as you like.
 
 ## Quick start
 
+The dashboard ships as a container image, which is the easiest way to run it.
+Grab `docker-compose.yml` from this repo and:
+
+```bash
+docker compose up -d                                    # http://localhost:8500
+
+docker compose run --rm dashboard add root@nas.lan      # a server, over SSH
+docker compose run --rm dashboard add deploy@10.0.0.5:2222   # other SSH port
+```
+
+The image is published to the GitHub Container Registry for amd64 and arm64, so
+it runs on a NAS or a Pi as happily as on a server:
+
+```bash
+docker pull ghcr.io/no-fy/update-tracker:latest
+```
+
+`docker compose run --rm dashboard check` prints the same information in the
+terminal, which is what you want from cron. See [Running in a
+container](#running-the-dashboard-in-a-container) for the volume, the Docker
+socket and the password.
+
+<details>
+<summary>Running from a checkout instead</summary>
+
+There is nothing to build and nothing to install — Python 3.8+ and the standard
+library are the only requirements.
+
 ```bash
 cd container-update-dashboard
 
@@ -37,10 +65,15 @@ cd container-update-dashboard
 ./cud add deploy@10.0.0.5:2222 # non-standard SSH port
 
 ./cud serve                    # http://localhost:8500
+./cud check                    # the same report, in the terminal
 ```
 
-`./cud check` prints the same information in the terminal, which is what you
-want from cron.
+This is the better path if you want the dashboard to watch its own machine,
+since it reads `/var/run/docker.sock` directly with no socket mount or group
+juggling. See [Running as a service](#running-the-dashboard-as-a-service) for
+the systemd unit.
+
+</details>
 
 ## What the statuses mean
 
@@ -147,6 +180,8 @@ elsewhere.
 
 ## Running the dashboard as a service
 
+If you are not using the container, systemd runs it from a checkout:
+
 ```ini
 # /etc/systemd/system/container-update-dashboard.service
 [Unit]
@@ -171,8 +206,13 @@ A copy of this unit is in `contrib/container-update-dashboard.service`.
 ## Running the dashboard in a container
 
 ```bash
-docker compose up -d --build          # http://localhost:8500
+docker compose up -d                  # http://localhost:8500
+docker compose up -d --build          # build your working copy instead
 ```
+
+`docker-compose.yml` points at `ghcr.io/no-fy/update-tracker:latest` and pulls
+on every `up`, so bringing the stack up is also how you update it. Pin a release
+tag (`:1.0.0`) instead if you would rather choose your own moment.
 
 The image is the CLI, so host management is the same commands with
 `docker compose run --rm`:
@@ -205,6 +245,25 @@ Adding a remote host from inside the container needs your SSH key mounted, as
 above; `setup-host.py` uses key-based auth only. Running it from a checkout on
 the host works equally well — the agent it installs is independent of how the
 dashboard is deployed.
+
+### How the image is built
+
+`.github/workflows/docker.yml` runs the offline smoke test on Python 3.8 and
+3.12, and only then builds `linux/amd64` and `linux/arm64` and pushes to
+`ghcr.io/no-fy/update-tracker`. Pull requests build the image to prove the
+Dockerfile still works but publish nothing.
+
+| Trigger | Tags |
+|---|---|
+| push to `main` | `latest`, `sha-<short>` |
+| push of tag `v1.2.3` | `1.2.3`, `1.2`, `sha-<short>` |
+
+Nothing needs configuring for this: it authenticates with the built-in
+`GITHUB_TOKEN` via the workflow's `packages: write` permission — no secret to
+add. The one manual step is on the very first run, since a new GHCR package is
+private: open the package under your profile's *Packages*, then *Package
+settings* → *Change visibility* → *Public* if you want unauthenticated pulls,
+and link it to this repository so it inherits future access.
 
 For a nightly report by mail instead:
 
@@ -271,6 +330,7 @@ cud                       CLI: serve, check, hosts, add, remove
 setup-host.py             SSH provisioner for a remote host
 Dockerfile                the dashboard as a container
 docker-compose.yml        socket mount and password, commented out
+.github/workflows/        test, then build and push the image to ghcr.io
 agent/agent.py            the agent — one stdlib-only file, also imported for local hosts
 dashboard/registry.py     tag → digest, via the OCI distribution API
 dashboard/collector.py    polls hosts, classifies containers

@@ -1,7 +1,10 @@
 services:
   dashboard:
+    image: ghcr.io/no-fy/update-tracker:latest
+    # To run your own working copy instead of the published image:
+    #   docker compose up -d --build
     build: .
-    image: container-update-dashboard:1.0.0
+    pull_policy: always
     container_name: container-update-dashboard
     restart: unless-stopped
     ports:
