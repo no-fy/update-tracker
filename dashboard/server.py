@@ -322,6 +322,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_container_logs(path)
             return
 
+        if path.startswith("/api/hosts/") and "/recreate/job/" in path:
+            self._handle_container_recreate_job(path)
+            return
+
         if path.startswith("/api/hosts/") and "/os/job/" in path:
             rest = path[len("/api/hosts/"):]
             name, _, job_id = rest.partition("/os/job/")
@@ -397,8 +401,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if path.startswith("/api/hosts/") and "/containers/" in path:
             tail = path.rsplit("/", 1)[-1]
-            if tail in ("start", "stop", "restart"):
+            if tail in ("start", "stop", "restart", "pause", "unpause"):
                 self._handle_container_action(path, tail)
+                return
+            if tail == "rename":
+                self._handle_container_rename(path)
+                return
+            if tail == "recreate":
+                self._handle_container_recreate(path)
                 return
 
         if path.startswith("/api/hosts/") and path.endswith("/enabled"):
@@ -525,6 +535,85 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self._json(200, result)
 
+    def _handle_container_rename(self, path):
+        name, container_id = self._split_container_path(path, "/rename")
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+
+        body = self._read_body()
+        new_name = (body.get("name") or "").strip()
+        if not new_name:
+            self._json(400, {"error": "A new name is required."})
+            return
+        try:
+            result = collector.container_rename(host, container_id, new_name)
+        except collector.ContainerActionRefused as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")
+            try:
+                self._json(exc.code, json.loads(detail))
+            except ValueError:
+                self._json(exc.code, {"error": detail[:300] or "agent refused"})
+            return
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self.server.poller.refresh_async()
+        self._json(200, result)
+
+    def _handle_container_recreate(self, path):
+        name, container_id = self._split_container_path(path, "/recreate")
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+
+        try:
+            job = collector.container_recreate(host, container_id)
+        except collector.ContainerActionRefused as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")
+            try:
+                self._json(exc.code, json.loads(detail))
+            except ValueError:
+                self._json(exc.code, {"error": detail[:300] or "agent refused"})
+            return
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self._json(202, job)
+
+    def _handle_container_recreate_job(self, path):
+        rest = path[len("/api/hosts/"):]
+        name, _, tail = rest.partition("/containers/")
+        container_id, _, job_id = tail.partition("/recreate/job/")
+        name = urllib.parse.unquote(name)
+        container_id = urllib.parse.unquote(container_id)
+        job_id = urllib.parse.unquote(job_id)
+
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+        try:
+            job = collector.container_recreate_job(host, container_id, job_id)
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        if job is None:
+            self._json(404, {"error": "no such job"})
+            return
+        self._json(200, job)
+
     # -- first-run setup ---------------------------------------------------
 
     def _handle_setup(self):
@@ -627,6 +716,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(200 if removed else 404, {"removed": removed, "id": item_id})
             return
 
+        if path.startswith("/api/hosts/") and "/containers/" in path:
+            self._handle_container_remove(path)
+            return
+
         if path.startswith("/api/hosts/"):
             name = urllib.parse.unquote(path[len("/api/hosts/"):])
             config, config_path = self.server.load_config()
@@ -640,6 +733,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         self._json(404, {"error": "no such endpoint", "path": path})
+
+    def _handle_container_remove(self, path):
+        name, container_id = self._split_container_path(path, "")
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        expected_name = (query.get("expected_name") or [None])[0]
+        try:
+            result = collector.container_remove(host, container_id, expected_name=expected_name)
+        except collector.ContainerActionRefused as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")
+            try:
+                self._json(exc.code, json.loads(detail))
+            except ValueError:
+                self._json(exc.code, {"error": detail[:300] or "agent refused"})
+            return
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self.server.poller.refresh_async()
+        self._json(200, result)
 
 
 class DashboardServer(socketserver.ThreadingMixIn, http.server.HTTPServer):

@@ -231,6 +231,85 @@ def container_action(host, container_id, action, timeout=None, request_timeout=3
                            verify_tls=host.get("verify_tls", True))
 
 
+def container_rename(host, container_id, new_name, request_timeout=30):
+    if host.get("mode") == "local":
+        import containerctl
+
+        client = agent_module.DockerClient(host.get("docker_socket"))
+        try:
+            containerctl.run_rename(client, container_id, new_name)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+        return {"ok": True, "container": container_id, "name": new_name}
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/containers/%s/rename" % (
+        scheme, host.get("address"), host.get("port", 9713),
+        urllib.parse.quote(container_id, safe=""))
+    return _http_post_json(url, {"name": new_name}, token=host.get("token"),
+                           timeout=request_timeout, verify_tls=host.get("verify_tls", True))
+
+
+def container_remove(host, container_id, expected_name=None, request_timeout=30):
+    if host.get("mode") == "local":
+        import containerctl
+
+        client = agent_module.DockerClient(host.get("docker_socket"))
+        try:
+            containerctl.run_remove(client, container_id, expected_name=expected_name)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+        return {"ok": True, "container": container_id, "removed": True}
+
+    scheme = "https" if host.get("tls") else "http"
+    query = ("?expected_name=" + urllib.parse.quote(expected_name, safe="")) if expected_name else ""
+    url = "%s://%s:%s/v1/containers/%s%s" % (
+        scheme, host.get("address"), host.get("port", 9713),
+        urllib.parse.quote(container_id, safe=""), query)
+    return _http_delete_json(url, token=host.get("token"), timeout=request_timeout,
+                             verify_tls=host.get("verify_tls", True))
+
+
+def container_recreate(host, container_id, request_timeout=30):
+    """Start a recreate job: pull the container's image and swap it in."""
+    if host.get("mode") == "local":
+        import containerctl
+
+        client = agent_module.DockerClient(host.get("docker_socket"))
+        try:
+            job = containerctl.RECREATE_RUNNER.start(client, container_id)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+        return job.snapshot()
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/containers/%s/recreate" % (
+        scheme, host.get("address"), host.get("port", 9713),
+        urllib.parse.quote(container_id, safe=""))
+    return _http_post_json(url, {}, token=host.get("token"), timeout=request_timeout,
+                           verify_tls=host.get("verify_tls", True))
+
+
+def container_recreate_job(host, container_id, job_id, timeout=20):
+    if host.get("mode") == "local":
+        import containerctl
+
+        job = containerctl.RECREATE_RUNNER.get(job_id)
+        return job.snapshot() if job else None
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/containers/%s/recreate/job/%s" % (
+        scheme, host.get("address"), host.get("port", 9713),
+        urllib.parse.quote(container_id, safe=""), urllib.parse.quote(job_id, safe=""))
+    try:
+        return _http_get_json(url, token=host.get("token"), timeout=timeout,
+                              verify_tls=host.get("verify_tls", True))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise
+
+
 def container_logs(host, container_id, tail=200, timeout=20):
     """Recent stdout/stderr lines for one container."""
     if host.get("mode") == "local":
@@ -257,6 +336,20 @@ def _http_post_json(url, payload, token=None, timeout=30, verify_tls=True):
     if token:
         headers["Authorization"] = "Bearer " + token
     request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    context = None
+    if url.startswith("https://") and not verify_tls:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _http_delete_json(url, token=None, timeout=30, verify_tls=True):
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    request = urllib.request.Request(url, headers=headers, method="DELETE")
     context = None
     if url.startswith("https://") and not verify_tls:
         context = ssl.create_default_context()

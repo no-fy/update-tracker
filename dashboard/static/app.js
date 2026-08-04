@@ -25,7 +25,7 @@
     status: "", query: "",            // containers tab
     severity: "", osQuery: "",        // OS tab
     host: "", open: {}, picked: {}, osJobs: {}, canAddHosts: false,
-    containerJobs: {}, logsOpen: {}, logs: {}
+    containerJobs: {}, logsOpen: {}, logs: {}, renaming: {}, detailTab: {}
   };
   var el = {};
   var pollTimer = null;
@@ -451,31 +451,34 @@
   }
 
   function confirmAndRun(host, packages, severity, question) {
-    if (!window.confirm(question + "\n\nThis runs the package manager on that machine.")) return;
-    var body = {};
-    if (packages) body.packages = packages;
-    if (severity) body.severity = severity;
+    confirmDialog("Install updates?", question + " This runs the package manager on that machine.",
+      { confirmLabel: "Install" }).then(function (ok) {
+      if (!ok) return;
+      var body = {};
+      if (packages) body.packages = packages;
+      if (severity) body.severity = severity;
 
-    state.osJobs[host.name] = { status: "running", packages: packages || [], lines: [] };
-    render();
+      state.osJobs[host.name] = { status: "running", packages: packages || [], lines: [] };
+      render();
 
-    postJSON("/api/hosts/" + encodeURIComponent(host.name) + "/os/update", body)
-      .then(function (job) {
-        if (job.error) throw new Error(job.error);
-        state.osJobs[host.name] = job;
-        pickedFor(host).forEach(function (name) {
-          delete state.picked[host.name + "/" + name];
+      postJSON("/api/hosts/" + encodeURIComponent(host.name) + "/os/update", body)
+        .then(function (job) {
+          if (job.error) throw new Error(job.error);
+          state.osJobs[host.name] = job;
+          pickedFor(host).forEach(function (name) {
+            delete state.picked[host.name + "/" + name];
+          });
+          render();
+          watchOsJob(host, job.id);
+        })
+        .catch(function (err) {
+          state.osJobs[host.name] = {
+            status: "failed", packages: packages || [],
+            lines: [err.message || "The update could not be started."]
+          };
+          render();
         });
-        render();
-        watchOsJob(host, job.id);
-      })
-      .catch(function (err) {
-        state.osJobs[host.name] = {
-          status: "failed", packages: packages || [],
-          lines: [err.message || "The update could not be started."]
-        };
-        render();
-      });
+    });
   }
 
   function watchOsJob(host, jobId) {
@@ -509,6 +512,19 @@
 
   function capitalize(word) { return word.charAt(0).toUpperCase() + word.slice(1); }
 
+  var ACTION_PRESENT = {
+    start: "Starting", stop: "Stopping", restart: "Restarting", pause: "Pausing",
+    unpause: "Unpausing", rename: "Renaming", remove: "Removing", recreate: "Recreating"
+  };
+  var ACTION_PAST = {
+    start: "started", stop: "stopped", restart: "restarted", pause: "paused",
+    unpause: "unpaused", rename: "renamed", remove: "removed", recreate: "recreated"
+  };
+  function presentTense(action) { return ACTION_PRESENT[action] || (capitalize(action) + "ing"); }
+  function pastTense(action) { return ACTION_PAST[action] || (action + "ed"); }
+
+  function containerKey(container) { return container.host + "/" + container.id; }
+
   function containerActionBar(host, container) {
     var bar = text("div", "container-actions");
     var capability = host.container_actions || {};
@@ -518,49 +534,142 @@
       return bar;
     }
 
-    var key = container.host + "/" + container.id;
+    var key = containerKey(container);
     var job = state.containerJobs[key];
     if (job && job.status === "running") {
       var busy = text("span", "os-running");
       busy.appendChild(text("span", "spinner"));
-      busy.appendChild(text("span", null, capitalize(job.action) + "ing " + container.name + "…"));
+      busy.appendChild(text("span", null, presentTense(job.action) + " " + container.name + "…"));
       bar.appendChild(busy);
+      if (job.action === "recreate" && job.lines && job.lines.length) {
+        bar.appendChild(logBox(job));
+      }
       return bar;
     }
 
     var running = container.state === "running";
+    var paused = container.state === "paused";
 
-    function actionButton(label, action, needsConfirm, primary) {
-      var btn = text("button", "button small" + (primary ? " primary" : ""));
+    function actionButton(parent, label, action, needsConfirm, style) {
+      var btn = text("button", "button small" + (style ? " " + style : ""));
       btn.type = "button";
       btn.textContent = label;
       btn.addEventListener("click", function () {
-        if (needsConfirm && !window.confirm(
-            label + " " + container.name + " on " + (host.label || host.name) + "?")) {
+        if (!needsConfirm) {
+          runContainerAction(host, container, action);
           return;
         }
-        runContainerAction(host, container, action);
+        confirmDialog(
+          label + " this container?",
+          label + " " + container.name + " on " + (host.label || host.name) + "?",
+          { confirmLabel: label, danger: style === "danger" }
+        ).then(function (ok) { if (ok) runContainerAction(host, container, action); });
       });
-      bar.appendChild(btn);
+      parent.appendChild(btn);
     }
 
-    if (!running) actionButton("Start", "start", false, true);
-    if (running) actionButton("Restart", "restart", true, false);
-    if (running) actionButton("Stop", "stop", true, false);
+    var lifecycle = text("div", "action-group");
+    if (!running && !paused) actionButton(lifecycle, "Start", "start", false, "primary");
+    if (paused) actionButton(lifecycle, "Unpause", "unpause", false, "primary");
+    if (running) actionButton(lifecycle, "Pause", "pause", false, "");
+    if (running) actionButton(lifecycle, "Restart", "restart", true, "");
+    if (running || paused) actionButton(lifecycle, "Stop", "stop", true, "danger");
+    bar.appendChild(lifecycle);
+
+    if (container.update_status === "update-available" || container.update_status === "restart-pending") {
+      var recreateBtn = text("button", "button small primary");
+      recreateBtn.type = "button";
+      recreateBtn.textContent = "Recreate with latest image";
+      recreateBtn.addEventListener("click", function () {
+        confirmDialog(
+          "Recreate this container?",
+          "Pull the latest image for " + container.name + " and swap it in, keeping its " +
+          "config (env, ports, networks, volumes). Brief downtime while it restarts.",
+          { confirmLabel: "Recreate" }
+        ).then(function (ok) { if (ok) runContainerRecreate(host, container); });
+      });
+      bar.appendChild(recreateBtn);
+    }
+
+    var manage = text("div", "action-group");
+    if (state.renaming[key]) {
+      manage.appendChild(renameForm(host, container, key));
+    } else {
+      var renameBtn = text("button", "button small");
+      renameBtn.type = "button";
+      renameBtn.textContent = "Rename";
+      renameBtn.addEventListener("click", function () {
+        state.renaming[key] = true;
+        render();
+      });
+      manage.appendChild(renameBtn);
+    }
+    if (!running && !paused) {
+      var removeBtn = text("button", "button small danger");
+      removeBtn.type = "button";
+      removeBtn.textContent = "Remove";
+      removeBtn.addEventListener("click", function () {
+        confirmDialog(
+          "Remove this container?",
+          "This permanently deletes " + container.name + " on " + (host.label || host.name) +
+          ". This cannot be undone.",
+          { confirmLabel: "Remove", danger: true, typeToConfirm: container.name }
+        ).then(function (ok) { if (ok) runContainerRemove(host, container); });
+      });
+      manage.appendChild(removeBtn);
+    }
+    bar.appendChild(manage);
 
     if (job && job.status && job.status !== "running") {
       var done = text("span", job.status === "ok" ? "os-done" : "os-failed",
         job.status === "ok"
-          ? capitalize(job.action) + "ed " + container.name
-          : (job.message || (capitalize(job.action) + " failed")));
+          ? capitalize(pastTense(job.action)) + " " + container.name
+          : (job.message || (capitalize(pastTense(job.action)) + " failed")));
       bar.appendChild(done);
+      if (job.action === "recreate" && job.lines && job.lines.length) {
+        bar.appendChild(logBox(job));
+      }
     }
 
     return bar;
   }
 
+  function renameForm(host, container, key) {
+    var wrap = text("span", "rename-form");
+    var input = document.createElement("input");
+    input.type = "text";
+    input.value = container.name;
+    input.className = "rename-input";
+    wrap.appendChild(input);
+
+    var save = text("button", "button small primary");
+    save.type = "button";
+    save.textContent = "Save";
+    save.addEventListener("click", function () {
+      var newName = input.value.trim();
+      if (!newName || newName === container.name) {
+        state.renaming[key] = false;
+        render();
+        return;
+      }
+      runContainerRename(host, container, newName);
+    });
+    wrap.appendChild(save);
+
+    var cancel = text("button", "button small");
+    cancel.type = "button";
+    cancel.textContent = "Cancel";
+    cancel.addEventListener("click", function () {
+      state.renaming[key] = false;
+      render();
+    });
+    wrap.appendChild(cancel);
+
+    return wrap;
+  }
+
   function runContainerAction(host, container, action) {
-    var key = container.host + "/" + container.id;
+    var key = containerKey(container);
     state.containerJobs[key] = { status: "running", action: action };
     render();
 
@@ -580,14 +689,123 @@
       .catch(function (err) {
         state.containerJobs[key] = {
           status: "failed", action: action,
-          message: err.message || (capitalize(action) + " failed."),
+          message: err.message || (capitalize(pastTense(action)) + " failed."),
         };
         render();
       });
   }
 
+  function runContainerRename(host, container, newName) {
+    var key = containerKey(container);
+    state.containerJobs[key] = { status: "running", action: "rename" };
+    render();
+
+    postJSON(
+      "/api/hosts/" + encodeURIComponent(host.name) +
+      "/containers/" + encodeURIComponent(container.id) + "/rename",
+      { name: newName }
+    )
+      .then(function (result) {
+        if (result.error) throw new Error(result.error);
+        state.containerJobs[key] = { status: "ok", action: "rename" };
+        state.renaming[key] = false;
+        render();
+        fetch("/api/refresh", { method: "POST" }).then(function () {
+          setTimeout(load, 1200);
+        });
+      })
+      .catch(function (err) {
+        state.containerJobs[key] = {
+          status: "failed", action: "rename",
+          message: err.message || "Rename failed.",
+        };
+        render();
+      });
+  }
+
+  function runContainerRemove(host, container) {
+    var key = containerKey(container);
+    state.containerJobs[key] = { status: "running", action: "remove" };
+    render();
+
+    fetch(
+      "/api/hosts/" + encodeURIComponent(host.name) +
+      "/containers/" + encodeURIComponent(container.id) +
+      "?expected_name=" + encodeURIComponent(container.name),
+      { method: "DELETE" }
+    )
+      .then(function (r) { return r.json().catch(function () { return {}; }); })
+      .then(function (result) {
+        if (result.error) throw new Error(result.error);
+        render();
+        fetch("/api/refresh", { method: "POST" }).then(function () {
+          setTimeout(load, 1200);
+        });
+      })
+      .catch(function (err) {
+        state.containerJobs[key] = {
+          status: "failed", action: "remove",
+          message: err.message || "Remove failed.",
+        };
+        render();
+      });
+  }
+
+  function runContainerRecreate(host, container) {
+    var key = containerKey(container);
+    state.containerJobs[key] = { status: "running", action: "recreate", lines: [] };
+    render();
+
+    postJSON(
+      "/api/hosts/" + encodeURIComponent(host.name) +
+      "/containers/" + encodeURIComponent(container.id) + "/recreate",
+      {}
+    )
+      .then(function (job) {
+        if (job.error) throw new Error(job.error);
+        state.containerJobs[key] = recreateJobState(job);
+        render();
+        watchRecreateJob(host, container, job.id);
+      })
+      .catch(function (err) {
+        state.containerJobs[key] = {
+          status: "failed", action: "recreate",
+          message: err.message || "Recreate could not be started.",
+        };
+        render();
+      });
+  }
+
+  function recreateJobState(job) {
+    return { status: job.status, action: "recreate", lines: job.lines || [], jobId: job.id };
+  }
+
+  function watchRecreateJob(host, container, jobId) {
+    var key = containerKey(container);
+    fetch(
+      "/api/hosts/" + encodeURIComponent(host.name) +
+      "/containers/" + encodeURIComponent(container.id) +
+      "/recreate/job/" + encodeURIComponent(jobId)
+    )
+      .then(function (r) { return r.json(); })
+      .then(function (job) {
+        state.containerJobs[key] = recreateJobState(job);
+        render();
+        if (job.status === "running") {
+          setTimeout(function () { watchRecreateJob(host, container, jobId); }, 1200);
+        } else {
+          fetch("/api/refresh", { method: "POST" }).then(function () {
+            setTimeout(load, 1200);
+          });
+        }
+      })
+      .catch(function () {
+        setTimeout(function () { watchRecreateJob(host, container, jobId); }, 2500);
+      });
+  }
+
   function logsSection(host, container) {
-    var key = container.host + "/" + container.id;
+    var key = containerKey(container);
     var wrap = text("div", "logs-section");
     var open = !!state.logsOpen[key];
 
@@ -622,7 +840,7 @@
   }
 
   function loadLogs(host, container) {
-    var key = container.host + "/" + container.id;
+    var key = containerKey(container);
     state.logs[key] = { loading: true };
     render();
 
@@ -686,6 +904,67 @@
     el.hostFilter.value = state.host;
   }
 
+  function containerDetailsPanel(container) {
+    var grid = text("div", "detail-grid");
+
+    function item(label, value) {
+      if (!value) return;
+      var wrapper = text("dl", "detail-item");
+      wrapper.appendChild(text("dt", null, label));
+      wrapper.appendChild(text("dd", null, value));
+      grid.appendChild(wrapper);
+    }
+
+    item("Image", container.image_ref);
+    item("Running", shortDigest(container.local_digest));
+    item("Registry", shortDigest(container.remote_digest));
+    item("Built", container.image_created ? relativeTime(container.image_created) : null);
+    item("Published", container.remote_created ? relativeTime(container.remote_created) : null);
+    item("Container", container.id);
+    item("Created", relativeTime(container.created));
+    item("Ports", (container.ports || []).join(", "));
+    if (container.compose_workdir) item("Compose", container.compose_workdir);
+
+    return grid;
+  }
+
+  var DETAIL_TABS = [
+    { id: "details", label: "Details" },
+    { id: "actions", label: "Actions" },
+    { id: "logs", label: "Logs" }
+  ];
+
+  function containerDetailTabs(host, container, key) {
+    var wrap = text("div", null);
+    var active = state.detailTab[key] || "details";
+
+    var tabs = text("div", "subtabs");
+    DETAIL_TABS.forEach(function (tab) {
+      var btn = text("button", "subtab");
+      btn.type = "button";
+      btn.setAttribute("aria-selected", active === tab.id ? "true" : "false");
+      btn.textContent = tab.label;
+      btn.addEventListener("click", function () {
+        state.detailTab[key] = tab.id;
+        render();
+      });
+      tabs.appendChild(btn);
+    });
+    wrap.appendChild(tabs);
+
+    var panel = text("div", "subtab-panel");
+    if (active === "actions") {
+      panel.appendChild(containerActionBar(host, container));
+    } else if (active === "logs") {
+      panel.appendChild(logsSection(host, container));
+    } else {
+      panel.appendChild(containerDetailsPanel(container));
+    }
+    wrap.appendChild(panel);
+
+    return wrap;
+  }
+
   function containerRow(container, host) {
     var key = container.host + "/" + container.id;
     var row = text("tr", "row");
@@ -716,27 +995,7 @@
     cell.colSpan = 5;
     var body = text("div", "detail-body");
     body.appendChild(text("p", "detail-note", container.detail || ""));
-    body.appendChild(containerActionBar(host, container));
-
-    function item(label, value) {
-      if (!value) return;
-      var wrapper = text("dl", "detail-item");
-      wrapper.appendChild(text("dt", null, label));
-      wrapper.appendChild(text("dd", null, value));
-      body.appendChild(wrapper);
-    }
-
-    item("Image", container.image_ref);
-    item("Running", shortDigest(container.local_digest));
-    item("Registry", shortDigest(container.remote_digest));
-    item("Built", container.image_created ? relativeTime(container.image_created) : null);
-    item("Published", container.remote_created ? relativeTime(container.remote_created) : null);
-    item("Container", container.id);
-    item("Created", relativeTime(container.created));
-    item("Ports", (container.ports || []).join(", "));
-    if (container.compose_workdir) item("Compose", container.compose_workdir);
-
-    body.appendChild(logsSection(host, container));
+    body.appendChild(containerDetailTabs(host, container, key));
 
     cell.appendChild(body);
     detail.appendChild(cell);
@@ -1197,6 +1456,45 @@
     }
   }
 
+  // ---- confirm dialog ------------------------------------------------------
+
+  function confirmDialog(title, message, options) {
+    options = options || {};
+    el.confirmTitle.textContent = title || "Are you sure?";
+    el.confirmMessage.textContent = message || "";
+    el.confirmOk.textContent = options.confirmLabel || "Confirm";
+    el.confirmOk.className = "button" + (options.danger ? " danger" : " primary");
+
+    var typed = options.typeToConfirm;
+    el.confirmTypedWrap.hidden = !typed;
+    el.confirmTypedInput.value = "";
+    if (typed) {
+      el.confirmTypedLabel.textContent = "Type “" + typed + "” to confirm";
+      el.confirmOk.disabled = true;
+      el.confirmTypedInput.oninput = function () {
+        el.confirmOk.disabled = el.confirmTypedInput.value !== typed;
+      };
+    } else {
+      el.confirmOk.disabled = false;
+      el.confirmTypedInput.oninput = null;
+    }
+
+    return new Promise(function (resolve) {
+      function onClose() {
+        el.confirmDialog.removeEventListener("close", onClose);
+        el.confirmOk.disabled = false;
+        resolve(el.confirmDialog.returnValue === "ok");
+      }
+      el.confirmDialog.addEventListener("close", onClose);
+      if (typeof el.confirmDialog.showModal === "function") {
+        el.confirmDialog.showModal();
+        if (typed) el.confirmTypedInput.focus();
+      } else {
+        resolve(!typed && window.confirm([title, message].filter(Boolean).join("\n\n")));
+      }
+    });
+  }
+
   // ---- small helpers -----------------------------------------------------
 
   function postJSON(url, body) {
@@ -1276,7 +1574,15 @@
       hostPort: $("host-port"),
       hostSubmit: $("host-submit"),
       hostCancel: $("host-cancel"),
-      hostError: $("host-error")
+      hostError: $("host-error"),
+      confirmDialog: $("confirm-dialog"),
+      confirmTitle: $("confirm-title"),
+      confirmMessage: $("confirm-message"),
+      confirmOk: $("confirm-ok"),
+      confirmCancel: $("confirm-cancel"),
+      confirmTypedWrap: $("confirm-typed-wrap"),
+      confirmTypedLabel: $("confirm-typed-label"),
+      confirmTypedInput: $("confirm-typed-input")
     };
 
     initTheme();
@@ -1291,6 +1597,7 @@
     el.hostForm.addEventListener("submit", submitHost);
     el.hostCancel.addEventListener("click", function () { el.hostDialog.close(); });
     el.hostCopy.addEventListener("click", copyCommand);
+    el.confirmCancel.addEventListener("click", function () { el.confirmDialog.close(""); });
     el.signout.addEventListener("click", function () {
       fetch("/api/logout", { method: "POST" })
         .then(function () { window.location.replace("/login"); })

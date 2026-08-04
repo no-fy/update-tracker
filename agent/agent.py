@@ -195,6 +195,117 @@ class DockerClient:
             API_VERSION, urllib.parse.quote(container_id, safe=""), int(tail))
         return self.raw_get(path)
 
+    def delete(self, path):
+        conn = self._connect()
+        try:
+            conn.request("DELETE", path, headers={"Host": "docker"})
+            resp = conn.getresponse()
+            body = resp.read()
+            if resp.status == 404:
+                raise DockerError("not found: %s" % path)
+            if resp.status >= 400:
+                raise DockerError(
+                    "docker API %s returned %s: %s"
+                    % (path, resp.status, body.decode("utf-8", "replace")[:200])
+                )
+            if not body:
+                return None
+            try:
+                return json.loads(body.decode("utf-8"))
+            except ValueError:
+                return None
+        except (OSError, http.client.HTTPException) as exc:
+            raise DockerError("docker API request failed: %s" % exc) from exc
+        finally:
+            conn.close()
+
+    def post_json(self, path, payload=None):
+        """Like post(), but sends a JSON body -- create/rename/connect need one."""
+        conn = self._connect()
+        try:
+            data = json.dumps(payload if payload is not None else {}).encode("utf-8")
+            headers = {
+                "Host": "docker",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(data)),
+            }
+            conn.request("POST", path, body=data, headers=headers)
+            resp = conn.getresponse()
+            body = resp.read()
+            if resp.status == 404:
+                raise DockerError("not found: %s" % path)
+            if resp.status >= 400:
+                raise DockerError(
+                    "docker API %s returned %s: %s"
+                    % (path, resp.status, body.decode("utf-8", "replace")[:300])
+                )
+            if not body:
+                return None
+            try:
+                return json.loads(body.decode("utf-8"))
+            except ValueError:
+                return None
+        except (OSError, http.client.HTTPException) as exc:
+            raise DockerError("docker API request failed: %s" % exc) from exc
+        finally:
+            conn.close()
+
+    def inspect_container(self, container_id):
+        return self.get(
+            "/%s/containers/%s/json" % (API_VERSION, urllib.parse.quote(container_id, safe="")))
+
+    def remove_container(self, container_id):
+        self.delete(
+            "/%s/containers/%s" % (API_VERSION, urllib.parse.quote(container_id, safe="")))
+
+    def rename_container(self, container_id, new_name):
+        self.post_json(
+            "/%s/containers/%s/rename?name=%s" % (
+                API_VERSION, urllib.parse.quote(container_id, safe=""),
+                urllib.parse.quote(new_name, safe=""))
+        )
+
+    def create_container(self, name, body):
+        return self.post_json(
+            "/%s/containers/create?name=%s" % (API_VERSION, urllib.parse.quote(name, safe="")),
+            body,
+        )
+
+    def connect_network(self, network_id, container_id, endpoint_config=None):
+        self.post_json(
+            "/%s/networks/%s/connect" % (API_VERSION, urllib.parse.quote(network_id, safe="")),
+            {"Container": container_id, "EndpointConfig": endpoint_config or {}},
+        )
+
+    def pull_image(self, repository, reference, on_line=None):
+        path = "/%s/images/create?fromImage=%s&tag=%s" % (
+            API_VERSION, urllib.parse.quote(repository, safe=""),
+            urllib.parse.quote(reference, safe=""))
+        conn = self._connect()
+        try:
+            conn.request("POST", path, headers={"Host": "docker", "Content-Length": "0"})
+            resp = conn.getresponse()
+            buf = b""
+            while True:
+                chunk = resp.read(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line = line.strip()
+                    if line and on_line:
+                        try:
+                            on_line(json.loads(line.decode("utf-8", "replace")))
+                        except ValueError:
+                            pass
+            if resp.status >= 400:
+                raise DockerError("docker API pull returned %s" % resp.status)
+        except (OSError, http.client.HTTPException) as exc:
+            raise DockerError("docker API request failed: %s" % exc) from exc
+        finally:
+            conn.close()
+
 
 def _format_ports(raw_ports):
     out = []
@@ -409,6 +520,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     self._send(400, {"error": str(exc)})
                     return
                 self._send(200, {"container": container_id, "lines": lines})
+            elif "/recreate/job/" in path:
+                job_id = path.rsplit("/", 1)[-1]
+                job = _containerctl().RECREATE_RUNNER.get(job_id)
+                if job is None:
+                    self._send(404, {"error": "no such job"})
+                else:
+                    self._send(200, job.snapshot())
             else:
                 self._send(404, {"error": "no such endpoint", "path": path})
         except DockerError as exc:
@@ -436,18 +554,46 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if path.startswith("/v1/containers/"):
             rest = path[len("/v1/containers/"):]
             container_id, _, action = rest.rpartition("/")
-            if action in _containerctl().ACTIONS:
+            containerctl = _containerctl()
+
+            if action in containerctl.ACTIONS:
                 client = DockerClient(self.server.docker_endpoint)
                 try:
-                    _containerctl().run_action(
+                    containerctl.run_action(
                         client, container_id, action, timeout=body.get("timeout"))
-                except _containerctl().ActionError as exc:
+                except containerctl.ActionError as exc:
                     self._send(400, {"error": str(exc)})
                     return
                 except DockerError as exc:
                     self._send(503, {"error": str(exc)})
                     return
                 self._send(200, {"ok": True, "container": container_id, "action": action})
+                return
+
+            if action == "rename":
+                client = DockerClient(self.server.docker_endpoint)
+                try:
+                    containerctl.run_rename(client, container_id, body.get("name"))
+                except containerctl.ActionError as exc:
+                    self._send(400, {"error": str(exc)})
+                    return
+                except DockerError as exc:
+                    self._send(503, {"error": str(exc)})
+                    return
+                self._send(200, {"ok": True, "container": container_id, "name": body.get("name")})
+                return
+
+            if action == "recreate":
+                client = DockerClient(self.server.docker_endpoint)
+                try:
+                    job = containerctl.RECREATE_RUNNER.start(client, container_id)
+                except containerctl.ActionError as exc:
+                    self._send(400, {"error": str(exc)})
+                    return
+                except DockerError as exc:
+                    self._send(503, {"error": str(exc)})
+                    return
+                self._send(202, job.snapshot())
                 return
 
         if path != "/v1/os/update":
@@ -476,6 +622,35 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._send(400, {"error": str(exc)})
             return
         self._send(202, job.snapshot())
+
+    def do_DELETE(self):  # noqa: N802 - stdlib naming
+        path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
+
+        if not self._authorized():
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Bearer realm="container-update-agent"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        if not path.startswith("/v1/containers/"):
+            self._send(404, {"error": "no such endpoint", "path": path})
+            return
+
+        container_id = path[len("/v1/containers/"):]
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        expected_name = (query.get("expected_name") or [None])[0]
+
+        client = DockerClient(self.server.docker_endpoint)
+        try:
+            _containerctl().run_remove(client, container_id, expected_name=expected_name)
+        except _containerctl().ActionError as exc:
+            self._send(400, {"error": str(exc)})
+            return
+        except DockerError as exc:
+            self._send(503, {"error": str(exc)})
+            return
+        self._send(200, {"ok": True, "container": container_id, "removed": True})
 
 
 class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):

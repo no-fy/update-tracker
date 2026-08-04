@@ -117,7 +117,8 @@
       </div>
       <p class="dialog-note">
         The dashboard must be able to reach that port on the host. Nothing is
-        pulled and no container is ever started, stopped or changed by the agent.
+        pulled without asking, and starting, stopping or restarting a
+        container always needs a confirmation here first.
       </p>
     </div>
 
@@ -138,6 +139,21 @@
       <button type="button" class="button" id="host-cancel">Close</button>
       <button type="button" class="button" id="host-copy" hidden>Copy command</button>
       <button class="button primary" id="host-submit" value="add">Generate command</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="confirm-dialog" class="dialog confirm-dialog">
+  <form method="dialog" id="confirm-form">
+    <h2 id="confirm-title">Are you sure?</h2>
+    <p class="dialog-lede" id="confirm-message"></p>
+    <label class="stack" id="confirm-typed-wrap" hidden>
+      <span id="confirm-typed-label">Type to confirm</span>
+      <input id="confirm-typed-input" autocomplete="off">
+    </label>
+    <div class="dialog-actions">
+      <button type="button" class="button" id="confirm-cancel">Cancel</button>
+      <button class="button primary" id="confirm-ok" value="ok">Confirm</button>
     </div>
   </form>
 </dialog>
