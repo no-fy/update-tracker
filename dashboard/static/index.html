@@ -20,6 +20,7 @@
       <span class="button-label">Refresh</span>
     </button>
     <button id="theme" class="button icon" title="Switch theme" aria-label="Switch theme">◐</button>
+    <button id="settings-open" class="button icon" title="Settings" aria-label="Settings">⚙</button>
     <button id="signout" class="button icon" title="Sign out" aria-label="Sign out" hidden>⏻</button>
   </div>
 </header>
@@ -147,13 +148,62 @@
   <form method="dialog" id="confirm-form">
     <h2 id="confirm-title">Are you sure?</h2>
     <p class="dialog-lede" id="confirm-message"></p>
-    <label class="stack" id="confirm-typed-wrap" hidden>
-      <span id="confirm-typed-label">Type to confirm</span>
-      <input id="confirm-typed-input" autocomplete="off">
-    </label>
     <div class="dialog-actions">
       <button type="button" class="button" id="confirm-cancel">Cancel</button>
       <button class="button primary" id="confirm-ok" value="ok">Confirm</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="settings-dialog" class="dialog">
+  <form method="dialog" id="settings-form">
+    <h2>Settings</h2>
+    <p class="dialog-lede">These apply dashboard-wide, for anyone signed in.</p>
+
+    <label class="check">
+      <input type="checkbox" id="settings-skip-confirmations">
+      <span>
+        Skip confirmation dialogs
+        <small>Stop, restart, remove and recreate run immediately, no "are you sure".</small>
+      </span>
+    </label>
+
+    <label class="check">
+      <input type="checkbox" id="settings-include-stopped">
+      <span>
+        Include stopped containers
+        <small>Off hides exited containers from the list entirely.</small>
+      </span>
+    </label>
+
+    <div class="dialog-row">
+      <label class="stack">
+        <span>Background refresh <small>minutes</small></span>
+        <input type="number" id="settings-refresh-interval" min="1" step="1">
+      </label>
+      <label class="stack">
+        <span>Log lines fetched <small>per request</small></span>
+        <input type="number" id="settings-log-tail" min="20" step="10">
+      </label>
+    </div>
+
+    <label class="check">
+      <input type="checkbox" id="settings-log-auto-refresh">
+      <span>
+        Auto-refresh open log panels
+        <small>Off means logs only update when you press Refresh.</small>
+      </span>
+    </label>
+
+    <label class="stack" id="settings-log-refresh-wrap">
+      <span>Log refresh interval <small>seconds</small></span>
+      <input type="number" id="settings-log-refresh" min="2" step="1">
+    </label>
+
+    <p class="dialog-error" id="settings-error" hidden></p>
+    <div class="dialog-actions">
+      <button type="button" class="button" id="settings-cancel">Cancel</button>
+      <button class="button primary" id="settings-save" value="save">Save</button>
     </div>
   </form>
 </dialog>

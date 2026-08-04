@@ -73,6 +73,7 @@ def poll_host(host, timeout=20, include_stopped=True):
         poll_seconds=0.0,
         os=None,
         container_actions=None,
+        log_history=None,
     )
 
     if not host.get("enabled", True):
@@ -104,6 +105,7 @@ def poll_host(host, timeout=20, include_stopped=True):
             containers = [c for c in containers if c.get("state") == "running"]
         result["containers"] = containers
         result["container_actions"] = snapshot.get("container_actions")
+        result["log_history"] = snapshot.get("log_history")
         result["os"] = _poll_os(host, timeout)
     except agent_module.DockerError as exc:
         result["error"] = str(exc)
@@ -326,6 +328,33 @@ def container_logs(host, container_id, tail=200, timeout=20):
     url = "%s://%s:%s/v1/containers/%s/logs?tail=%d" % (
         scheme, host.get("address"), host.get("port", 9713),
         urllib.parse.quote(container_id, safe=""), int(tail))
+    return _http_get_json(url, token=host.get("token"), timeout=timeout,
+                          verify_tls=host.get("verify_tls", True))
+
+
+def container_logs_history(host, container_id, since=None, until=None, limit=500, timeout=20):
+    """Stored log lines for one container, from before it may have
+    restarted or its live logs rotated away -- if the agent has this on."""
+    if host.get("mode") == "local":
+        import logstore
+
+        if logstore.STORE is None:
+            return {"container": container_id, "lines": [], "enabled": False}
+        lines = logstore.STORE.query(container_id, since=since, until=until, limit=limit)
+        return {"container": container_id, "lines": lines, "enabled": True}
+
+    scheme = "https" if host.get("tls") else "http"
+    query = []
+    if since is not None:
+        query.append("since=%s" % since)
+    if until is not None:
+        query.append("until=%s" % until)
+    if limit is not None:
+        query.append("limit=%s" % limit)
+    url = "%s://%s:%s/v1/containers/%s/logs/history%s" % (
+        scheme, host.get("address"), host.get("port", 9713),
+        urllib.parse.quote(container_id, safe=""),
+        ("?" + "&".join(query)) if query else "")
     return _http_get_json(url, token=host.get("token"), timeout=timeout,
                           verify_tls=host.get("verify_tls", True))
 
@@ -596,6 +625,11 @@ class Poller:
         except Exception as exc:  # pragma: no cover - keep the loop alive
             sys.stderr.write("refresh failed: %s: %s\n" % (type(exc).__name__, exc))
 
+    def wake(self):
+        """Re-evaluate the refresh interval now instead of at the next tick --
+        used after a settings change so it does not wait out the old one."""
+        self._wake.set()
+
     def start_background(self, interval_minutes):
         if self._thread:
             return
@@ -603,7 +637,15 @@ class Poller:
         def loop():
             self._safe_refresh()
             while not self._stop.is_set():
-                self._wake.wait(timeout=max(60.0, interval_minutes * 60))
+                # Re-read on every cycle so a settings change takes effect
+                # without restarting the dashboard.
+                try:
+                    config, _ = self.config_loader()
+                    current = config.get("dashboard", {}).get(
+                        "refresh_interval_minutes", interval_minutes)
+                except Exception:
+                    current = interval_minutes
+                self._wake.wait(timeout=max(60.0, float(current) * 60))
                 self._wake.clear()
                 if self._stop.is_set():
                     break

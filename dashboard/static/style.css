@@ -357,6 +357,13 @@ td.c-image { color: var(--text-secondary); font-family: var(--mono); font-size: 
 td.c-state { color: var(--text-secondary); white-space: nowrap; }
 td.c-age { color: var(--text-secondary); white-space: nowrap; font-variant-numeric: tabular-nums; }
 td.c-status { white-space: nowrap; }
+td.c-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  white-space: nowrap;
+}
 
 tr.detail td { padding: 0 18px 14px; background: transparent; }
 .detail-body {
@@ -368,26 +375,6 @@ tr.detail td { padding: 0 18px 14px; background: transparent; }
   color: var(--text-secondary);
   margin: 0 0 8px;
 }
-
-.subtabs {
-  display: flex;
-  gap: 2px;
-  border-bottom: 1px solid var(--hairline);
-  margin-bottom: 10px;
-}
-.subtab {
-  padding: 5px 10px;
-  border: 0;
-  border-bottom: 2px solid transparent;
-  background: none;
-  color: var(--text-secondary);
-  font: inherit;
-  font-size: 0.78rem;
-  font-weight: 550;
-  cursor: pointer;
-}
-.subtab:hover { color: var(--text-primary); }
-.subtab[aria-selected="true"] { color: var(--text-primary); border-bottom-color: var(--accent); }
 
 .detail-grid {
   display: grid;
@@ -496,6 +483,7 @@ tr.detail td { padding: 0 18px 14px; background: transparent; }
 }
 
 .check input { margin-top: 2px; }
+.check small { display: block; color: var(--text-muted); font-size: 0.79rem; margin-top: 1px; }
 
 .dialog-error {
   margin: 0;
@@ -824,6 +812,9 @@ tr.detail td { padding: 0 18px 14px; background: transparent; }
 }
 
 .logs-section .joblog { flex-basis: 100%; max-height: 260px; }
+.logs-auto-hint { color: var(--text-muted); font-size: 0.76rem; }
+.logs-range { display: flex; flex-wrap: wrap; gap: 6px; flex-basis: 100%; }
+.logs-range .chip { padding: 4px 11px; font-size: 0.76rem; }
 
 .os-row { cursor: pointer; }
 .os-row:hover td { background: var(--wash); }

@@ -88,6 +88,10 @@ def agent_command(enrollment, dashboard_url, socket_path="/var/run/docker.sock")
     moment the socket is reachable, with no extra flags to grant. Add
     `-e CUD_ALLOW_CONTAINER_ACTIONS=0` for an agent that only ever reports.
 
+    `-v {name}-logs:/var/lib/container-update-agent` is where it keeps
+    history for those logs, in its own SQLite file. Drop it (and set
+    `CUD_LOG_HISTORY=0`) for an agent that only reports the live tail.
+
     For an agent that only ever reports OS updates, drop `--pid=host
     --privileged` and add `-e CUD_ALLOW_UPDATES=0`. Everything except
     installing keeps working.
@@ -97,6 +101,7 @@ def agent_command(enrollment, dashboard_url, socket_path="/var/run/docker.sock")
         "  --pid=host --privileged \\\n"
         "  -v {socket}:{socket}:ro \\\n"
         "  -v /:/host:ro \\\n"
+        "  -v {name}-logs:/var/lib/container-update-agent \\\n"
         "  -p {port}:{port} \\\n"
         "  -e CUD_AGENT_TOKEN={agent_token} \\\n"
         "  -e CUD_HOST_ROOT=/host \\\n"
