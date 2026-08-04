@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Container-update agent.
 
-A read-only collector that reports the containers on one Docker host. It is a
-single stdlib-only file so it can be scp'd to any machine with Python 3.12+ and
-run under systemd. It never writes to Docker -- the only API calls it makes are
-GETs against the container, image and info endpoints.
+A collector that reports the containers on one Docker host, with optional
+capability to manage them (start/stop/restart, read logs) and to install OS
+package updates. It is a single stdlib-only file so it can be scp'd to any
+machine with Python 3.12+ and run under systemd. Reporting is always GETs
+against the container, image and info endpoints; the write paths live in
+containerctl.py and osupdate.py and are each gated by their own env var.
 
 It is also importable: the dashboard uses ``DockerClient`` and
 ``collect_snapshot`` directly for the host it runs on, so local and remote hosts
@@ -71,11 +73,15 @@ class _UnixHTTPConnection(http.client.HTTPConnection):
 
 
 class DockerClient:
-    """Minimal read-only Docker Engine API client.
+    """Minimal Docker Engine API client.
 
     Accepts a unix socket path or a ``tcp://host:port`` / ``http://`` endpoint
     (DOCKER_HOST style). No TLS client-cert support -- for remote daemons use
     the agent rather than exposing the Docker socket.
+
+    Mostly GETs. The three write calls (``container_action``, and the raw POST
+    underneath it) only ever reach the container lifecycle endpoints, and only
+    when containerctl.py has already decided the action is allowed.
     """
 
     def __init__(self, endpoint=None, timeout=15):
@@ -134,6 +140,61 @@ class DockerClient:
     def image(self, ref):
         return self.get("/%s/images/%s/json" % (API_VERSION, urllib.parse.quote(ref, safe="")))
 
+    def post(self, path):
+        conn = self._connect()
+        try:
+            conn.request("POST", path, headers={"Host": "docker", "Content-Length": "0"})
+            resp = conn.getresponse()
+            body = resp.read()
+            if resp.status == 404:
+                raise DockerError("not found: %s" % path)
+            if resp.status >= 400:
+                raise DockerError(
+                    "docker API %s returned %s: %s"
+                    % (path, resp.status, body.decode("utf-8", "replace")[:200])
+                )
+            if not body:
+                return None
+            try:
+                return json.loads(body.decode("utf-8"))
+            except ValueError:
+                return None
+        except (OSError, http.client.HTTPException) as exc:
+            raise DockerError("docker API request failed: %s" % exc) from exc
+        finally:
+            conn.close()
+
+    def raw_get(self, path):
+        conn = self._connect()
+        try:
+            conn.request("GET", path, headers={"Host": "docker"})
+            resp = conn.getresponse()
+            body = resp.read()
+            if resp.status == 404:
+                raise DockerError("not found: %s" % path)
+            if resp.status >= 400:
+                raise DockerError(
+                    "docker API %s returned %s: %s"
+                    % (path, resp.status, body.decode("utf-8", "replace")[:200])
+                )
+            return body
+        except (OSError, http.client.HTTPException) as exc:
+            raise DockerError("docker API request failed: %s" % exc) from exc
+        finally:
+            conn.close()
+
+    def container_action(self, container_id, action, timeout=None):
+        path = "/%s/containers/%s/%s" % (
+            API_VERSION, urllib.parse.quote(container_id, safe=""), action)
+        if timeout is not None:
+            path += "?t=%d" % int(timeout)
+        self.post(path)
+
+    def container_logs(self, container_id, tail=200):
+        path = "/%s/containers/%s/logs?stdout=1&stderr=1&tail=%d" % (
+            API_VERSION, urllib.parse.quote(container_id, safe=""), int(tail))
+        return self.raw_get(path)
+
 
 def _format_ports(raw_ports):
     out = []
@@ -190,6 +251,11 @@ def os_updates(force=False):
 def _osupdate():
     import osupdate
     return osupdate
+
+
+def _containerctl():
+    import containerctl
+    return containerctl
 
 
 def collect_snapshot(client, include_stopped=True):
@@ -271,6 +337,7 @@ def collect_snapshot(client, include_stopped=True):
         "collected_at": time.time(),
         "info": host_info,
         "containers": containers,
+        "container_actions": _containerctl().capability(),
     }
 
 
@@ -332,6 +399,16 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     self._send(404, {"error": "no such job"})
                 else:
                     self._send(200, job.snapshot())
+            elif path.startswith("/v1/containers/") and path.endswith("/logs"):
+                container_id = path[len("/v1/containers/"):-len("/logs")]
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                tail = int((query.get("tail") or ["200"])[0])
+                try:
+                    lines = _containerctl().fetch_logs(client, container_id, tail=tail)
+                except _containerctl().ActionError as exc:
+                    self._send(400, {"error": str(exc)})
+                    return
+                self._send(200, {"container": container_id, "lines": lines})
             else:
                 self._send(404, {"error": "no such endpoint", "path": path})
         except DockerError as exc:
@@ -350,15 +427,32 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        if path != "/v1/os/update":
-            self._send(404, {"error": "no such endpoint", "path": path})
-            return
-
         length = int(self.headers.get("Content-Length") or 0)
         try:
             body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
         except ValueError:
             body = {}
+
+        if path.startswith("/v1/containers/"):
+            rest = path[len("/v1/containers/"):]
+            container_id, _, action = rest.rpartition("/")
+            if action in _containerctl().ACTIONS:
+                client = DockerClient(self.server.docker_endpoint)
+                try:
+                    _containerctl().run_action(
+                        client, container_id, action, timeout=body.get("timeout"))
+                except _containerctl().ActionError as exc:
+                    self._send(400, {"error": str(exc)})
+                    return
+                except DockerError as exc:
+                    self._send(503, {"error": str(exc)})
+                    return
+                self._send(200, {"ok": True, "container": container_id, "action": action})
+                return
+
+        if path != "/v1/os/update":
+            self._send(404, {"error": "no such endpoint", "path": path})
+            return
 
         osupdate = _osupdate()
         snapshot = os_updates()
@@ -454,7 +548,7 @@ def announce(enroll_url, enroll_token, port, attempts=12, delay=5.0):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Read-only Docker container update agent")
+    parser = argparse.ArgumentParser(description="Docker container update agent")
     parser.add_argument("--config", help="JSON config file")
     parser.add_argument("--token", help="shared bearer token (required unless --no-auth)")
     parser.add_argument("--no-auth", action="store_true", help="disable token auth (loopback only)")

@@ -16,9 +16,14 @@ services:
       - "8500:8500"
     volumes:
       - cud-config:/config
-      # Watching this machine's own containers. Read-only, and that is all you
-      # need: the container works out the socket's group id itself at startup.
-      # Drop this line if you only want to watch remote hosts.
+      # Watching this machine's own containers -- and, by default, managing
+      # them (start/stop/restart, logs). The container works out the socket's
+      # group id itself at startup. Set CUD_ALLOW_CONTAINER_ACTIONS=0 below for
+      # a dashboard that only reports. The :ro here is not a safety boundary:
+      # a Unix socket can be written to over a read-only bind mount just as
+      # well, since :ro only stops the container renaming or deleting the
+      # socket file itself. Drop this line if you only want to watch remote
+      # hosts.
       - /var/run/docker.sock:/var/run/docker.sock:ro
       # Read-only view of the host so OS package updates can be read from the
       # package manager's own database. Drop this and CUD_HOST_ROOT below to
@@ -29,6 +34,8 @@ services:
       # There is no auth by default. Set this if the port is reachable beyond
       # a trusted LAN; any username then works with this password.
       # CUD_PASSWORD: change-me
+      # Container start/stop/restart and log access are on by default.
+      # CUD_ALLOW_CONTAINER_ACTIONS: "0"
       TZ: UTC
 
 volumes:

@@ -318,6 +318,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(200, {"enrollments": self.server.enrollments.list()})
             return
 
+        if path.startswith("/api/hosts/") and "/containers/" in path and path.endswith("/logs"):
+            self._handle_container_logs(path)
+            return
+
         if path.startswith("/api/hosts/") and "/os/job/" in path:
             rest = path[len("/api/hosts/"):]
             name, _, job_id = rest.partition("/os/job/")
@@ -391,6 +395,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 urllib.parse.unquote(path[len("/api/hosts/"):-len("/os/update")]))
             return
 
+        if path.startswith("/api/hosts/") and "/containers/" in path:
+            tail = path.rsplit("/", 1)[-1]
+            if tail in ("start", "stop", "restart"):
+                self._handle_container_action(path, tail)
+                return
+
         if path.startswith("/api/hosts/") and path.endswith("/enabled"):
             name = urllib.parse.unquote(path[len("/api/hosts/"):-len("/enabled")])
             body = self._read_body()
@@ -460,6 +470,60 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self.server.poller.refresh_async()
         self._json(202, job)
+
+    def _split_container_path(self, path, suffix):
+        """"/api/hosts/<name>/containers/<id><suffix>" -> (name, id)."""
+        rest = path[len("/api/hosts/"):-len(suffix)] if suffix else path[len("/api/hosts/"):]
+        name, _, container_id = rest.partition("/containers/")
+        return urllib.parse.unquote(name), urllib.parse.unquote(container_id)
+
+    def _handle_container_action(self, path, action):
+        name, container_id = self._split_container_path(path, "/" + action)
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+
+        body = self._read_body()
+        try:
+            result = collector.container_action(
+                host, container_id, action, timeout=body.get("timeout"))
+        except collector.ContainerActionRefused as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")
+            try:
+                self._json(exc.code, json.loads(detail))
+            except ValueError:
+                self._json(exc.code, {"error": detail[:300] or "agent refused"})
+            return
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self.server.poller.refresh_async()
+        self._json(200, result)
+
+    def _handle_container_logs(self, path):
+        name, container_id = self._split_container_path(path, "/logs")
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        tail = int((query.get("tail") or ["200"])[0])
+        try:
+            result = collector.container_logs(host, container_id, tail=tail)
+        except collector.ContainerActionRefused as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self._json(200, result)
 
     # -- first-run setup ---------------------------------------------------
 

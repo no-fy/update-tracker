@@ -12,8 +12,10 @@ image, across as many servers as you like.
 - **No pulls.** "Needs an update" is decided by asking the registry what digest
   the tag points at right now and comparing it to the digest the container is
   running. One HTTP request per unique image, not one image download.
-- **Read-only about containers.** The agent only ever issues GETs to the Docker
-  API. Nothing here can start, stop, pull or recreate a container.
+- **A container manager, not just a watcher.** Start, stop and restart any
+  container from the dashboard, and read its recent logs, on this machine or
+  any agent-hosted one. `CUD_ALLOW_CONTAINER_ACTIONS=0` makes an agent
+  report-only.
 - **OS updates you can actually install.** Pending packages are listed with
   what they are and how big they are, and you can install a selection — or
   every security update — from the dashboard. `CUD_ALLOW_UPDATES=0` makes an
@@ -147,8 +149,12 @@ the rest of its life as before. Setting `user:` yourself also works — the
 entrypoint sees it is not root, changes nothing, and leaves the socket group to
 you via `group_add`.
 
-The `:ro` is not decoration: the dashboard only ever issues GETs, and mounting
-read-only means a bug cannot become a container being stopped.
+The `:ro` here is about the socket *file* — the container cannot rename or
+delete it — not about what travels over it. Once connected, a Unix socket
+carries whatever the protocol on both ends allows, `:ro` bind mount or not;
+what actually decides whether this dashboard can stop a container is
+`CUD_ALLOW_CONTAINER_ACTIONS`, on by default. Set it to `0` for a dashboard
+that only reports.
 
 **From a checkout** there is nothing to configure either, beyond the user
 running `./cud serve` being able to read the socket — normally
@@ -213,6 +219,29 @@ that address instead of the one the dashboard sees.
 The host needs Docker and a reachable port; that is the whole requirement.
 There is no SSH path any more, from the browser or anywhere else — the
 dashboard holds no credentials for your machines at all.
+
+## Managing containers
+
+Click a container to expand it, and — unless the host's agent has this turned
+off — you get **Start**, **Stop** or **Restart**, plus a **View logs** panel
+with its recent stdout/stderr.
+
+- **On by default.** Unlike OS updates, this needs nothing beyond the Docker
+  socket the agent already reads to report containers in the first place —
+  there is no extra namespace or privilege to grant, so an agent gets this the
+  moment it starts. Set `-e CUD_ALLOW_CONTAINER_ACTIONS=0` for an agent that
+  only ever reports; the dashboard explains why the buttons are absent instead
+  of failing when you press them.
+- **Re-checked on the agent, not just hidden in the UI.** The capability is
+  computed server-side and the write endpoints refuse the request themselves
+  if it is off, the same way OS updates do.
+- **Stop and restart ask first.** Starting an already-stopped container does
+  not — there is nothing running to interrupt.
+- **Logs are a snapshot, not a live tail.** Press **Refresh** to pull the
+  latest lines; there is no websocket or long-poll here, in keeping with
+  everything else in this project.
+- **A restart clears the "restart pending" status** the same way installing an
+  update does — the dashboard refreshes shortly after either one finishes.
 
 ## OS package updates
 
@@ -291,7 +320,8 @@ manager's output streams into the page, and the list refreshes when the job
 finishes. Clicking a row opens what the package is, its section and priority,
 download and installed size, and its homepage.
 
-This is the one part of the tool that writes anything, so it is worth being
+This is one of two things in the tool that write anything (the other being
+[container management](#managing-containers) above), so it is worth being
 precise about what it needs and what it will not do:
 
 - **It runs the host's package manager, in the host's namespaces.** That is why
@@ -516,6 +546,10 @@ tokens are never returned.
 | DELETE | `/api/hosts/<name>` | unregister a host |
 | POST | `/api/hosts/<name>/os/update` | install updates: `{"packages": [...]}` or `{"severity": "security"}` |
 | GET | `/api/hosts/<name>/os/job/<id>` | that install's status and output |
+| POST | `/api/hosts/<name>/containers/<id>/start` | start a stopped container |
+| POST | `/api/hosts/<name>/containers/<id>/stop` | stop a running container |
+| POST | `/api/hosts/<name>/containers/<id>/restart` | restart a container |
+| GET | `/api/hosts/<name>/containers/<id>/logs?tail=200` | recent stdout/stderr lines |
 | POST | `/api/enrollments` | mint an enrolment and return the command to run |
 | GET | `/api/enrollments` | pending and finished enrolments, tokens omitted |
 | GET | `/api/enrollments/<id>` | one enrolment, to watch for the agent checking in |
@@ -533,7 +567,9 @@ is refused until they do — an unauthenticated dashboard will not hand out
 enrolment tokens to whoever can reach the port.
 
 The agent's own API is `/healthz` (open) plus `/v1/containers`, `/v1/info`,
-`/v1/os`, `POST /v1/os/update` and `/v1/os/job/<id>` (bearer token).
+`/v1/os`, `POST /v1/os/update`, `/v1/os/job/<id>`,
+`POST /v1/containers/<id>/{start,stop,restart}` and
+`/v1/containers/<id>/logs` (bearer token).
 
 ## Security notes
 
@@ -544,8 +580,12 @@ The agent's own API is `/healthz` (open) plus `/v1/containers`, `/v1/info`,
   put the agent behind a reverse proxy with TLS (`"tls": true` on the host
   entry), or bind the agent to loopback (`--bind 127.0.0.1`) and point the host
   entry at an SSH tunnel.
-- The agent exposes container names, image names, ports and labels — not
-  environment variables, not secrets, not container contents.
+- The agent exposes container names, image names, ports and labels, and now
+  recent log output too — not environment variables, not secrets, not the
+  filesystem inside a container.
+- Anyone who can sign in to the dashboard can stop or restart any container on
+  any host it watches. That is the trade this project now makes deliberately —
+  see [Managing containers](#managing-containers) for the opt-out.
 
 ## Testing
 

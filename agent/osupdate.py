@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Actually installing OS updates -- the one thing here that writes.
+"""Actually installing OS updates -- one of two things here that write.
 
-Everything else in this project is read-only by design. This is not, so it is
-off unless switched on: the agent refuses to run anything unless started with
-CUD_ALLOW_UPDATES=1. An agent that was never given that stays exactly as
-read-only as it always was.
+The other is containerctl.py. This one needs more than the Docker socket: it
+runs the host's own package manager, which needs the host's namespaces
+(--pid=host --privileged) as well as CUD_ALLOW_UPDATES not being turned off.
+Without those extra flags an agent stays exactly as report-only as it always
+was, regardless of the env var's default.
 
 Running the host's package manager from inside a container needs the host's
 namespaces, which means the agent must be started with --privileged and

@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "agent"))
@@ -71,6 +72,7 @@ def poll_host(host, timeout=20, include_stopped=True):
         agent_version=None,
         poll_seconds=0.0,
         os=None,
+        container_actions=None,
     )
 
     if not host.get("enabled", True):
@@ -101,6 +103,7 @@ def poll_host(host, timeout=20, include_stopped=True):
         if not include_stopped:
             containers = [c for c in containers if c.get("state") == "running"]
         result["containers"] = containers
+        result["container_actions"] = snapshot.get("container_actions")
         result["os"] = _poll_os(host, timeout)
     except agent_module.DockerError as exc:
         result["error"] = str(exc)
@@ -199,6 +202,53 @@ def get_os_job(host, job_id, timeout=20):
         if exc.code == 404:
             return None
         raise
+
+
+class ContainerActionRefused(Exception):
+    """The agent declined, for a reason worth showing the user verbatim."""
+
+
+def container_action(host, container_id, action, timeout=None, request_timeout=30):
+    """Ask a host's agent to start, stop or restart one container."""
+    if host.get("mode") == "local":
+        import containerctl
+
+        client = agent_module.DockerClient(host.get("docker_socket"))
+        try:
+            containerctl.run_action(client, container_id, action, timeout=timeout)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+        return {"ok": True, "container": container_id, "action": action}
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/containers/%s/%s" % (
+        scheme, host.get("address"), host.get("port", 9713),
+        urllib.parse.quote(container_id, safe=""), action)
+    body = {}
+    if timeout is not None:
+        body["timeout"] = timeout
+    return _http_post_json(url, body, token=host.get("token"), timeout=request_timeout,
+                           verify_tls=host.get("verify_tls", True))
+
+
+def container_logs(host, container_id, tail=200, timeout=20):
+    """Recent stdout/stderr lines for one container."""
+    if host.get("mode") == "local":
+        import containerctl
+
+        client = agent_module.DockerClient(host.get("docker_socket"))
+        try:
+            lines = containerctl.fetch_logs(client, container_id, tail=tail)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+        return {"container": container_id, "lines": lines}
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/containers/%s/logs?tail=%d" % (
+        scheme, host.get("address"), host.get("port", 9713),
+        urllib.parse.quote(container_id, safe=""), int(tail))
+    return _http_get_json(url, token=host.get("token"), timeout=timeout,
+                          verify_tls=host.get("verify_tls", True))
 
 
 def _http_post_json(url, payload, token=None, timeout=30, verify_tls=True):

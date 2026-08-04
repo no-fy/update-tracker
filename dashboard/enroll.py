@@ -83,8 +83,14 @@ def agent_command(enrollment, dashboard_url, socket_path="/var/run/docker.sock")
     --privileged` is what lets it install them, by running the package manager
     in the host's own namespaces.
 
-    For an agent that only ever reports, drop those two and add
-    `-e CUD_ALLOW_UPDATES=0`. Everything except installing keeps working.
+    The Docker socket mount alone is enough for the agent to start, stop and
+    restart containers and read their logs -- that is on by default the
+    moment the socket is reachable, with no extra flags to grant. Add
+    `-e CUD_ALLOW_CONTAINER_ACTIONS=0` for an agent that only ever reports.
+
+    For an agent that only ever reports OS updates, drop `--pid=host
+    --privileged` and add `-e CUD_ALLOW_UPDATES=0`. Everything except
+    installing keeps working.
     """
     return (
         "docker run -d --name {name} --restart unless-stopped \\\n"
