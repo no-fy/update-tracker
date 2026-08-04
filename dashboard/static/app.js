@@ -24,7 +24,8 @@
     data: null, tab: "containers",
     status: "", query: "",            // containers tab
     severity: "", osQuery: "",        // OS tab
-    host: "", open: {}, picked: {}, osJobs: {}, canAddHosts: false
+    host: "", open: {}, picked: {}, osJobs: {}, canAddHosts: false,
+    containerJobs: {}, logsOpen: {}, logs: {}
   };
   var el = {};
   var pollTimer = null;
@@ -504,6 +505,143 @@
     existing.parentNode.replaceChild(updateBar(host, updates), existing);
   }
 
+  // ---- container actions --------------------------------------------------
+
+  function capitalize(word) { return word.charAt(0).toUpperCase() + word.slice(1); }
+
+  function containerActionBar(host, container) {
+    var bar = text("div", "container-actions");
+    var capability = host.container_actions || {};
+    if (!capability.can_manage) {
+      bar.appendChild(text("span", "os-readonly", capability.reason ||
+        "This agent is read-only, so containers can only be managed on the host itself."));
+      return bar;
+    }
+
+    var key = container.host + "/" + container.id;
+    var job = state.containerJobs[key];
+    if (job && job.status === "running") {
+      var busy = text("span", "os-running");
+      busy.appendChild(text("span", "spinner"));
+      busy.appendChild(text("span", null, capitalize(job.action) + "ing " + container.name + "…"));
+      bar.appendChild(busy);
+      return bar;
+    }
+
+    var running = container.state === "running";
+
+    function actionButton(label, action, needsConfirm, primary) {
+      var btn = text("button", "button small" + (primary ? " primary" : ""));
+      btn.type = "button";
+      btn.textContent = label;
+      btn.addEventListener("click", function () {
+        if (needsConfirm && !window.confirm(
+            label + " " + container.name + " on " + (host.label || host.name) + "?")) {
+          return;
+        }
+        runContainerAction(host, container, action);
+      });
+      bar.appendChild(btn);
+    }
+
+    if (!running) actionButton("Start", "start", false, true);
+    if (running) actionButton("Restart", "restart", true, false);
+    if (running) actionButton("Stop", "stop", true, false);
+
+    if (job && job.status && job.status !== "running") {
+      var done = text("span", job.status === "ok" ? "os-done" : "os-failed",
+        job.status === "ok"
+          ? capitalize(job.action) + "ed " + container.name
+          : (job.message || (capitalize(job.action) + " failed")));
+      bar.appendChild(done);
+    }
+
+    return bar;
+  }
+
+  function runContainerAction(host, container, action) {
+    var key = container.host + "/" + container.id;
+    state.containerJobs[key] = { status: "running", action: action };
+    render();
+
+    postJSON(
+      "/api/hosts/" + encodeURIComponent(host.name) +
+      "/containers/" + encodeURIComponent(container.id) + "/" + action,
+      {}
+    )
+      .then(function (result) {
+        if (result.error) throw new Error(result.error);
+        state.containerJobs[key] = { status: "ok", action: action };
+        render();
+        fetch("/api/refresh", { method: "POST" }).then(function () {
+          setTimeout(load, 1200);
+        });
+      })
+      .catch(function (err) {
+        state.containerJobs[key] = {
+          status: "failed", action: action,
+          message: err.message || (capitalize(action) + " failed."),
+        };
+        render();
+      });
+  }
+
+  function logsSection(host, container) {
+    var key = container.host + "/" + container.id;
+    var wrap = text("div", "logs-section");
+    var open = !!state.logsOpen[key];
+
+    var toggle = text("button", "button small");
+    toggle.type = "button";
+    toggle.textContent = open ? "Hide logs" : "View logs";
+    toggle.addEventListener("click", function () {
+      state.logsOpen[key] = !open;
+      if (!open && !state.logs[key]) loadLogs(host, container);
+      render();
+    });
+    wrap.appendChild(toggle);
+
+    if (open) {
+      var entry = state.logs[key];
+      if (entry && entry.loading) {
+        wrap.appendChild(text("span", "os-running", "Loading logs…"));
+      } else {
+        var refreshBtn = text("button", "button small");
+        refreshBtn.type = "button";
+        refreshBtn.textContent = "Refresh";
+        refreshBtn.addEventListener("click", function () { loadLogs(host, container); });
+        wrap.appendChild(refreshBtn);
+
+        var pre = text("pre", "joblog", entry
+          ? (entry.error || (entry.lines || []).join("\n") || "No log output.")
+          : "");
+        wrap.appendChild(pre);
+      }
+    }
+    return wrap;
+  }
+
+  function loadLogs(host, container) {
+    var key = container.host + "/" + container.id;
+    state.logs[key] = { loading: true };
+    render();
+
+    fetch(
+      "/api/hosts/" + encodeURIComponent(host.name) +
+      "/containers/" + encodeURIComponent(container.id) + "/logs?tail=300"
+    )
+      .then(function (r) { return r.json(); })
+      .then(function (result) {
+        if (result.error) throw new Error(result.error);
+        state.logs[key] = { lines: result.lines || [] };
+        render();
+      })
+      .catch(function (err) {
+        state.logs[key] = { error: err.message || "Could not load logs." };
+        render();
+      });
+  }
+
   function renderFilters(data) {
     var counts = (data.summary || {}).counts || {};
     var total = (data.summary || {}).containers_total || 0;
@@ -548,7 +686,7 @@
     el.hostFilter.value = state.host;
   }
 
-  function containerRow(container) {
+  function containerRow(container, host) {
     var key = container.host + "/" + container.id;
     var row = text("tr", "row");
     row.tabIndex = 0;
@@ -578,6 +716,7 @@
     cell.colSpan = 5;
     var body = text("div", "detail-body");
     body.appendChild(text("p", "detail-note", container.detail || ""));
+    body.appendChild(containerActionBar(host, container));
 
     function item(label, value) {
       if (!value) return;
@@ -596,6 +735,8 @@
     item("Created", relativeTime(container.created));
     item("Ports", (container.ports || []).join(", "));
     if (container.compose_workdir) item("Compose", container.compose_workdir);
+
+    body.appendChild(logsSection(host, container));
 
     cell.appendChild(body);
     detail.appendChild(cell);
@@ -679,7 +820,7 @@
         return delta || a.name.localeCompare(b.name);
       })
       .forEach(function (container) {
-        containerRow(container).forEach(function (node) { tbody.appendChild(node); });
+        containerRow(container, host).forEach(function (node) { tbody.appendChild(node); });
       });
     table.appendChild(tbody);
     scroll.appendChild(table);
