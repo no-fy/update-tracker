@@ -222,9 +222,18 @@ dashboard holds no credentials for your machines at all.
 
 ## Managing containers
 
-Click a container to expand it, and — unless the host's agent has this turned
-off — you get **Start**, **Stop** or **Restart**, plus a **View logs** panel
-with its recent stdout/stderr.
+Click a container to expand it into three tabs: **Details** (what you had
+before — image, digests, ports, compose info), **Actions**, and **Logs**.
+
+The Actions tab, unless the host's agent has this turned off, gives you:
+
+| Action | What it does |
+|---|---|
+| **Start / Stop / Restart** | The usual lifecycle. Stop and restart ask first; starting an already-stopped container does not, since there's nothing running to interrupt. |
+| **Pause / Unpause** | Freezes the container's processes in place without stopping it. |
+| **Rename** | An inline field, not a prompt — type the new name and save. |
+| **Remove** | Only offered once a container is stopped. Asks you to type the container's name before the button is even clickable — a plain "are you sure" is too easy to reflex-click on something this irreversible. |
+| **Recreate with latest image** | Only shown when the container is **update available** or **restart pending** — this is the button that closes the loop the dashboard started with. It pulls the tag's current image, then swaps the container for a new one built from the same config (env, labels, ports, volumes, restart policy, networks and aliases), streaming progress the same way an OS update does. |
 
 - **On by default.** Unlike OS updates, this needs nothing beyond the Docker
   socket the agent already reads to report containers in the first place —
@@ -232,16 +241,26 @@ with its recent stdout/stderr.
   moment it starts. Set `-e CUD_ALLOW_CONTAINER_ACTIONS=0` for an agent that
   only ever reports; the dashboard explains why the buttons are absent instead
   of failing when you press them.
-- **Re-checked on the agent, not just hidden in the UI.** The capability is
-  computed server-side and the write endpoints refuse the request themselves
-  if it is off, the same way OS updates do.
-- **Stop and restart ask first.** Starting an already-stopped container does
-  not — there is nothing running to interrupt.
+- **Re-checked on the agent, not just hidden in the UI.** Every action above is
+  re-validated server-side — including the typed name on Remove — so a stale
+  page or a direct API call can't do anything the UI itself wouldn't allow.
+- **Recreate is best-effort, not a compose replacement.** It reuses the
+  container's own inspected config, which is enough for containers started
+  directly with `docker run` and for most compose-managed ones too, but it is
+  not `docker compose up -d` — deploy-time compose concepts (`depends_on`,
+  build contexts, profiles) aren't replayed, only what Docker itself
+  persisted about the running container. For anything compose manages, running
+  compose's own recreate on the host remains the most faithful path; this
+  covers the common case of "pull the same image, keep everything else."
+  If Docker refuses to remove the old container after the new one is already
+  running, or the new one fails to start, the recreate rolls back: the
+  original container is restored under its original name.
 - **Logs are a snapshot, not a live tail.** Press **Refresh** to pull the
   latest lines; there is no websocket or long-poll here, in keeping with
   everything else in this project.
-- **A restart clears the "restart pending" status** the same way installing an
-  update does — the dashboard refreshes shortly after either one finishes.
+- **A restart or recreate clears the "restart pending"/"update available"
+  status** the same way installing an OS update does — the dashboard refreshes
+  shortly after any of these finish.
 
 ## OS package updates
 
@@ -549,6 +568,12 @@ tokens are never returned.
 | POST | `/api/hosts/<name>/containers/<id>/start` | start a stopped container |
 | POST | `/api/hosts/<name>/containers/<id>/stop` | stop a running container |
 | POST | `/api/hosts/<name>/containers/<id>/restart` | restart a container |
+| POST | `/api/hosts/<name>/containers/<id>/pause` | freeze a running container |
+| POST | `/api/hosts/<name>/containers/<id>/unpause` | resume a paused container |
+| POST | `/api/hosts/<name>/containers/<id>/rename` | `{"name": "..."}` |
+| DELETE | `/api/hosts/<name>/containers/<id>?expected_name=...` | remove a stopped container; refused if the name doesn't match |
+| POST | `/api/hosts/<name>/containers/<id>/recreate` | pull the current image and recreate the container (202 + job) |
+| GET | `/api/hosts/<name>/containers/<id>/recreate/job/<job_id>` | that recreate's status and log |
 | GET | `/api/hosts/<name>/containers/<id>/logs?tail=200` | recent stdout/stderr lines |
 | POST | `/api/enrollments` | mint an enrolment and return the command to run |
 | GET | `/api/enrollments` | pending and finished enrolments, tokens omitted |
@@ -568,8 +593,9 @@ enrolment tokens to whoever can reach the port.
 
 The agent's own API is `/healthz` (open) plus `/v1/containers`, `/v1/info`,
 `/v1/os`, `POST /v1/os/update`, `/v1/os/job/<id>`,
-`POST /v1/containers/<id>/{start,stop,restart}` and
-`/v1/containers/<id>/logs` (bearer token).
+`POST /v1/containers/<id>/{start,stop,restart,pause,unpause,rename,recreate}`,
+`DELETE /v1/containers/<id>`, `/v1/containers/<id>/logs` and
+`/v1/containers/<id>/recreate/job/<job_id>` (bearer token).
 
 ## Security notes
 
@@ -583,9 +609,10 @@ The agent's own API is `/healthz` (open) plus `/v1/containers`, `/v1/info`,
 - The agent exposes container names, image names, ports and labels, and now
   recent log output too — not environment variables, not secrets, not the
   filesystem inside a container.
-- Anyone who can sign in to the dashboard can stop or restart any container on
-  any host it watches. That is the trade this project now makes deliberately —
-  see [Managing containers](#managing-containers) for the opt-out.
+- Anyone who can sign in to the dashboard can start, stop, restart, pause,
+  rename, remove or recreate any container on any host it watches. That is
+  the trade this project now makes deliberately — see [Managing
+  containers](#managing-containers) for the opt-out.
 
 ## Testing
 
