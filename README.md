@@ -222,18 +222,19 @@ dashboard holds no credentials for your machines at all.
 
 ## Managing containers
 
-Click a container to expand it into three tabs: **Details** (what you had
-before — image, digests, ports, compose info), **Actions**, and **Logs**.
-
-The Actions tab, unless the host's agent has this turned off, gives you:
+The lifecycle actions and a **Logs** button sit right on each container's row
+— no expanding, no menu, unless the host's agent has this turned off:
 
 | Action | What it does |
 |---|---|
-| **Start / Stop / Restart** | The usual lifecycle. Stop and restart ask first; starting an already-stopped container does not, since there's nothing running to interrupt. |
+| **Start / Stop / Restart** | The usual lifecycle. |
 | **Pause / Unpause** | Freezes the container's processes in place without stopping it. |
 | **Rename** | An inline field, not a prompt — type the new name and save. |
-| **Remove** | Only offered once a container is stopped. Asks you to type the container's name before the button is even clickable — a plain "are you sure" is too easy to reflex-click on something this irreversible. |
+| **Remove** | Only offered once a container is stopped. |
 | **Recreate with latest image** | Only shown when the container is **update available** or **restart pending** — this is the button that closes the loop the dashboard started with. It pulls the tag's current image, then swaps the container for a new one built from the same config (env, labels, ports, volumes, restart policy, networks and aliases), streaming progress the same way an OS update does. |
+
+Clicking a container still expands it, now just for **Details** (image,
+digests, ports, compose info) and whatever the **Logs** button opens.
 
 - **On by default.** Unlike OS updates, this needs nothing beyond the Docker
   socket the agent already reads to report containers in the first place —
@@ -242,8 +243,12 @@ The Actions tab, unless the host's agent has this turned off, gives you:
   only ever reports; the dashboard explains why the buttons are absent instead
   of failing when you press them.
 - **Re-checked on the agent, not just hidden in the UI.** Every action above is
-  re-validated server-side — including the typed name on Remove — so a stale
-  page or a direct API call can't do anything the UI itself wouldn't allow.
+  re-validated server-side — including the name on Remove — so a stale page or
+  a direct API call can't do anything the UI itself wouldn't allow.
+- **A plain yes/no before Stop, Restart, Remove and Recreate** — nothing to
+  type, just a confirm dialog styled like the rest of the app instead of the
+  browser's own. **Settings** (the gear icon) can turn these off entirely for
+  anyone signed in, so the action runs the moment you click it.
 - **Recreate is best-effort, not a compose replacement.** It reuses the
   container's own inspected config, which is enough for containers started
   directly with `docker run` and for most compose-managed ones too, but it is
@@ -255,12 +260,52 @@ The Actions tab, unless the host's agent has this turned off, gives you:
   If Docker refuses to remove the old container after the new one is already
   running, or the new one fails to start, the recreate rolls back: the
   original container is restored under its original name.
-- **Logs are a snapshot, not a live tail.** Press **Refresh** to pull the
-  latest lines; there is no websocket or long-poll here, in keeping with
-  everything else in this project.
 - **A restart or recreate clears the "restart pending"/"update available"
   status** the same way installing an OS update does — the dashboard refreshes
   shortly after any of these finish.
+
+### Logs
+
+The **Logs** panel shows a live tail by default, auto-refreshing on the
+interval set in **Settings** (5 seconds by default; **Refresh** always works
+on demand regardless). **1h / 24h / 7d** switch to stored history instead —
+see below.
+
+### Log history
+
+Docker itself only shows what its log driver still has on disk, which
+rotates away. If the agent has this on, it separately keeps its own copy:
+
+- **Polled, not followed.** Every few seconds, the agent asks Docker for each
+  running container's recent output the same way the live tail does, and
+  keeps whatever lines it has not already stored. An earlier version used a
+  long-lived `follow` connection per container instead; on Docker Desktop's
+  WSL2 backend that combination of flags proved unreliable enough (`since` or
+  `tail` alongside `follow` could simply hang) that polling — the same
+  request/response call every other feature here already makes, with nothing
+  long-lived to leak or wedge — won out over lower latency.
+- **On by default, once there's somewhere to put it.** Stored in SQLite
+  (Python's own `sqlite3` — still no dependencies) at `CUD_LOG_DB`, default
+  `/var/lib/container-update-agent/logs.db`. That path needs a volume mounted
+  under it to survive an agent restart; without one, history capture simply
+  does not start, and the dashboard says why instead of pretending to have
+  history it doesn't. `CUD_LOG_HISTORY=0` turns it off outright.
+- **Pruned automatically.** `CUD_LOG_RETENTION_DAYS` (default 7) and
+  `CUD_LOG_MAX_ROWS_PER_CONTAINER` (default 200,000) are both enforced, so a
+  chatty container can't fill the disk between prunes.
+
+## Settings
+
+The gear icon opens dashboard-wide preferences, saved to `config.json` and
+shared by everyone signed in:
+
+| Setting | What it does |
+|---|---|
+| Skip confirmation dialogs | Stop, restart, remove and recreate run immediately, no dialog at all. |
+| Include stopped containers | Off hides exited containers from the list entirely. |
+| Background refresh | How often the dashboard re-polls every host, in minutes. |
+| Log lines fetched | How many lines a live tail request pulls at once. |
+| Auto-refresh open log panels, and how often | Off means logs only update when you press Refresh. |
 
 ## OS package updates
 
@@ -575,6 +620,9 @@ tokens are never returned.
 | POST | `/api/hosts/<name>/containers/<id>/recreate` | pull the current image and recreate the container (202 + job) |
 | GET | `/api/hosts/<name>/containers/<id>/recreate/job/<job_id>` | that recreate's status and log |
 | GET | `/api/hosts/<name>/containers/<id>/logs?tail=200` | recent stdout/stderr lines |
+| GET | `/api/hosts/<name>/containers/<id>/logs/history?since=&until=&limit=` | stored log lines, if the agent has history on |
+| GET | `/api/settings` | current dashboard-wide preferences |
+| POST | `/api/settings` | update one or more of them |
 | POST | `/api/enrollments` | mint an enrolment and return the command to run |
 | GET | `/api/enrollments` | pending and finished enrolments, tokens omitted |
 | GET | `/api/enrollments/<id>` | one enrolment, to watch for the agent checking in |
@@ -594,7 +642,8 @@ enrolment tokens to whoever can reach the port.
 The agent's own API is `/healthz` (open) plus `/v1/containers`, `/v1/info`,
 `/v1/os`, `POST /v1/os/update`, `/v1/os/job/<id>`,
 `POST /v1/containers/<id>/{start,stop,restart,pause,unpause,rename,recreate}`,
-`DELETE /v1/containers/<id>`, `/v1/containers/<id>/logs` and
+`DELETE /v1/containers/<id>`, `/v1/containers/<id>/logs`,
+`/v1/containers/<id>/logs/history` and
 `/v1/containers/<id>/recreate/job/<job_id>` (bearer token).
 
 ## Security notes

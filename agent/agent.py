@@ -190,9 +190,10 @@ class DockerClient:
             path += "?t=%d" % int(timeout)
         self.post(path)
 
-    def container_logs(self, container_id, tail=200):
-        path = "/%s/containers/%s/logs?stdout=1&stderr=1&tail=%d" % (
-            API_VERSION, urllib.parse.quote(container_id, safe=""), int(tail))
+    def container_logs(self, container_id, tail=200, timestamps=False):
+        path = "/%s/containers/%s/logs?stdout=1&stderr=1&tail=%d%s" % (
+            API_VERSION, urllib.parse.quote(container_id, safe=""), int(tail),
+            "&timestamps=1" if timestamps else "")
         return self.raw_get(path)
 
     def delete(self, path):
@@ -369,6 +370,11 @@ def _containerctl():
     return containerctl
 
 
+def _logstore():
+    import logstore
+    return logstore
+
+
 def collect_snapshot(client, include_stopped=True):
     """Return ``{"info": {...}, "containers": [...]}`` for one Docker host."""
     try:
@@ -449,6 +455,7 @@ def collect_snapshot(client, include_stopped=True):
         "info": host_info,
         "containers": containers,
         "container_actions": _containerctl().capability(),
+        "log_history": _logstore().capability(),
     }
 
 
@@ -510,6 +517,20 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     self._send(404, {"error": "no such job"})
                 else:
                     self._send(200, job.snapshot())
+            elif path.startswith("/v1/containers/") and path.endswith("/logs/history"):
+                container_id = path[len("/v1/containers/"):-len("/logs/history")]
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                store = _logstore().STORE
+                if store is None:
+                    self._send(200, {"container": container_id, "lines": [], "enabled": False})
+                else:
+                    lines = store.query(
+                        container_id,
+                        since=(query.get("since") or [None])[0],
+                        until=(query.get("until") or [None])[0],
+                        limit=(query.get("limit") or [None])[0],
+                    )
+                    self._send(200, {"container": container_id, "lines": lines, "enabled": True})
             elif path.startswith("/v1/containers/") and path.endswith("/logs"):
                 container_id = path[len("/v1/containers/"):-len("/logs")]
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -677,6 +698,7 @@ def serve(token, bind="0.0.0.0", port=DEFAULT_PORT, docker_endpoint=None,
         % (AGENT_VERSION, scheme, bind, port, docker_endpoint or DEFAULT_SOCKET)
     )
     sys.stderr.flush()
+    _logstore().init(docker_endpoint)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:

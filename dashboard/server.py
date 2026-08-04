@@ -118,6 +118,31 @@ def sanitise_settings(settings):
     return out
 
 
+# User-editable preferences, as opposed to the rest of `dashboard.*` (bind,
+# port, password, ...) which are configuration, not day-to-day settings.
+SETTINGS_SCHEMA = {
+    "skip_confirmations": bool,
+    "include_stopped": bool,
+    "refresh_interval_minutes": float,
+    "log_tail_lines": int,
+    "log_refresh_seconds": int,
+    "log_auto_refresh": bool,
+}
+SETTINGS_DEFAULTS = {
+    "skip_confirmations": False,
+    "include_stopped": True,
+    "refresh_interval_minutes": 30.0,
+    "log_tail_lines": 300,
+    "log_refresh_seconds": 5,
+    "log_auto_refresh": True,
+}
+
+
+def current_settings(config):
+    stored = config.get("dashboard", {})
+    return {key: stored.get(key, default) for key, default in SETTINGS_DEFAULTS.items()}
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "container-update-dashboard/" + VERSION
     sys_version = ""
@@ -302,6 +327,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/api/settings":
+            config, _ = self.server.load_config()
+            self._json(200, current_settings(config))
+            return
+
         if path == "/api/setup":
             self._json(
                 200,
@@ -316,6 +346,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/enrollments":
             self._json(200, {"enrollments": self.server.enrollments.list()})
+            return
+
+        if path.startswith("/api/hosts/") and "/containers/" in path and path.endswith("/logs/history"):
+            self._handle_container_logs_history(path)
             return
 
         if path.startswith("/api/hosts/") and "/containers/" in path and path.endswith("/logs"):
@@ -388,6 +422,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/setup":
             self._handle_setup()
+            return
+
+        if path == "/api/settings":
+            self._handle_update_settings()
             return
 
         if path == "/api/enrollments":
@@ -535,6 +573,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self._json(200, result)
 
+    def _handle_container_logs_history(self, path):
+        name, container_id = self._split_container_path(path, "/logs/history")
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        try:
+            result = collector.container_logs_history(
+                host, container_id,
+                since=(query.get("since") or [None])[0],
+                until=(query.get("until") or [None])[0],
+                limit=(query.get("limit") or [None])[0],
+            )
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self._json(200, result)
+
     def _handle_container_rename(self, path):
         name, container_id = self._split_container_path(path, "/rename")
         config, _ = self.server.load_config()
@@ -645,6 +704,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.server.password = settings["password"]
         token = self.server.sessions.create(username)
         self._json_with_session(200, {"ok": True, "username": username}, token=token)
+
+    def _handle_update_settings(self):
+        body = self._read_body()
+        config, config_path = self.server.load_config()
+        settings = config.setdefault("dashboard", {})
+        for key, value in body.items():
+            if key not in SETTINGS_SCHEMA:
+                continue
+            expected = SETTINGS_SCHEMA[key]
+            try:
+                settings[key] = bool(value) if expected is bool else expected(value)
+            except (TypeError, ValueError):
+                self._json(400, {"error": "invalid value for %s" % key})
+                return
+        config_mod.save_config(config, config_path)
+        self.server.poller.wake()
+        self._json(200, current_settings(config))
 
     # -- adding hosts ------------------------------------------------------
 
@@ -792,6 +868,12 @@ def build_server(config_path=None, bind=None, port=None, verbose=False):
     config, config_path = config_mod.load_config(config_path)
     ensure_local_host_registered(config, config_path)
     settings = config.get("dashboard", {})
+
+    local_host = next(
+        (h for h in config.get("hosts", []) if h.get("mode") == "local"), None)
+    if local_host is not None:
+        import logstore
+        logstore.init(local_host.get("docker_socket"))
 
     loader = functools.partial(config_mod.load_config, config_path)
     factory = functools.partial(

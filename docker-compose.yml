@@ -29,6 +29,10 @@ services:
       # package manager's own database. Drop this and CUD_HOST_ROOT below to
       # track containers only.
       - /:/host:ro
+      # Historical container logs, so they survive a restart of this
+      # container. Drop this and set CUD_LOG_HISTORY=0 below to keep only
+      # the live tail Docker itself still has.
+      - cud-logs:/var/lib/container-update-agent
     environment:
       CUD_HOST_ROOT: /host
       # There is no auth by default. Set this if the port is reachable beyond
@@ -36,7 +40,11 @@ services:
       # CUD_PASSWORD: change-me
       # Container start/stop/restart and log access are on by default.
       # CUD_ALLOW_CONTAINER_ACTIONS: "0"
+      # Historical logs are on by default too, once there is somewhere to
+      # put them (the cud-logs volume above). Days of history to keep:
+      # CUD_LOG_RETENTION_DAYS: "7"
       TZ: UTC
 
 volumes:
   cud-config:
+  cud-logs:

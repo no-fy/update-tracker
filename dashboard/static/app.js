@@ -25,7 +25,7 @@
     status: "", query: "",            // containers tab
     severity: "", osQuery: "",        // OS tab
     host: "", open: {}, picked: {}, osJobs: {}, canAddHosts: false,
-    containerJobs: {}, logsOpen: {}, logs: {}, renaming: {}, detailTab: {}
+    containerJobs: {}, logsOpen: {}, logs: {}, renaming: {}, settings: {}, logsRange: {}
   };
   var el = {};
   var pollTimer = null;
@@ -613,7 +613,7 @@
           "Remove this container?",
           "This permanently deletes " + container.name + " on " + (host.label || host.name) +
           ". This cannot be undone.",
-          { confirmLabel: "Remove", danger: true, typeToConfirm: container.name }
+          { confirmLabel: "Remove", danger: true }
         ).then(function (ok) { if (ok) runContainerRemove(host, container); });
       });
       manage.appendChild(removeBtn);
@@ -804,49 +804,130 @@
       });
   }
 
+  // Auto-refresh timers live outside `state` -- they are not render-derived
+  // data, just live handles, and must survive individual render() calls.
+  var logTimers = {};
+
+  function logTailLines() { return (state.settings && state.settings.log_tail_lines) || 300; }
+  function logRefreshSeconds() { return (state.settings && state.settings.log_refresh_seconds) || 5; }
+  function logAutoRefreshEnabled() {
+    return !state.settings || state.settings.log_auto_refresh !== false;
+  }
+
+  function startLogsAutoRefresh(host, container) {
+    var key = containerKey(container);
+    if (logTimers[key] || !logAutoRefreshEnabled()) return;
+    logTimers[key] = setInterval(function () {
+      if (!state.logsOpen[key]) { stopLogsAutoRefresh(key); return; }
+      loadLogs(host, container, true);
+    }, logRefreshSeconds() * 1000);
+  }
+
+  function stopLogsAutoRefresh(key) {
+    if (logTimers[key]) { clearInterval(logTimers[key]); delete logTimers[key]; }
+  }
+
+  function logsToggleButton(host, container) {
+    var key = containerKey(container);
+    var btn = text("button", "button small");
+    btn.type = "button";
+    btn.textContent = state.logsOpen[key] ? "Hide logs" : "Logs";
+    btn.addEventListener("click", function () {
+      var opening = !state.logsOpen[key];
+      state.logsOpen[key] = opening;
+      state.open[key] = true;
+      if (opening) {
+        loadLogs(host, container);
+        startLogsAutoRefresh(host, container);
+      } else {
+        stopLogsAutoRefresh(key);
+      }
+      render();
+    });
+    return btn;
+  }
+
+  var LOG_RANGES = [
+    { id: "live", label: "Live" },
+    { id: "1h", label: "1h", seconds: 3600 },
+    { id: "24h", label: "24h", seconds: 86400 },
+    { id: "7d", label: "7d", seconds: 604800 }
+  ];
+
+  function formatLogLine(item) {
+    if (typeof item === "string") return item;
+    var when = item.ts ? new Date(item.ts * 1000).toLocaleString() : "";
+    return (when ? "[" + when + "] " : "") + item.line;
+  }
+
   function logsSection(host, container) {
     var key = containerKey(container);
     var wrap = text("div", "logs-section");
-    var open = !!state.logsOpen[key];
+    var range = state.logsRange[key] || "live";
+    var entry = state.logs[key];
 
-    var toggle = text("button", "button small");
-    toggle.type = "button";
-    toggle.textContent = open ? "Hide logs" : "View logs";
-    toggle.addEventListener("click", function () {
-      state.logsOpen[key] = !open;
-      if (!open && !state.logs[key]) loadLogs(host, container);
-      render();
+    var rangeRow = text("div", "logs-range");
+    LOG_RANGES.forEach(function (r) {
+      var btn = text("button", "chip");
+      btn.type = "button";
+      btn.setAttribute("aria-pressed", range === r.id ? "true" : "false");
+      btn.textContent = r.label;
+      btn.addEventListener("click", function () {
+        if (state.logsRange[key] === r.id) return;
+        state.logsRange[key] = r.id;
+        if (r.id === "live") {
+          loadLogs(host, container);
+          startLogsAutoRefresh(host, container);
+        } else {
+          stopLogsAutoRefresh(key);
+          loadLogHistory(host, container, r.seconds);
+        }
+        render();
+      });
+      rangeRow.appendChild(btn);
     });
-    wrap.appendChild(toggle);
+    wrap.appendChild(rangeRow);
 
-    if (open) {
-      var entry = state.logs[key];
-      if (entry && entry.loading) {
-        wrap.appendChild(text("span", "os-running", "Loading logs…"));
-      } else {
-        var refreshBtn = text("button", "button small");
-        refreshBtn.type = "button";
-        refreshBtn.textContent = "Refresh";
-        refreshBtn.addEventListener("click", function () { loadLogs(host, container); });
-        wrap.appendChild(refreshBtn);
-
-        var pre = text("pre", "joblog", entry
-          ? (entry.error || (entry.lines || []).join("\n") || "No log output.")
-          : "");
-        wrap.appendChild(pre);
-      }
+    if (entry && entry.loading) {
+      wrap.appendChild(text("span", "os-running", "Loading logs…"));
+      return wrap;
     }
+
+    var refreshBtn = text("button", "button small");
+    refreshBtn.type = "button";
+    refreshBtn.textContent = "Refresh";
+    refreshBtn.addEventListener("click", function () {
+      if (range === "live") {
+        loadLogs(host, container);
+      } else {
+        var r = LOG_RANGES.filter(function (item) { return item.id === range; })[0];
+        loadLogHistory(host, container, r ? r.seconds : null);
+      }
+    });
+    wrap.appendChild(refreshBtn);
+
+    if (range === "live" && logAutoRefreshEnabled()) {
+      wrap.appendChild(text("span", "logs-auto-hint",
+        "Auto-refreshing every " + logRefreshSeconds() + "s"));
+    }
+
+    var pre = text("pre", "joblog", entry
+      ? (entry.error || (entry.lines || []).map(formatLogLine).join("\n") || "No log output.")
+      : "");
+    wrap.appendChild(pre);
     return wrap;
   }
 
-  function loadLogs(host, container) {
+  function loadLogs(host, container, silent) {
     var key = containerKey(container);
-    state.logs[key] = { loading: true };
-    render();
+    if (!silent) {
+      state.logs[key] = { loading: true };
+      render();
+    }
 
     fetch(
       "/api/hosts/" + encodeURIComponent(host.name) +
-      "/containers/" + encodeURIComponent(container.id) + "/logs?tail=300"
+      "/containers/" + encodeURIComponent(container.id) + "/logs?tail=" + logTailLines()
     )
       .then(function (r) { return r.json(); })
       .then(function (result) {
@@ -855,7 +936,40 @@
         render();
       })
       .catch(function (err) {
-        state.logs[key] = { error: err.message || "Could not load logs." };
+        // A silent background refresh that fails keeps showing the last good
+        // fetch rather than replacing it with an error -- one flaky poll
+        // should not blank out logs someone is actively reading.
+        if (!silent) {
+          state.logs[key] = { error: err.message || "Could not load logs." };
+          render();
+        }
+      });
+  }
+
+  function loadLogHistory(host, container, seconds) {
+    var key = containerKey(container);
+    state.logs[key] = { loading: true };
+    render();
+
+    var since = seconds ? (Date.now() / 1000 - seconds) : null;
+    var qs = "?limit=2000" + (since ? "&since=" + since : "");
+
+    fetch(
+      "/api/hosts/" + encodeURIComponent(host.name) +
+      "/containers/" + encodeURIComponent(container.id) + "/logs/history" + qs
+    )
+      .then(function (r) { return r.json(); })
+      .then(function (result) {
+        if (result.error) throw new Error(result.error);
+        if (result.enabled === false) {
+          state.logs[key] = { error: "Log history is not enabled on this host." };
+        } else {
+          state.logs[key] = { lines: result.lines || [] };
+        }
+        render();
+      })
+      .catch(function (err) {
+        state.logs[key] = { error: err.message || "Could not load log history." };
         render();
       });
   }
@@ -928,45 +1042,8 @@
     return grid;
   }
 
-  var DETAIL_TABS = [
-    { id: "details", label: "Details" },
-    { id: "actions", label: "Actions" },
-    { id: "logs", label: "Logs" }
-  ];
-
-  function containerDetailTabs(host, container, key) {
-    var wrap = text("div", null);
-    var active = state.detailTab[key] || "details";
-
-    var tabs = text("div", "subtabs");
-    DETAIL_TABS.forEach(function (tab) {
-      var btn = text("button", "subtab");
-      btn.type = "button";
-      btn.setAttribute("aria-selected", active === tab.id ? "true" : "false");
-      btn.textContent = tab.label;
-      btn.addEventListener("click", function () {
-        state.detailTab[key] = tab.id;
-        render();
-      });
-      tabs.appendChild(btn);
-    });
-    wrap.appendChild(tabs);
-
-    var panel = text("div", "subtab-panel");
-    if (active === "actions") {
-      panel.appendChild(containerActionBar(host, container));
-    } else if (active === "logs") {
-      panel.appendChild(logsSection(host, container));
-    } else {
-      panel.appendChild(containerDetailsPanel(container));
-    }
-    wrap.appendChild(panel);
-
-    return wrap;
-  }
-
   function containerRow(container, host) {
-    var key = container.host + "/" + container.id;
+    var key = containerKey(container);
     var row = text("tr", "row");
     row.tabIndex = 0;
 
@@ -990,12 +1067,19 @@
     status.appendChild(badge(container.update_status));
     row.appendChild(status);
 
+    var actionsCell = text("td", "c-actions");
+    actionsCell.addEventListener("click", function (event) { event.stopPropagation(); });
+    actionsCell.appendChild(containerActionBar(host, container));
+    actionsCell.appendChild(logsToggleButton(host, container));
+    row.appendChild(actionsCell);
+
     var detail = text("tr", "detail");
     var cell = document.createElement("td");
-    cell.colSpan = 5;
+    cell.colSpan = 6;
     var body = text("div", "detail-body");
     body.appendChild(text("p", "detail-note", container.detail || ""));
-    body.appendChild(containerDetailTabs(host, container, key));
+    body.appendChild(containerDetailsPanel(container));
+    if (state.logsOpen[key]) body.appendChild(logsSection(host, container));
 
     cell.appendChild(body);
     detail.appendChild(cell);
@@ -1004,6 +1088,12 @@
     function toggle() {
       state.open[key] = !state.open[key];
       detail.hidden = !state.open[key];
+      if (!state.open[key]) {
+        stopLogsAutoRefresh(key);
+      } else if (state.logsOpen[key]) {
+        startLogsAutoRefresh(host, container);
+        loadLogs(host, container, true);
+      }
     }
     row.addEventListener("click", toggle);
     row.addEventListener("keydown", function (event) {
@@ -1064,7 +1154,8 @@
     var table = document.createElement("table");
     var thead = document.createElement("thead");
     var headRow = document.createElement("tr");
-    [["Container", ""], ["Image", ""], ["State", "optional"], ["Image age", "optional"], ["Update", ""]]
+    [["Container", ""], ["Image", ""], ["State", "optional"], ["Image age", "optional"],
+     ["Update", ""], ["Actions", ""]]
       .forEach(function (column) {
         headRow.appendChild(text("th", column[1], column[0]));
       });
@@ -1344,6 +1435,53 @@
     if (typeof el.setupDialog.showModal === "function") el.setupDialog.showModal();
   }
 
+  // ---- settings ------------------------------------------------------------
+
+  function loadSettings() {
+    return fetch("/api/settings")
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (settings) {
+        if (settings) state.settings = settings;
+        return settings;
+      })
+      .catch(function () { return null; });
+  }
+
+  function openSettings() {
+    var s = state.settings || {};
+    el.settingsSkipConfirmations.checked = !!s.skip_confirmations;
+    el.settingsIncludeStopped.checked = s.include_stopped !== false;
+    el.settingsRefreshInterval.value = s.refresh_interval_minutes || 30;
+    el.settingsLogTail.value = s.log_tail_lines || 300;
+    el.settingsLogAutoRefresh.checked = s.log_auto_refresh !== false;
+    el.settingsLogRefresh.value = s.log_refresh_seconds || 5;
+    el.settingsLogRefreshWrap.hidden = !el.settingsLogAutoRefresh.checked;
+    hide(el.settingsError);
+    if (typeof el.settingsDialog.showModal === "function") el.settingsDialog.showModal();
+  }
+
+  function submitSettings(event) {
+    event.preventDefault();
+    var body = {
+      skip_confirmations: el.settingsSkipConfirmations.checked,
+      include_stopped: el.settingsIncludeStopped.checked,
+      refresh_interval_minutes: Number(el.settingsRefreshInterval.value) || 30,
+      log_tail_lines: Number(el.settingsLogTail.value) || 300,
+      log_auto_refresh: el.settingsLogAutoRefresh.checked,
+      log_refresh_seconds: Number(el.settingsLogRefresh.value) || 5
+    };
+    postJSON("/api/settings", body)
+      .then(function (result) {
+        if (result.error) throw new Error(result.error);
+        state.settings = result;
+        el.settingsDialog.close();
+        render();
+      })
+      .catch(function (err) {
+        showError(el.settingsError, err.message || "Could not save settings.");
+      });
+  }
+
   function submitSetup(event) {
     event.preventDefault();
     var username = el.setupUsername.value.trim();
@@ -1460,37 +1598,25 @@
 
   function confirmDialog(title, message, options) {
     options = options || {};
+    if (state.settings && state.settings.skip_confirmations) {
+      return Promise.resolve(true);
+    }
+
     el.confirmTitle.textContent = title || "Are you sure?";
     el.confirmMessage.textContent = message || "";
     el.confirmOk.textContent = options.confirmLabel || "Confirm";
     el.confirmOk.className = "button" + (options.danger ? " danger" : " primary");
 
-    var typed = options.typeToConfirm;
-    el.confirmTypedWrap.hidden = !typed;
-    el.confirmTypedInput.value = "";
-    if (typed) {
-      el.confirmTypedLabel.textContent = "Type “" + typed + "” to confirm";
-      el.confirmOk.disabled = true;
-      el.confirmTypedInput.oninput = function () {
-        el.confirmOk.disabled = el.confirmTypedInput.value !== typed;
-      };
-    } else {
-      el.confirmOk.disabled = false;
-      el.confirmTypedInput.oninput = null;
-    }
-
     return new Promise(function (resolve) {
       function onClose() {
         el.confirmDialog.removeEventListener("close", onClose);
-        el.confirmOk.disabled = false;
         resolve(el.confirmDialog.returnValue === "ok");
       }
       el.confirmDialog.addEventListener("close", onClose);
       if (typeof el.confirmDialog.showModal === "function") {
         el.confirmDialog.showModal();
-        if (typed) el.confirmTypedInput.focus();
       } else {
-        resolve(!typed && window.confirm([title, message].filter(Boolean).join("\n\n")));
+        resolve(window.confirm([title, message].filter(Boolean).join("\n\n")));
       }
     });
   }
@@ -1580,14 +1706,24 @@
       confirmMessage: $("confirm-message"),
       confirmOk: $("confirm-ok"),
       confirmCancel: $("confirm-cancel"),
-      confirmTypedWrap: $("confirm-typed-wrap"),
-      confirmTypedLabel: $("confirm-typed-label"),
-      confirmTypedInput: $("confirm-typed-input")
+      settingsOpen: $("settings-open"),
+      settingsDialog: $("settings-dialog"),
+      settingsForm: $("settings-form"),
+      settingsCancel: $("settings-cancel"),
+      settingsError: $("settings-error"),
+      settingsSkipConfirmations: $("settings-skip-confirmations"),
+      settingsIncludeStopped: $("settings-include-stopped"),
+      settingsRefreshInterval: $("settings-refresh-interval"),
+      settingsLogTail: $("settings-log-tail"),
+      settingsLogAutoRefresh: $("settings-log-auto-refresh"),
+      settingsLogRefresh: $("settings-log-refresh"),
+      settingsLogRefreshWrap: $("settings-log-refresh-wrap")
     };
 
     initTheme();
     renderLegend();
     checkSetup();
+    loadSettings();
 
     el.refresh.addEventListener("click", refresh);
     el.addHost.addEventListener("click", openHostDialog);
@@ -1598,6 +1734,12 @@
     el.hostCancel.addEventListener("click", function () { el.hostDialog.close(); });
     el.hostCopy.addEventListener("click", copyCommand);
     el.confirmCancel.addEventListener("click", function () { el.confirmDialog.close(""); });
+    el.settingsOpen.addEventListener("click", openSettings);
+    el.settingsForm.addEventListener("submit", submitSettings);
+    el.settingsCancel.addEventListener("click", function () { el.settingsDialog.close(); });
+    el.settingsLogAutoRefresh.addEventListener("change", function () {
+      el.settingsLogRefreshWrap.hidden = !el.settingsLogAutoRefresh.checked;
+    });
     el.signout.addEventListener("click", function () {
       fetch("/api/logout", { method: "POST" })
         .then(function () { window.location.replace("/login"); })
