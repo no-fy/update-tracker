@@ -701,9 +701,6 @@ tr.detail td { padding: 0 18px 14px; background: transparent; }
 .tabs {
   display: flex;
   gap: 4px;
-  margin: 0 auto;
-  padding: 0 var(--gap);
-  max-width: 1200px;
   border-bottom: 1px solid var(--hairline);
 }
 
