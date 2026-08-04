@@ -700,7 +700,25 @@
     var table = text("table", "os-table");
 
     var head = text("tr");
-    if (canUpdate) head.appendChild(text("th", "os-pick", ""));
+    if (canUpdate) {
+      var pickAll = text("th", "os-pick");
+      var allBox = document.createElement("input");
+      allBox.type = "checkbox";
+      allBox.setAttribute("aria-label", "Select all packages");
+      var pickedCount = updates.filter(function (u) {
+        return state.picked[host.name + "/" + u.name];
+      }).length;
+      allBox.checked = updates.length > 0 && pickedCount === updates.length;
+      allBox.indeterminate = pickedCount > 0 && pickedCount < updates.length;
+      allBox.addEventListener("change", function () {
+        updates.forEach(function (u) {
+          state.picked[host.name + "/" + u.name] = allBox.checked;
+        });
+        render();
+      });
+      pickAll.appendChild(allBox);
+      head.appendChild(pickAll);
+    }
     ["Package", "Installed", "Available", "From"].forEach(function (label) {
       head.appendChild(text("th", null, label));
     });
