@@ -25,7 +25,8 @@
     status: "", query: "",            // containers tab
     severity: "", osQuery: "",        // OS tab
     host: "", open: {}, picked: {}, osJobs: {}, canAddHosts: false,
-    containerJobs: {}, logsOpen: {}, logs: {}, renaming: {}, settings: {}, logsRange: {}
+    containerJobs: {}, logsOpen: {}, logs: {}, renaming: {}, settings: {}, logsRange: {},
+    chatOpen: {}, chats: {}
   };
   var el = {};
   var pollTimer = null;
@@ -974,6 +975,196 @@
       });
   }
 
+  function aiChatAvailable() {
+    return !!(state.settings && state.settings.ai_chat_available);
+  }
+
+  function currentLogLines(key) {
+    var entry = state.logs[key];
+    if (!entry || !entry.lines) return [];
+    return entry.lines.map(formatLogLine);
+  }
+
+  // Streaming deltas can arrive many times a second; coalesce the
+  // full-tree re-renders they trigger into one per animation frame.
+  var renderScheduled = false;
+  function scheduleRender() {
+    if (renderScheduled) return;
+    renderScheduled = true;
+    requestAnimationFrame(function () { renderScheduled = false; render(); });
+  }
+
+  function formatCost(usage) {
+    if (!usage) return "";
+    var bits = [];
+    if (typeof usage.cost === "number") {
+      bits.push("$" + usage.cost.toFixed(usage.cost < 0.01 ? 5 : 4));
+    }
+    var tokens = usage.total_tokens ||
+      ((usage.prompt_tokens || 0) + (usage.completion_tokens || 0));
+    if (tokens) bits.push(tokens + " tokens");
+    return bits.join(" · ");
+  }
+
+  function aiChatToggleButton(host, container) {
+    var key = containerKey(container);
+    var btn = text("button", "button small");
+    btn.type = "button";
+    btn.textContent = state.chatOpen[key] ? "Hide AI" : "Ask AI";
+    btn.addEventListener("click", function () {
+      var opening = !state.chatOpen[key];
+      state.chatOpen[key] = opening;
+      state.open[key] = true;
+      if (opening) {
+        if (!state.chats[key]) state.chats[key] = { messages: [] };
+        if (!state.logs[key]) loadLogs(host, container, true);
+      }
+      render();
+    });
+    return btn;
+  }
+
+  function sendChatMessage(host, container, messageText) {
+    var key = containerKey(container);
+    var chat = state.chats[key] || (state.chats[key] = { messages: [] });
+    var history = chat.messages.map(function (m) { return { role: m.role, content: m.content }; });
+    chat.messages.push({ role: "user", content: messageText });
+    chat.draft = "";
+    chat.loading = true;
+    chat.error = null;
+    render();
+
+    var assistantMsg = null;
+
+    fetch(
+      "/api/hosts/" + encodeURIComponent(host.name) +
+      "/containers/" + encodeURIComponent(container.id) + "/chat/stream",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: messageText,
+          history: history,
+          logs: currentLogLines(key).slice(-400),
+          container_name: container.name
+        })
+      }
+    )
+      .then(function (response) {
+        if (!response.body) throw new Error("Streaming is not supported by this browser.");
+        var reader = response.body.getReader();
+        var decoder = new TextDecoder();
+        var buffer = "";
+
+        function handleLine(line) {
+          if (!line.trim()) return;
+          var event;
+          try { event = JSON.parse(line); } catch (e) { return; }
+          if (event.error) {
+            chat.error = event.error;
+            return;
+          }
+          if (event.delta) {
+            if (!assistantMsg) {
+              assistantMsg = { role: "assistant", content: "" };
+              chat.messages.push(assistantMsg);
+            }
+            assistantMsg.content += event.delta;
+            scheduleRender();
+          }
+          if (event.usage && assistantMsg) {
+            assistantMsg.usage = event.usage;
+          }
+        }
+
+        function pump() {
+          return reader.read().then(function (step) {
+            if (step.done) {
+              buffer += decoder.decode();
+              if (buffer) handleLine(buffer);
+              return;
+            }
+            buffer += decoder.decode(step.value, { stream: true });
+            var lines = buffer.split("\n");
+            buffer = lines.pop();
+            lines.forEach(handleLine);
+            return pump();
+          });
+        }
+        return pump();
+      })
+      .catch(function (err) {
+        chat.error = err.message || "Could not reach the AI assistant.";
+      })
+      .then(function () {
+        chat.loading = false;
+        if (assistantMsg && !assistantMsg.content && !chat.error) {
+          chat.error = "No response.";
+        }
+        render();
+      });
+  }
+
+  function aiChatPanel(host, container) {
+    var key = containerKey(container);
+    var chat = state.chats[key] || (state.chats[key] = { messages: [] });
+    var wrap = text("div", "ai-chat");
+
+    var messages = text("div", "ai-chat-messages");
+    if (!chat.messages.length) {
+      messages.appendChild(text("p", "ai-chat-hint",
+        "Ask about the logs below -- errors, restart loops, anything worth explaining. " +
+        "The log lines currently loaded are sent to the model along with your question."));
+    }
+    chat.messages.forEach(function (m) {
+      var bubble = text("div", "ai-chat-msg ai-chat-" + m.role);
+      bubble.appendChild(text("span", "ai-chat-role", m.role === "user" ? "You" : "AI"));
+      bubble.appendChild(text("p", null, m.content));
+      var cost = m.role === "assistant" ? formatCost(m.usage) : "";
+      if (cost) bubble.appendChild(text("span", "ai-chat-usage", cost));
+      messages.appendChild(bubble);
+    });
+    var lastMsg = chat.messages[chat.messages.length - 1];
+    var stillWaiting = chat.loading && (!lastMsg || lastMsg.role !== "assistant" || !lastMsg.content);
+    if (stillWaiting) {
+      var thinking = text("span", "os-running");
+      thinking.appendChild(text("span", "spinner"));
+      thinking.appendChild(text("span", null, "Thinking…"));
+      messages.appendChild(thinking);
+    }
+    if (chat.error) messages.appendChild(text("p", "ai-chat-error", chat.error));
+    wrap.appendChild(messages);
+
+    var row = text("div", "ai-chat-input-row");
+    var input = document.createElement("textarea");
+    input.className = "ai-chat-input";
+    input.rows = 2;
+    input.placeholder = "What's going wrong with this container?";
+    input.value = chat.draft || "";
+    input.disabled = !!chat.loading;
+    input.addEventListener("input", function () { chat.draft = input.value; });
+
+    var sendBtn = text("button", "button small primary");
+    sendBtn.type = "button";
+    sendBtn.textContent = "Send";
+    sendBtn.disabled = !!chat.loading;
+
+    function send() {
+      var value = (input.value || "").trim();
+      if (!value || chat.loading) return;
+      sendChatMessage(host, container, value);
+    }
+    sendBtn.addEventListener("click", send);
+    input.addEventListener("keydown", function (event) {
+      if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); send(); }
+    });
+
+    row.appendChild(input);
+    row.appendChild(sendBtn);
+    wrap.appendChild(row);
+    return wrap;
+  }
+
   function renderFilters(data) {
     var counts = (data.summary || {}).counts || {};
     var total = (data.summary || {}).containers_total || 0;
@@ -1071,6 +1262,7 @@
     actionsCell.addEventListener("click", function (event) { event.stopPropagation(); });
     actionsCell.appendChild(containerActionBar(host, container));
     actionsCell.appendChild(logsToggleButton(host, container));
+    if (aiChatAvailable()) actionsCell.appendChild(aiChatToggleButton(host, container));
     row.appendChild(actionsCell);
 
     var detail = text("tr", "detail");
@@ -1080,6 +1272,7 @@
     body.appendChild(text("p", "detail-note", container.detail || ""));
     body.appendChild(containerDetailsPanel(container));
     if (state.logsOpen[key]) body.appendChild(logsSection(host, container));
+    if (state.chatOpen[key]) body.appendChild(aiChatPanel(host, container));
 
     cell.appendChild(body);
     detail.appendChild(cell);
@@ -1456,8 +1649,36 @@
     el.settingsLogAutoRefresh.checked = s.log_auto_refresh !== false;
     el.settingsLogRefresh.value = s.log_refresh_seconds || 5;
     el.settingsLogRefreshWrap.hidden = !el.settingsLogAutoRefresh.checked;
+    el.settingsAiKey.value = "";
+    el.settingsAiKey.placeholder = s.openrouter_api_key_set
+      ? "A key is set -- leave blank to keep it"
+      : "sk-or-...";
+    el.settingsAiKeyHint.textContent = s.openrouter_api_key_set
+      ? "A key is already configured. Enter a new one to replace it, or leave this blank."
+      : "Required for the Ask AI button to appear. Get one at openrouter.ai/keys.";
+    el.settingsAiModel.value = s.openrouter_model || "";
     hide(el.settingsError);
+    loadAiModels();
     if (typeof el.settingsDialog.showModal === "function") el.settingsDialog.showModal();
+  }
+
+  var aiModelsLoaded = false;
+  function loadAiModels() {
+    if (aiModelsLoaded) return;
+    aiModelsLoaded = true;
+    fetch("/api/ai/models")
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (result) {
+        if (!result || !result.models) return;
+        el.settingsAiModelList.innerHTML = "";
+        result.models.forEach(function (m) {
+          var opt = document.createElement("option");
+          opt.value = m.id;
+          opt.label = m.name || m.id;
+          el.settingsAiModelList.appendChild(opt);
+        });
+      })
+      .catch(function () { aiModelsLoaded = false; });
   }
 
   function submitSettings(event) {
@@ -1468,7 +1689,9 @@
       refresh_interval_minutes: Number(el.settingsRefreshInterval.value) || 30,
       log_tail_lines: Number(el.settingsLogTail.value) || 300,
       log_auto_refresh: el.settingsLogAutoRefresh.checked,
-      log_refresh_seconds: Number(el.settingsLogRefresh.value) || 5
+      log_refresh_seconds: Number(el.settingsLogRefresh.value) || 5,
+      openrouter_api_key: el.settingsAiKey.value,
+      openrouter_model: el.settingsAiModel.value.trim()
     };
     postJSON("/api/settings", body)
       .then(function (result) {
@@ -1717,7 +1940,11 @@
       settingsLogTail: $("settings-log-tail"),
       settingsLogAutoRefresh: $("settings-log-auto-refresh"),
       settingsLogRefresh: $("settings-log-refresh"),
-      settingsLogRefreshWrap: $("settings-log-refresh-wrap")
+      settingsLogRefreshWrap: $("settings-log-refresh-wrap"),
+      settingsAiKey: $("settings-ai-key"),
+      settingsAiKeyHint: $("settings-ai-key-hint"),
+      settingsAiModel: $("settings-ai-model"),
+      settingsAiModelList: $("settings-ai-model-list")
     };
 
     initTheme();

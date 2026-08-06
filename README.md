@@ -294,6 +294,44 @@ rotates away. If the agent has this on, it separately keeps its own copy:
   `CUD_LOG_MAX_ROWS_PER_CONTAINER` (default 200,000) are both enforced, so a
   chatty container can't fill the disk between prunes.
 
+### AI troubleshooting
+
+An **Ask AI** button next to Logs opens a small chat scoped to that
+container, backed by [OpenRouter](https://openrouter.ai):
+
+- **Configured from Settings.** The gear icon has an OpenRouter API key field
+  — paste one from [openrouter.ai/keys](https://openrouter.ai/keys) and the
+  Ask AI button appears everywhere. The key is write-only: `GET /api/settings`
+  reports `openrouter_api_key_set: true/false`, never the key itself, the same
+  way it reports `password_set` instead of the password. Saving with the field
+  left blank keeps whatever key is already configured — it does not clear it.
+  `CUD_OPENROUTER_API_KEY` still works too, as a fallback for when nothing is
+  set in Settings (same precedence as `CUD_PASSWORD`).
+- **Pick any model.** The model field autocompletes from OpenRouter's live
+  catalog (`GET /api/ai/models`, cached in memory for an hour). Leave it blank
+  for the default, **Claude Haiku** (`anthropic/claude-haiku-4.5`) — cheap,
+  since this is Q&A over a page of log text, not a task that needs a frontier
+  model. `CUD_OPENROUTER_MODEL` sets a different default the same way the key
+  env var does.
+- **Streams**, rather than waiting for the full reply — the dashboard relays
+  OpenRouter's response chunk by chunk over a plain chunked HTTP response
+  (`POST .../chat/stream`), no SSE library or dependency involved on either
+  end.
+- **Shows what it cost.** Requests ask OpenRouter for cost accounting, so
+  each reply is followed by its token count and price.
+- **Raw HTTP against OpenRouter's OpenAI-compatible endpoint**, no SDK. Same
+  reason as everywhere else in this project: no dependencies beyond the
+  standard library, on either side.
+- **Your log lines leave the machine.** Whatever the Logs panel currently has
+  loaded (live tail or a stored history range) is sent to OpenRouter, and
+  from there to whichever model you've picked, along with your question,
+  every time you ask one — this is the one feature in the whole project that
+  talks to anything other than the hosts you configured. Don't turn it on for
+  a container that logs secrets you would not want leaving this machine.
+- **The key sits in `config.json` like everything else here**, mode 0600 —
+  there's no separate secrets store, consistent with how agent tokens and the
+  dashboard password are already kept.
+
 ## Settings
 
 The gear icon opens dashboard-wide preferences, saved to `config.json` and
@@ -306,6 +344,8 @@ shared by everyone signed in:
 | Background refresh | How often the dashboard re-polls every host, in minutes. |
 | Log lines fetched | How many lines a live tail request pulls at once. |
 | Auto-refresh open log panels, and how often | Off means logs only update when you press Refresh. |
+| OpenRouter API key | Turns on the **Ask AI** button. Write-only — never shown back once saved. |
+| OpenRouter model | Which model **Ask AI** uses. Blank means the built-in default (Claude Haiku). |
 
 ## OS package updates
 
@@ -621,6 +661,9 @@ tokens are never returned.
 | GET | `/api/hosts/<name>/containers/<id>/recreate/job/<job_id>` | that recreate's status and log |
 | GET | `/api/hosts/<name>/containers/<id>/logs?tail=200` | recent stdout/stderr lines |
 | GET | `/api/hosts/<name>/containers/<id>/logs/history?since=&until=&limit=` | stored log lines, if the agent has history on |
+| POST | `/api/hosts/<name>/containers/<id>/chat` | ask about this container's logs via OpenRouter (non-streaming): `{"message", "history", "logs"}` — refused unless an OpenRouter key is configured |
+| POST | `/api/hosts/<name>/containers/<id>/chat/stream` | same, streamed back as chunked newline-delimited JSON (`{"delta"}` events, then `{"usage"}`) |
+| GET | `/api/ai/models` | OpenRouter's model catalog, for the Settings model picker |
 | GET | `/api/settings` | current dashboard-wide preferences |
 | POST | `/api/settings` | update one or more of them |
 | POST | `/api/enrollments` | mint an enrolment and return the command to run |
