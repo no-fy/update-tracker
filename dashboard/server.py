@@ -477,6 +477,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 urllib.parse.unquote(path[len("/api/hosts/"):-len("/os/update")]))
             return
 
+        if path.startswith("/api/hosts/") and path.endswith("/os/refresh"):
+            self._handle_os_refresh(
+                urllib.parse.unquote(path[len("/api/hosts/"):-len("/os/refresh")]))
+            return
+
         if path.startswith("/api/hosts/") and "/containers/" in path:
             tail = path.rsplit("/", 1)[-1]
             if tail in ("start", "stop", "restart", "pause", "unpause"):
@@ -557,6 +562,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
             return
         self.server.poller.refresh_async()
+        self._json(202, job)
+
+    def _handle_os_refresh(self, name):
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+
+        try:
+            job = collector.refresh_os_lists(host)
+        except collector.OsUpdateRefused as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")
+            try:
+                self._json(exc.code, json.loads(detail))
+            except ValueError:
+                self._json(exc.code, {"error": detail[:300] or "agent refused"})
+            return
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
         self._json(202, job)
 
     def _split_container_path(self, path, suffix):
@@ -951,7 +980,10 @@ def build_server(config_path=None, bind=None, port=None, verbose=False):
         (h for h in config.get("hosts", []) if h.get("mode") == "local"), None)
     if local_host is not None:
         import logstore
+        import osupdate
         logstore.init(local_host.get("docker_socket"))
+        osupdate.start_auto_refresh(
+            on_finish=lambda job: collector.agent_module.os_updates(force=True))
 
     loader = functools.partial(config_mod.load_config, config_path)
     factory = functools.partial(

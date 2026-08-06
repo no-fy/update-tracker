@@ -43,6 +43,11 @@ services:
       # Historical logs are on by default too, once there is somewhere to
       # put them (the cud-logs volume above). Days of history to keep:
       # CUD_LOG_RETENTION_DAYS: "7"
+      # OS package lists refresh themselves every 6 hours by default (needs
+      # the same pid/privileged access as installing updates does, above).
+      # 0 turns this off; there is also a manual "Refresh package lists"
+      # button per host either way.
+      # CUD_OS_REFRESH_HOURS: "6"
       # A dashboard-wide "Ask AI" assistant that can look at hosts,
       # containers, logs and OS updates -- and, with your approval, act on
       # them -- via OpenRouter (Claude Haiku by default, pick any model at

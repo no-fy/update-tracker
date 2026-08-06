@@ -398,8 +398,10 @@
     if (job && job.status === "running") {
       var busy = text("span", "os-running");
       busy.appendChild(text("span", "spinner"));
-      busy.appendChild(text("span", null, "Installing " + job.packages.length + " " +
-        plural(job.packages.length, "package", "packages") + "…"));
+      busy.appendChild(text("span", null, job.kind === "refresh"
+        ? "Refreshing package lists…"
+        : "Installing " + job.packages.length + " " +
+          plural(job.packages.length, "package", "packages") + "…"));
       bar.appendChild(busy);
       bar.appendChild(logBox(job));
       return bar;
@@ -435,15 +437,47 @@
       bar.appendChild(sec);
     }
 
+    var refreshBtn = text("button", "button small");
+    refreshBtn.type = "button";
+    refreshBtn.textContent = "Refresh package lists";
+    var listsUpdated = (host.os || {}).lists_updated;
+    refreshBtn.title = listsUpdated
+      ? "Package lists last refreshed " + relativeTime(listsUpdated) + " ago"
+      : "";
+    refreshBtn.addEventListener("click", function () { runOsRefresh(host); });
+    bar.appendChild(refreshBtn);
+
     if (job && job.status && job.status !== "running") {
-      var done = text("span", job.status === "ok" ? "os-done" : "os-failed",
-        job.status === "ok"
-          ? "Installed " + job.packages.length + " " + plural(job.packages.length, "package", "packages")
-          : "Update failed");
+      var doneText = job.kind === "refresh"
+        ? (job.status === "ok" ? "Package lists refreshed" : "Refresh failed")
+        : (job.status === "ok"
+            ? "Installed " + job.packages.length + " " + plural(job.packages.length, "package", "packages")
+            : "Update failed");
+      var done = text("span", job.status === "ok" ? "os-done" : "os-failed", doneText);
       bar.appendChild(done);
       bar.appendChild(logBox(job));
     }
     return bar;
+  }
+
+  function runOsRefresh(host) {
+    state.osJobs[host.name] = { status: "running", kind: "refresh", packages: [], lines: [] };
+    render();
+
+    postJSON("/api/hosts/" + encodeURIComponent(host.name) + "/os/refresh", {})
+      .then(function (job) {
+        if (job.error) throw new Error(job.error);
+        state.osJobs[host.name] = job;
+        render();
+        watchOsJob(host, job.id);
+      })
+      .catch(function (err) {
+        state.osJobs[host.name] = {
+          status: "failed", kind: "refresh", packages: [],
+          lines: [err.message || "The refresh could not be started."]
+        };
+        render();
+      });
   }
 
   function logBox(job) {
@@ -975,6 +1009,111 @@
       });
   }
 
+  // A small, dependency-free markdown renderer -- just enough for what a
+  // model actually sends back: paragraphs, headings, lists, fenced code,
+  // inline code/bold/italic/links. Not a full spec implementation.
+
+  function renderInlineMarkdown(parent, raw) {
+    var pattern = /`([^`]+)`|\*\*([^*]+)\*\*|\*([^*]+)\*|_([^_]+)_|\[([^\]]+)\]\(([^)\s]+)\)/g;
+    var lastIndex = 0;
+    var match;
+    while ((match = pattern.exec(raw)) !== null) {
+      if (match.index > lastIndex) {
+        parent.appendChild(document.createTextNode(raw.slice(lastIndex, match.index)));
+      }
+      if (match[1] !== undefined) {
+        parent.appendChild(text("code", "md-inline-code", match[1]));
+      } else if (match[2] !== undefined) {
+        var strong = document.createElement("strong");
+        strong.textContent = match[2];
+        parent.appendChild(strong);
+      } else if (match[3] !== undefined || match[4] !== undefined) {
+        var em = document.createElement("em");
+        em.textContent = match[3] !== undefined ? match[3] : match[4];
+        parent.appendChild(em);
+      } else if (match[5] !== undefined) {
+        var a = document.createElement("a");
+        a.href = match[6];
+        a.textContent = match[5];
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        parent.appendChild(a);
+      }
+      lastIndex = pattern.lastIndex;
+    }
+    if (lastIndex < raw.length) {
+      parent.appendChild(document.createTextNode(raw.slice(lastIndex)));
+    }
+  }
+
+  function renderMarkdown(parent, raw) {
+    var lines = (raw || "").replace(/\r\n/g, "\n").split("\n");
+    var i = 0;
+    var listEl = null;
+
+    while (i < lines.length) {
+      var line = lines[i];
+
+      var fence = line.match(/^```(\w*)\s*$/);
+      if (fence) {
+        listEl = null;
+        var codeLines = [];
+        i++;
+        while (i < lines.length && !/^```\s*$/.test(lines[i])) {
+          codeLines.push(lines[i]);
+          i++;
+        }
+        i++;
+        var pre = document.createElement("pre");
+        pre.className = "md-code";
+        pre.appendChild(text("code", null, codeLines.join("\n")));
+        parent.appendChild(pre);
+        continue;
+      }
+
+      if (!line.trim()) { listEl = null; i++; continue; }
+
+      var heading = line.match(/^(#{1,4})\s+(.*)$/);
+      if (heading) {
+        listEl = null;
+        var h = document.createElement("h" + Math.min(6, heading[1].length + 2));
+        h.className = "md-heading";
+        renderInlineMarkdown(h, heading[2]);
+        parent.appendChild(h);
+        i++;
+        continue;
+      }
+
+      var ordered = line.match(/^\s*\d+\.\s+(.*)$/);
+      var unordered = !ordered && line.match(/^\s*[-*]\s+(.*)$/);
+      if (ordered || unordered) {
+        var tag = ordered ? "ol" : "ul";
+        if (!listEl || listEl.tagName.toLowerCase() !== tag) {
+          listEl = document.createElement(tag);
+          listEl.className = "md-list";
+          parent.appendChild(listEl);
+        }
+        var li = document.createElement("li");
+        renderInlineMarkdown(li, (ordered || unordered)[1]);
+        listEl.appendChild(li);
+        i++;
+        continue;
+      }
+
+      listEl = null;
+      var paraLines = [];
+      while (i < lines.length && lines[i].trim() &&
+             !/^```/.test(lines[i]) && !/^#{1,4}\s/.test(lines[i]) &&
+             !/^\s*\d+\.\s+/.test(lines[i]) && !/^\s*[-*]\s+/.test(lines[i])) {
+        paraLines.push(lines[i]);
+        i++;
+      }
+      var p = document.createElement("p");
+      renderInlineMarkdown(p, paraLines.join(" "));
+      parent.appendChild(p);
+    }
+  }
+
   function formatCost(usage) {
     if (!usage) return "";
     var bits = [];
@@ -1045,7 +1184,14 @@
       }
       var bubble = text("div", "ai-chat-msg ai-chat-" + m.role);
       bubble.appendChild(text("span", "ai-chat-role", m.role === "user" ? "You" : "AI"));
-      bubble.appendChild(text("p", null, m.text));
+      if (m.role === "assistant") {
+        var body = document.createElement("div");
+        body.className = "md-body";
+        renderMarkdown(body, m.text || "");
+        bubble.appendChild(body);
+      } else {
+        bubble.appendChild(text("p", null, m.text));
+      }
       var cost = m.role === "assistant" ? formatCost(m.usage) : "";
       if (cost) bubble.appendChild(text("span", "ai-chat-usage", cost));
       el.aiAssistantMessages.appendChild(bubble);

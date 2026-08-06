@@ -334,6 +334,9 @@ remove or recreate a container, or install OS updates. It's backed by
   browser holds the whole conversation, tool calls and all, and resends it
   each turn (`POST /api/ai/chat`); nothing is kept in memory between
   requests beyond the current dashboard snapshot the tools already read from.
+- **Replies render as markdown** — headings, lists, bold/italic, inline code
+  and fenced code blocks — via a small renderer built into `app.js` rather
+  than a library, same reasoning as the rest of the project.
 - **Shows what it cost.** Requests ask OpenRouter for cost accounting, so
   each reply is followed by its token count and price.
 - **Raw HTTP against OpenRouter's OpenAI-compatible endpoint**, no SDK. Same
@@ -425,13 +428,26 @@ databases instead — same results, nothing else visible:
 The only thing lost is the `reboot-required` flag, which lives in `/var/run`.
 
 **"Available" means what the host last fetched.** These files only change when
-something runs `apt update`, so a box that has not refreshed in a month will
-honestly report old data — the dashboard shows how stale the lists are rather
-than implying freshness it cannot check. Most systems refresh on a timer;
-if yours does not, that timestamp is the thing to watch.
+something runs `apt update` and friends, so a box that has not refreshed in a
+month will honestly report old data — the dashboard shows how stale the lists
+are rather than implying freshness it cannot check. Two things keep that from
+being something you have to remember to do yourself:
 
-A scan costs about two seconds on a normal Debian box, so the agent caches it
-for 15 minutes (`CUD_OS_CACHE_SECONDS`).
+- **The agent refreshes them on its own**, every `CUD_OS_REFRESH_HOURS` hours
+  (default 6, same idea as Ubuntu's own `apt-daily.timer`, just from inside
+  the agent so it works the same way on every distro this supports). Set it
+  to `0` to turn this off if you'd rather control refreshes yourself.
+- **A "Refresh package lists" button** sits next to Install on every host, for
+  "I know something changed, check now" — same 30-minute-ceiling, one-job,
+  streamed-output job as installing, just running `apt-get update` (or
+  `apk update` / `pacman -Sy`) instead of an upgrade. Needs the same
+  `--pid=host --privileged` access installing does, since it is the same
+  mechanism running a different command.
+
+A scan of the lists themselves costs about two seconds on a normal Debian box,
+so the agent caches *that* for 15 minutes (`CUD_OS_CACHE_SECONDS`) — this is
+just how often the already-fetched files get re-read, not how often they get
+fetched.
 
 ### Installing them
 
@@ -666,7 +682,8 @@ tokens are never returned.
 | POST | `/api/hosts/<name>/enabled` | `{"enabled": false}` to pause a host |
 | DELETE | `/api/hosts/<name>` | unregister a host |
 | POST | `/api/hosts/<name>/os/update` | install updates: `{"packages": [...]}` or `{"severity": "security"}` |
-| GET | `/api/hosts/<name>/os/job/<id>` | that install's status and output |
+| POST | `/api/hosts/<name>/os/refresh` | refresh that host's package lists (`apt-get update` and friends) |
+| GET | `/api/hosts/<name>/os/job/<id>` | that install's or refresh's status and output (`"kind": "install"\|"refresh"`) |
 | POST | `/api/hosts/<name>/containers/<id>/start` | start a stopped container |
 | POST | `/api/hosts/<name>/containers/<id>/stop` | stop a running container |
 | POST | `/api/hosts/<name>/containers/<id>/restart` | restart a container |
@@ -699,7 +716,7 @@ is refused until they do — an unauthenticated dashboard will not hand out
 enrolment tokens to whoever can reach the port.
 
 The agent's own API is `/healthz` (open) plus `/v1/containers`, `/v1/info`,
-`/v1/os`, `POST /v1/os/update`, `/v1/os/job/<id>`,
+`/v1/os`, `POST /v1/os/update`, `POST /v1/os/refresh`, `/v1/os/job/<id>`,
 `POST /v1/containers/<id>/{start,stop,restart,pause,unpause,rename,recreate}`,
 `DELETE /v1/containers/<id>`, `/v1/containers/<id>/logs`,
 `/v1/containers/<id>/logs/history` and
