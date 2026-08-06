@@ -173,6 +173,18 @@ def build_command(manager, packages):
     raise UpdateError("Updating %s hosts is not supported." % manager)
 
 
+def refresh_command(manager):
+    """The argv to refresh a manager's package lists -- no packages touched,
+    just the metadata `scan_dpkg`/`scan_apk`/`scan_pacman` read from disk."""
+    if manager == "apt":
+        return ["apt-get", "-y", "update"], {"DEBIAN_FRONTEND": "noninteractive"}
+    if manager == "apk":
+        return ["apk", "update"], {}
+    if manager == "pacman":
+        return ["pacman", "-Sy", "--noconfirm"], {}
+    raise UpdateError("Refreshing %s package lists is not supported." % manager)
+
+
 def _wrap_for_host(argv, env):
     """Run argv on the host rather than inside this container."""
     if execution_mode() == "direct":
@@ -184,10 +196,11 @@ def _wrap_for_host(argv, env):
 
 
 class Job(object):
-    def __init__(self, job_id, packages, manager):
+    def __init__(self, job_id, packages, manager, kind="install"):
         self.id = job_id
         self.packages = list(packages)
         self.manager = manager
+        self.kind = kind  # "install" or "refresh"
         self.status = "running"
         self.returncode = None
         self.lines = []
@@ -207,6 +220,7 @@ class Job(object):
                 "id": self.id,
                 "packages": self.packages,
                 "manager": self.manager,
+                "kind": self.kind,
                 "status": self.status,
                 "returncode": self.returncode,
                 "lines": list(self.lines),
@@ -269,28 +283,64 @@ class Runner(object):
         thread.start()
         return job
 
+    def start_refresh(self, manager, on_finish=None):
+        """Refresh a manager's package lists -- same capability gate and
+        one-at-a-time lock as an install, since it is the same nsenter
+        subprocess mechanism, just a different, non-mutating command."""
+        able = capability()
+        if not able["can_update"]:
+            raise UpdateError(able["reason"] or "This agent cannot refresh package lists.")
+
+        with self._lock:
+            if self._active is not None:
+                raise UpdateError("An update is already running on this host.")
+            job = Job(uuid.uuid4().hex[:12], [], manager, kind="refresh")
+            self._jobs[job.id] = job
+            self._order.append(job.id)
+            self._active = job.id
+
+        thread = threading.Thread(
+            target=self._run_refresh, args=(job, manager, on_finish),
+            name="os-refresh-%s" % job.id, daemon=True,
+        )
+        thread.start()
+        return job
+
+    def _execute(self, job, argv, env):
+        command = _wrap_for_host(argv, env)
+        job.append("$ " + " ".join(command))
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            env=dict(os.environ, **env) if execution_mode() == "direct" else None,
+        )
+        deadline = time.time() + DEFAULT_TIMEOUT
+        for raw in process.stdout:
+            job.append(raw.decode("utf-8", "replace"))
+            if time.time() > deadline:
+                process.kill()
+                job.append("timed out after %d seconds" % DEFAULT_TIMEOUT)
+                break
+        process.wait()
+        job.returncode = process.returncode
+        job.status = "ok" if process.returncode == 0 else "failed"
+
+    def _finish(self, job, on_finish):
+        job.finished = time.time()
+        with self._lock:
+            self._active = None
+        if on_finish:
+            try:
+                on_finish(job)
+            except Exception:
+                pass
+
     def _run(self, job, manager, packages, on_finish):
         try:
             argv, env = build_command(manager, packages)
-            command = _wrap_for_host(argv, env)
-            job.append("$ " + " ".join(command))
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                env=dict(os.environ, **env) if execution_mode() == "direct" else None,
-            )
-            deadline = time.time() + DEFAULT_TIMEOUT
-            for raw in process.stdout:
-                job.append(raw.decode("utf-8", "replace"))
-                if time.time() > deadline:
-                    process.kill()
-                    job.append("timed out after %d seconds" % DEFAULT_TIMEOUT)
-                    break
-            process.wait()
-            job.returncode = process.returncode
-            job.status = "ok" if process.returncode == 0 else "failed"
+            self._execute(job, argv, env)
         except FileNotFoundError as exc:
             job.append(str(exc))
             job.returncode = -1
@@ -300,14 +350,59 @@ class Runner(object):
             job.returncode = -1
             job.status = "failed"
         finally:
-            job.finished = time.time()
-            with self._lock:
-                self._active = None
-            if on_finish:
-                try:
-                    on_finish(job)
-                except Exception:
-                    pass
+            self._finish(job, on_finish)
+
+    def _run_refresh(self, job, manager, on_finish):
+        try:
+            argv, env = refresh_command(manager)
+            self._execute(job, argv, env)
+        except FileNotFoundError as exc:
+            job.append(str(exc))
+            job.returncode = -1
+            job.status = "failed"
+        except Exception as exc:
+            job.append("%s: %s" % (type(exc).__name__, exc))
+            job.returncode = -1
+            job.status = "failed"
+        finally:
+            self._finish(job, on_finish)
 
 
 RUNNER = Runner()
+
+
+# ------------------------------------------------------------ auto-refresh --
+
+AUTO_REFRESH_HOURS = float(os.environ.get("CUD_OS_REFRESH_HOURS") or 6)
+_auto_refresh_started = False
+
+
+def start_auto_refresh(on_finish=None):
+    """Keep package lists from ever going stale without anyone asking --
+    the same reason Ubuntu ships apt-daily.timer, just from inside the
+    agent so it works the same way everywhere this runs. CUD_OS_REFRESH_HOURS=0
+    turns it off; the manual refresh (Runner.start_refresh) still works either way.
+    """
+    global _auto_refresh_started
+    if _auto_refresh_started or AUTO_REFRESH_HOURS <= 0:
+        return
+    _auto_refresh_started = True
+
+    def loop():
+        while True:
+            time.sleep(max(300.0, AUTO_REFRESH_HOURS * 3600))
+            if not capability()["can_update"]:
+                continue
+            try:
+                import ospackages
+                manager = ospackages.detect_manager()
+            except Exception:
+                continue
+            if not manager:
+                continue
+            try:
+                RUNNER.start_refresh(manager, on_finish=on_finish)
+            except UpdateError:
+                pass  # something else is already running; try again next interval
+
+    threading.Thread(target=loop, name="os-auto-refresh", daemon=True).start()

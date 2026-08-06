@@ -188,6 +188,28 @@ def start_os_update(host, packages=None, severity=None, timeout=30):
                            verify_tls=host.get("verify_tls", True))
 
 
+def refresh_os_lists(host, timeout=30):
+    """Ask a host's agent to refresh its package manager's lists (`apt-get
+    update` and friends) -- read-only in the sense that no package is
+    touched, but still needs the same host-namespace access as installing.
+    Raises on refusal."""
+    if host.get("mode") == "local":
+        import osupdate
+
+        manager = agent_module.os_updates().get("manager")
+        try:
+            job = osupdate.RUNNER.start_refresh(
+                manager, on_finish=lambda job: agent_module.os_updates(force=True))
+        except osupdate.UpdateError as exc:
+            raise OsUpdateRefused(str(exc))
+        return job.snapshot()
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/os/refresh" % (scheme, host.get("address"), host.get("port", 9713))
+    return _http_post_json(url, {}, token=host.get("token"), timeout=timeout,
+                           verify_tls=host.get("verify_tls", True))
+
+
 def get_os_job(host, job_id, timeout=20):
     if host.get("mode") == "local":
         import osupdate

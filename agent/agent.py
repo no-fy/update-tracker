@@ -617,6 +617,18 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._send(202, job.snapshot())
                 return
 
+        if path == "/v1/os/refresh":
+            osupdate = _osupdate()
+            manager = os_updates().get("manager")
+            try:
+                job = osupdate.RUNNER.start_refresh(
+                    manager, on_finish=lambda job: os_updates(force=True))
+            except osupdate.UpdateError as exc:
+                self._send(400, {"error": str(exc)})
+                return
+            self._send(202, job.snapshot())
+            return
+
         if path != "/v1/os/update":
             self._send(404, {"error": "no such endpoint", "path": path})
             return
@@ -699,6 +711,7 @@ def serve(token, bind="0.0.0.0", port=DEFAULT_PORT, docker_endpoint=None,
     )
     sys.stderr.flush()
     _logstore().init(docker_endpoint)
+    _osupdate().start_auto_refresh(on_finish=lambda job: os_updates(force=True))
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:

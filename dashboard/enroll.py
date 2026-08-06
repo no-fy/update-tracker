@@ -94,7 +94,7 @@ def agent_command(enrollment, dashboard_url, socket_path="/var/run/docker.sock")
 
     For an agent that only ever reports OS updates, drop `--pid=host
     --privileged` and add `-e CUD_ALLOW_UPDATES=0`. Everything except
-    installing keeps working.
+    installing and refreshing the package lists keeps working.
     """
     return (
         "docker run -d --name {name} --restart unless-stopped \\\n"
