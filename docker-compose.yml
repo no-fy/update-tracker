@@ -43,8 +43,9 @@ services:
       # Historical logs are on by default too, once there is somewhere to
       # put them (the cud-logs volume above). Days of history to keep:
       # CUD_LOG_RETENTION_DAYS: "7"
-      # An "Ask AI" button per container that sends its logs and your
-      # question to OpenRouter (Claude Haiku by default -- pick any model at
+      # A dashboard-wide "Ask AI" assistant that can look at hosts,
+      # containers, logs and OS updates -- and, with your approval, act on
+      # them -- via OpenRouter (Claude Haiku by default, pick any model at
       # https://openrouter.ai/models). Easiest to set from Settings in the
       # UI instead -- these are just a fallback for when nothing is saved
       # there yet:

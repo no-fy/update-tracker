@@ -26,7 +26,7 @@
     severity: "", osQuery: "",        // OS tab
     host: "", open: {}, picked: {}, osJobs: {}, canAddHosts: false,
     containerJobs: {}, logsOpen: {}, logs: {}, renaming: {}, settings: {}, logsRange: {},
-    chatOpen: {}, chats: {}
+    assistant: { open: false, wire: [], display: [], loading: false, error: null }
   };
   var el = {};
   var pollTimer = null;
@@ -975,25 +975,6 @@
       });
   }
 
-  function aiChatAvailable() {
-    return !!(state.settings && state.settings.ai_chat_available);
-  }
-
-  function currentLogLines(key) {
-    var entry = state.logs[key];
-    if (!entry || !entry.lines) return [];
-    return entry.lines.map(formatLogLine);
-  }
-
-  // Streaming deltas can arrive many times a second; coalesce the
-  // full-tree re-renders they trigger into one per animation frame.
-  var renderScheduled = false;
-  function scheduleRender() {
-    if (renderScheduled) return;
-    renderScheduled = true;
-    requestAnimationFrame(function () { renderScheduled = false; render(); });
-  }
-
   function formatCost(usage) {
     if (!usage) return "";
     var bits = [];
@@ -1006,163 +987,159 @@
     return bits.join(" · ");
   }
 
-  function aiChatToggleButton(host, container) {
-    var key = containerKey(container);
-    var btn = text("button", "button small");
-    btn.type = "button";
-    btn.textContent = state.chatOpen[key] ? "Hide AI" : "Ask AI";
-    btn.addEventListener("click", function () {
-      var opening = !state.chatOpen[key];
-      state.chatOpen[key] = opening;
-      state.open[key] = true;
-      if (opening) {
-        if (!state.chats[key]) state.chats[key] = { messages: [] };
-        if (!state.logs[key]) loadLogs(host, container, true);
-      }
-      render();
-    });
-    return btn;
+  // ---- the dashboard-wide assistant --------------------------------------
+  // One entry point for the whole site, not a button per container: it can
+  // look at any host/container/OS-update the dashboard tracks, and -- after
+  // going through the same confirm dialog the action buttons use -- start,
+  // stop, restart, pause, unpause, rename, remove or recreate a container,
+  // or install OS updates.
+
+  var TOOL_STATUS_LABELS = {
+    list_hosts: "Checking hosts…",
+    list_containers: "Looking at containers…",
+    get_logs: "Reading logs…",
+    get_logs_history: "Reading log history…",
+    list_os_updates: "Checking OS updates…"
+  };
+
+  function assistantAvailable() {
+    return !!(state.settings && state.settings.ai_assistant_available);
   }
 
-  function sendChatMessage(host, container, messageText) {
-    var key = containerKey(container);
-    var chat = state.chats[key] || (state.chats[key] = { messages: [] });
-    var history = chat.messages.map(function (m) { return { role: m.role, content: m.content }; });
-    chat.messages.push({ role: "user", content: messageText });
-    chat.draft = "";
-    chat.loading = true;
-    chat.error = null;
-    render();
+  function updateAssistantVisibility() {
+    if (el.aiFab) el.aiFab.hidden = !assistantAvailable();
+  }
 
-    var assistantMsg = null;
+  function openAssistant() {
+    state.assistant.open = true;
+    renderAssistantPanel();
+    if (typeof el.aiAssistantDialog.show === "function") {
+      el.aiAssistantDialog.show();
+    } else if (typeof el.aiAssistantDialog.showModal === "function") {
+      el.aiAssistantDialog.showModal();
+    }
+    el.aiAssistantInput.focus();
+  }
 
-    fetch(
-      "/api/hosts/" + encodeURIComponent(host.name) +
-      "/containers/" + encodeURIComponent(container.id) + "/chat/stream",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message: messageText,
-          history: history,
-          logs: currentLogLines(key).slice(-400),
-          container_name: container.name
-        })
+  function closeAssistant() {
+    state.assistant.open = false;
+    if (el.aiAssistantDialog.open) el.aiAssistantDialog.close();
+  }
+
+  function renderAssistantPanel() {
+    var a = state.assistant;
+    if (!el.aiAssistantMessages) return;
+    el.aiAssistantMessages.innerHTML = "";
+
+    if (!a.display.length) {
+      el.aiAssistantMessages.appendChild(text("p", "ai-chat-hint",
+        "Ask about any host or container -- I can look at containers, logs and OS updates, " +
+        "and, with your approval, start, stop, restart, rename, remove or recreate a " +
+        "container, or install OS updates."));
+    }
+
+    a.display.forEach(function (m) {
+      if (m.role === "status") {
+        el.aiAssistantMessages.appendChild(text("p", "ai-chat-status", m.text));
+        return;
       }
-    )
-      .then(function (response) {
-        if (!response.body) throw new Error("Streaming is not supported by this browser.");
-        var reader = response.body.getReader();
-        var decoder = new TextDecoder();
-        var buffer = "";
+      var bubble = text("div", "ai-chat-msg ai-chat-" + m.role);
+      bubble.appendChild(text("span", "ai-chat-role", m.role === "user" ? "You" : "AI"));
+      bubble.appendChild(text("p", null, m.text));
+      var cost = m.role === "assistant" ? formatCost(m.usage) : "";
+      if (cost) bubble.appendChild(text("span", "ai-chat-usage", cost));
+      el.aiAssistantMessages.appendChild(bubble);
+    });
 
-        function handleLine(line) {
-          if (!line.trim()) return;
-          var event;
-          try { event = JSON.parse(line); } catch (e) { return; }
-          if (event.error) {
-            chat.error = event.error;
-            return;
-          }
-          if (event.delta) {
-            if (!assistantMsg) {
-              assistantMsg = { role: "assistant", content: "" };
-              chat.messages.push(assistantMsg);
-            }
-            assistantMsg.content += event.delta;
-            scheduleRender();
-          }
-          if (event.usage && assistantMsg) {
-            assistantMsg.usage = event.usage;
-          }
-        }
+    if (a.loading) {
+      var thinking = text("span", "os-running");
+      thinking.appendChild(text("span", "spinner"));
+      thinking.appendChild(text("span", null, "Working…"));
+      el.aiAssistantMessages.appendChild(thinking);
+    }
+    if (a.error) el.aiAssistantMessages.appendChild(text("p", "ai-chat-error", a.error));
 
-        function pump() {
-          return reader.read().then(function (step) {
-            if (step.done) {
-              buffer += decoder.decode();
-              if (buffer) handleLine(buffer);
-              return;
-            }
-            buffer += decoder.decode(step.value, { stream: true });
-            var lines = buffer.split("\n");
-            buffer = lines.pop();
-            lines.forEach(handleLine);
-            return pump();
-          });
-        }
-        return pump();
-      })
+    el.aiAssistantMessages.scrollTop = el.aiAssistantMessages.scrollHeight;
+    el.aiAssistantSend.disabled = !!a.loading;
+  }
+
+  function assistantSend(messageText) {
+    var a = state.assistant;
+    a.display.push({ role: "user", text: messageText });
+    a.wire.push({ role: "user", content: messageText });
+    a.loading = true;
+    a.error = null;
+    renderAssistantPanel();
+
+    postJSON("/api/ai/chat", { messages: a.wire })
+      .then(handleAssistantResult)
       .catch(function (err) {
-        chat.error = err.message || "Could not reach the AI assistant.";
-      })
-      .then(function () {
-        chat.loading = false;
-        if (assistantMsg && !assistantMsg.content && !chat.error) {
-          chat.error = "No response.";
-        }
-        render();
+        a.loading = false;
+        a.error = err.message || "Could not reach the assistant.";
+        renderAssistantPanel();
       });
   }
 
-  function aiChatPanel(host, container) {
-    var key = containerKey(container);
-    var chat = state.chats[key] || (state.chats[key] = { messages: [] });
-    var wrap = text("div", "ai-chat");
-
-    var messages = text("div", "ai-chat-messages");
-    if (!chat.messages.length) {
-      messages.appendChild(text("p", "ai-chat-hint",
-        "Ask about the logs below -- errors, restart loops, anything worth explaining. " +
-        "The log lines currently loaded are sent to the model along with your question."));
+  function handleAssistantResult(result) {
+    var a = state.assistant;
+    if (result.error) {
+      a.loading = false;
+      a.error = result.error;
+      renderAssistantPanel();
+      return;
     }
-    chat.messages.forEach(function (m) {
-      var bubble = text("div", "ai-chat-msg ai-chat-" + m.role);
-      bubble.appendChild(text("span", "ai-chat-role", m.role === "user" ? "You" : "AI"));
-      bubble.appendChild(text("p", null, m.content));
-      var cost = m.role === "assistant" ? formatCost(m.usage) : "";
-      if (cost) bubble.appendChild(text("span", "ai-chat-usage", cost));
-      messages.appendChild(bubble);
-    });
-    var lastMsg = chat.messages[chat.messages.length - 1];
-    var stillWaiting = chat.loading && (!lastMsg || lastMsg.role !== "assistant" || !lastMsg.content);
-    if (stillWaiting) {
-      var thinking = text("span", "os-running");
-      thinking.appendChild(text("span", "spinner"));
-      thinking.appendChild(text("span", null, "Thinking…"));
-      messages.appendChild(thinking);
+    if (result.messages) a.wire = result.messages;
+
+    if (result.status === "final") {
+      a.loading = false;
+      a.display.push({ role: "assistant", text: result.reply || "", usage: result.usage });
+      renderAssistantPanel();
+      return;
     }
-    if (chat.error) messages.appendChild(text("p", "ai-chat-error", chat.error));
-    wrap.appendChild(messages);
 
-    var row = text("div", "ai-chat-input-row");
-    var input = document.createElement("textarea");
-    input.className = "ai-chat-input";
-    input.rows = 2;
-    input.placeholder = "What's going wrong with this container?";
-    input.value = chat.draft || "";
-    input.disabled = !!chat.loading;
-    input.addEventListener("input", function () { chat.draft = input.value; });
+    if (result.status === "needs_confirmation") {
+      var pending = result.pending || {};
+      var info = pending.confirm || {};
+      a.display.push({ role: "status",
+        text: TOOL_STATUS_LABELS[pending.name] || ("Proposing: " + pending.name) });
+      renderAssistantPanel();
 
-    var sendBtn = text("button", "button small primary");
-    sendBtn.type = "button";
-    sendBtn.textContent = "Send";
-    sendBtn.disabled = !!chat.loading;
+      confirmDialog(
+        info.title || "Confirm this action?",
+        info.message || "",
+        { confirmLabel: info.confirm_label || "Confirm", danger: !!info.danger }
+      ).then(function (approved) {
+        a.display.push({
+          role: "status",
+          text: (approved ? "Approved: " : "Declined: ") + (info.message || pending.name)
+        });
+        renderAssistantPanel();
 
-    function send() {
-      var value = (input.value || "").trim();
-      if (!value || chat.loading) return;
-      sendChatMessage(host, container, value);
+        postJSON("/api/ai/chat", {
+          messages: a.wire, confirm: { approved: approved }, pending: pending
+        })
+          .then(function (nextResult) {
+            if (approved) {
+              // Something may have just changed -- catch the dashboard up
+              // the same way the row action buttons do.
+              fetch("/api/refresh", { method: "POST" }).then(function () {
+                setTimeout(load, 1200);
+              });
+            }
+            handleAssistantResult(nextResult);
+          })
+          .catch(function (err) {
+            a.loading = false;
+            a.error = err.message || "Could not reach the assistant.";
+            renderAssistantPanel();
+          });
+      });
+      return;
     }
-    sendBtn.addEventListener("click", send);
-    input.addEventListener("keydown", function (event) {
-      if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); send(); }
-    });
 
-    row.appendChild(input);
-    row.appendChild(sendBtn);
-    wrap.appendChild(row);
-    return wrap;
+    a.loading = false;
+    a.error = "Unexpected response from the assistant.";
+    renderAssistantPanel();
   }
 
   function renderFilters(data) {
@@ -1262,7 +1239,6 @@
     actionsCell.addEventListener("click", function (event) { event.stopPropagation(); });
     actionsCell.appendChild(containerActionBar(host, container));
     actionsCell.appendChild(logsToggleButton(host, container));
-    if (aiChatAvailable()) actionsCell.appendChild(aiChatToggleButton(host, container));
     row.appendChild(actionsCell);
 
     var detail = text("tr", "detail");
@@ -1272,7 +1248,6 @@
     body.appendChild(text("p", "detail-note", container.detail || ""));
     body.appendChild(containerDetailsPanel(container));
     if (state.logsOpen[key]) body.appendChild(logsSection(host, container));
-    if (state.chatOpen[key]) body.appendChild(aiChatPanel(host, container));
 
     cell.appendChild(body);
     detail.appendChild(cell);
@@ -1635,6 +1610,7 @@
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (settings) {
         if (settings) state.settings = settings;
+        updateAssistantVisibility();
         return settings;
       })
       .catch(function () { return null; });
@@ -1697,6 +1673,7 @@
       .then(function (result) {
         if (result.error) throw new Error(result.error);
         state.settings = result;
+        updateAssistantVisibility();
         el.settingsDialog.close();
         render();
       })
@@ -1944,13 +1921,36 @@
       settingsAiKey: $("settings-ai-key"),
       settingsAiKeyHint: $("settings-ai-key-hint"),
       settingsAiModel: $("settings-ai-model"),
-      settingsAiModelList: $("settings-ai-model-list")
+      settingsAiModelList: $("settings-ai-model-list"),
+      aiFab: $("ai-assistant-open"),
+      aiAssistantDialog: $("ai-assistant-dialog"),
+      aiAssistantClose: $("ai-assistant-close"),
+      aiAssistantMessages: $("ai-assistant-messages"),
+      aiAssistantForm: $("ai-assistant-form"),
+      aiAssistantInput: $("ai-assistant-input"),
+      aiAssistantSend: $("ai-assistant-send")
     };
 
     initTheme();
     renderLegend();
     checkSetup();
     loadSettings();
+
+    el.aiFab.addEventListener("click", openAssistant);
+    el.aiAssistantClose.addEventListener("click", closeAssistant);
+    el.aiAssistantForm.addEventListener("submit", function (event) {
+      event.preventDefault();
+      var value = el.aiAssistantInput.value.trim();
+      if (!value || state.assistant.loading) return;
+      el.aiAssistantInput.value = "";
+      assistantSend(value);
+    });
+    el.aiAssistantInput.addEventListener("keydown", function (event) {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        el.aiAssistantForm.requestSubmit();
+      }
+    });
 
     el.refresh.addEventListener("click", refresh);
     el.addHost.addEventListener("click", openHostDialog);
