@@ -200,6 +200,22 @@
       <input type="number" id="settings-log-refresh" min="2" step="1">
     </label>
 
+    <h3 class="dialog-subhead">AI troubleshooting</h3>
+    <p class="dialog-lede">Powers the <strong>Ask AI</strong> button on each container's logs, via OpenRouter.</p>
+
+    <label class="stack">
+      <span>OpenRouter API key</span>
+      <input type="password" id="settings-ai-key" autocomplete="off" placeholder="sk-or-...">
+      <small id="settings-ai-key-hint"></small>
+    </label>
+
+    <label class="stack">
+      <span>Model</span>
+      <input type="text" id="settings-ai-model" list="settings-ai-model-list" placeholder="anthropic/claude-haiku-4.5">
+      <datalist id="settings-ai-model-list"></datalist>
+      <small>Any model id from openrouter.ai/models. Leave blank for the default (Claude Haiku).</small>
+    </label>
+
     <p class="dialog-error" id="settings-error" hidden></p>
     <div class="dialog-actions">
       <button type="button" class="button" id="settings-cancel">Cancel</button>

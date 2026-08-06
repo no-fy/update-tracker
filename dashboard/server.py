@@ -27,6 +27,7 @@ import urllib.parse
 if __package__ in (None, ""):  # allow `python3 dashboard/server.py`
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from dashboard import (
+        aihelper,
         collector,
         config as config_mod,
         enroll as enroll_mod,
@@ -34,6 +35,7 @@ if __package__ in (None, ""):  # allow `python3 dashboard/server.py`
     )
 else:
     from . import (
+        aihelper,
         collector,
         config as config_mod,
         enroll as enroll_mod,
@@ -127,6 +129,8 @@ SETTINGS_SCHEMA = {
     "log_tail_lines": int,
     "log_refresh_seconds": int,
     "log_auto_refresh": bool,
+    "openrouter_api_key": str,
+    "openrouter_model": str,
 }
 SETTINGS_DEFAULTS = {
     "skip_confirmations": False,
@@ -135,12 +139,33 @@ SETTINGS_DEFAULTS = {
     "log_tail_lines": 300,
     "log_refresh_seconds": 5,
     "log_auto_refresh": True,
+    "openrouter_api_key": "",
+    "openrouter_model": "",
 }
+# Like dashboard.password, this is never returned to the browser -- current_settings()
+# reports whether one is set instead of the value itself.
+SETTINGS_SECRET_KEYS = {"openrouter_api_key"}
+
+
+def resolved_openrouter_key(config):
+    """config.json first, then the env var -- same precedence as dashboard.password."""
+    return config.get("dashboard", {}).get("openrouter_api_key") or aihelper.api_key()
+
+
+def resolved_openrouter_model(config):
+    return config.get("dashboard", {}).get("openrouter_model") or aihelper.model()
 
 
 def current_settings(config):
     stored = config.get("dashboard", {})
-    return {key: stored.get(key, default) for key, default in SETTINGS_DEFAULTS.items()}
+    out = {
+        key: stored.get(key, default)
+        for key, default in SETTINGS_DEFAULTS.items()
+        if key not in SETTINGS_SECRET_KEYS
+    }
+    out["openrouter_api_key_set"] = bool(stored.get("openrouter_api_key"))
+    out["ai_chat_available"] = aihelper.available(resolved_openrouter_key(config))
+    return out
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -332,6 +357,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(200, current_settings(config))
             return
 
+        if path == "/api/ai/models":
+            try:
+                models = aihelper.list_models()
+            except Exception as exc:
+                self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+                return
+            self._json(200, {"models": models})
+            return
+
         if path == "/api/setup":
             self._json(
                 200,
@@ -437,6 +471,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 urllib.parse.unquote(path[len("/api/hosts/"):-len("/os/update")]))
             return
 
+        if path.startswith("/api/hosts/") and path.endswith("/chat/stream"):
+            self._handle_container_chat_stream(path)
+            return
+
         if path.startswith("/api/hosts/") and "/containers/" in path:
             tail = path.rsplit("/", 1)[-1]
             if tail in ("start", "stop", "restart", "pause", "unpause"):
@@ -447,6 +485,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             if tail == "recreate":
                 self._handle_container_recreate(path)
+                return
+            if tail == "chat":
+                self._handle_container_chat(path)
                 return
 
         if path.startswith("/api/hosts/") and path.endswith("/enabled"):
@@ -650,6 +691,82 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self._json(202, job)
 
+    def _handle_container_chat(self, path):
+        name, container_id = self._split_container_path(path, "/chat")
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+
+        body = self._read_body()
+        try:
+            result = aihelper.ask(
+                container_name=body.get("container_name") or container_id,
+                host_label=host.get("label") or host.get("name") or name,
+                log_lines=body.get("logs") or [],
+                history=body.get("history") or [],
+                message=body.get("message") or "",
+                api_key_override=resolved_openrouter_key(config),
+                model_override=resolved_openrouter_model(config),
+            )
+        except aihelper.ChatError as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self._json(200, result)
+
+    def _handle_container_chat_stream(self, path):
+        name, container_id = self._split_container_path(path, "/chat/stream")
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+
+        body = self._read_body()
+        api_key = resolved_openrouter_key(config)
+        model_override = resolved_openrouter_model(config)
+        container_name = body.get("container_name") or container_id
+        host_label = host.get("label") or host.get("name") or name
+        logs = body.get("logs") or []
+        history = body.get("history") or []
+        message = body.get("message") or ""
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+
+        def write_chunk(obj):
+            data = (json.dumps(obj) + "\n").encode("utf-8")
+            try:
+                self.wfile.write(("%x\r\n" % len(data)).encode("ascii") + data + b"\r\n")
+            except (BrokenPipeError, ConnectionResetError):
+                raise
+
+        try:
+            for event in aihelper.ask_stream(
+                container_name=container_name, host_label=host_label,
+                log_lines=logs, history=history, message=message,
+                api_key_override=api_key, model_override=model_override,
+            ):
+                write_chunk(event)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except Exception as exc:
+            try:
+                write_chunk({"error": "%s: %s" % (type(exc).__name__, exc)})
+            except (BrokenPipeError, ConnectionResetError):
+                return
+        try:
+            self.wfile.write(b"0\r\n\r\n")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def _handle_container_recreate_job(self, path):
         rest = path[len("/api/hosts/"):]
         name, _, tail = rest.partition("/containers/")
@@ -711,6 +828,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         settings = config.setdefault("dashboard", {})
         for key, value in body.items():
             if key not in SETTINGS_SCHEMA:
+                continue
+            if key == "openrouter_api_key" and not (value or "").strip():
+                # The field is never pre-filled with the current key, so a
+                # blank submission means "unchanged", not "clear it".
                 continue
             expected = SETTINGS_SCHEMA[key]
             try:
