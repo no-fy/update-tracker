@@ -200,8 +200,8 @@
       <input type="number" id="settings-log-refresh" min="2" step="1">
     </label>
 
-    <h3 class="dialog-subhead">AI troubleshooting</h3>
-    <p class="dialog-lede">Powers the <strong>Ask AI</strong> button on each container's logs, via OpenRouter.</p>
+    <h3 class="dialog-subhead">AI assistant</h3>
+    <p class="dialog-lede">Powers the <strong>Ask AI</strong> button in the corner, via OpenRouter. It can see every host/container/OS-update and, with your approval, act on them.</p>
 
     <label class="stack">
       <span>OpenRouter API key</span>
@@ -221,6 +221,21 @@
       <button type="button" class="button" id="settings-cancel">Cancel</button>
       <button class="button primary" id="settings-save" value="save">Save</button>
     </div>
+  </form>
+</dialog>
+
+<button type="button" class="ai-fab" id="ai-assistant-open" hidden>✦ Ask AI</button>
+
+<dialog id="ai-assistant-dialog" class="ai-assistant-dialog">
+  <div class="ai-assistant-head">
+    <h2>Assistant</h2>
+    <button type="button" class="button small" id="ai-assistant-close">Close</button>
+  </div>
+  <div class="ai-assistant-messages" id="ai-assistant-messages"></div>
+  <form id="ai-assistant-form" class="ai-chat-input-row">
+    <textarea id="ai-assistant-input" class="ai-chat-input" rows="2"
+      placeholder="Ask about your containers, logs, or OS updates..."></textarea>
+    <button type="submit" class="button small primary" id="ai-assistant-send">Send</button>
   </form>
 </dialog>
 

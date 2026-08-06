@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AI-assisted log troubleshooting, via OpenRouter.
+"""Low-level OpenRouter access, shared by the dashboard-wide assistant.
 
 Off by default: nothing here ever runs unless an OpenRouter API key is
 configured, either as `dashboard.openrouter_api_key` in config.json (set from
@@ -12,9 +12,9 @@ from a native Anthropic call.
 
 The dashboard is the only thing that calls out to OpenRouter; agents never
 do, so a host on an isolated LAN with no internet access still works exactly
-as before. Log lines are supplied by the browser (whatever it is currently
-showing), not re-fetched here, so this module has no dependency on collector
-or the agents at all.
+as before. This module only knows how to talk to OpenRouter -- what to ask
+it, which tools to offer, and the confirm-before-mutating loop live in
+aiagent.py.
 """
 
 import json
@@ -30,8 +30,6 @@ DEFAULT_MODEL = "anthropic/claude-haiku-4.5"
 CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODELS_URL = "https://openrouter.ai/api/v1/models"
 MODELS_CACHE_SECONDS = 3600
-MAX_LOG_CHARS = 12000
-MAX_HISTORY_MESSAGES = 20
 MAX_OUTPUT_TOKENS = 1024
 
 
@@ -61,32 +59,6 @@ def _headers(key):
     }
 
 
-def _system_prompt(container_name, host_label, log_lines):
-    log_text = "\n".join(log_lines or [])[-MAX_LOG_CHARS:]
-    if not log_text:
-        log_text = "(no log lines are currently loaded)"
-    return (
-        "You are helping a systems administrator troubleshoot a Docker "
-        "container by reading its logs. The container is \"%s\" on host "
-        "\"%s\". Be concise and specific: quote the exact log line(s) that "
-        "support your answer, name the likely root cause, and suggest a "
-        "next step. Say plainly when the logs don't contain enough "
-        "information to tell -- don't guess.\n\n"
-        "Recent log output:\n\n%s" % (container_name, host_label, log_text)
-    )
-
-
-def _build_messages(container_name, host_label, log_lines, history, message):
-    messages = [{"role": "system", "content": _system_prompt(container_name, host_label, log_lines)}]
-    for turn in (history or [])[-MAX_HISTORY_MESSAGES:]:
-        role = turn.get("role") if isinstance(turn, dict) else None
-        content = turn.get("content") if isinstance(turn, dict) else None
-        if role in ("user", "assistant") and content:
-            messages.append({"role": role, "content": str(content)[:4000]})
-    messages.append({"role": "user", "content": message})
-    return messages
-
-
 def _http_error_detail(exc):
     detail = exc.read().decode("utf-8", "replace")
     try:
@@ -96,101 +68,37 @@ def _http_error_detail(exc):
     return detail[:300]
 
 
-def ask(container_name, host_label, log_lines, history, message,
-        api_key_override=None, model_override=None):
-    """One-shot, non-streaming call. Returns {"reply": str, "usage": dict}."""
+def chat_completion(messages, tools=None, api_key_override=None, model_override=None,
+                     max_tokens=MAX_OUTPUT_TOKENS, timeout=45):
+    """One non-streaming call to OpenRouter's chat completions endpoint.
+    Returns the parsed response body (OpenAI-shaped: choices[0].message, usage)."""
     key = api_key_override or api_key()
     if not key:
         raise ChatError(
-            "AI troubleshooting is not configured on this dashboard "
+            "The AI assistant is not configured on this dashboard "
             "(set an OpenRouter API key in Settings, or CUD_OPENROUTER_API_KEY)."
         )
-    message = (message or "").strip()
-    if not message:
-        raise ChatError("A message is required.")
 
-    body = json.dumps({
+    payload = {
         "model": model_override or model(),
-        "max_tokens": MAX_OUTPUT_TOKENS,
-        "messages": _build_messages(container_name, host_label, log_lines, history, message),
+        "max_tokens": max_tokens,
+        "messages": messages,
         # OpenRouter's own extension: ask for cost/token accounting on the response.
         "usage": {"include": True},
-    }).encode("utf-8")
+    }
+    if tools:
+        payload["tools"] = tools
 
-    request = urllib.request.Request(CHAT_URL, data=body, method="POST", headers=_headers(key))
+    request = urllib.request.Request(
+        CHAT_URL, data=json.dumps(payload).encode("utf-8"), method="POST", headers=_headers(key)
+    )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raise ChatError("OpenRouter error: %s" % _http_error_detail(exc))
     except urllib.error.URLError as exc:
         raise ChatError("Could not reach OpenRouter: %s" % exc.reason)
-
-    choices = payload.get("choices") or []
-    if not choices:
-        error = payload.get("error")
-        if error:
-            raise ChatError("OpenRouter error: %s" % str(error.get("message", error))[:300])
-        return {"reply": "(no response)", "usage": payload.get("usage") or {}}
-    text = ((choices[0].get("message") or {}).get("content") or "").strip()
-    return {"reply": text or "(no response)", "usage": payload.get("usage") or {}}
-
-
-def ask_stream(container_name, host_label, log_lines, history, message,
-                api_key_override=None, model_override=None):
-    """Streaming call. Yields {"delta": str} pieces as they arrive, then a
-    final {"usage": dict} (or an {"error": str} at any point, terminal)."""
-    key = api_key_override or api_key()
-    if not key:
-        yield {"error": "AI troubleshooting is not configured on this dashboard "
-                         "(set an OpenRouter API key in Settings, or CUD_OPENROUTER_API_KEY)."}
-        return
-    message = (message or "").strip()
-    if not message:
-        yield {"error": "A message is required."}
-        return
-
-    body = json.dumps({
-        "model": model_override or model(),
-        "max_tokens": MAX_OUTPUT_TOKENS,
-        "messages": _build_messages(container_name, host_label, log_lines, history, message),
-        "stream": True,
-        "usage": {"include": True},
-    }).encode("utf-8")
-
-    request = urllib.request.Request(CHAT_URL, data=body, method="POST", headers=_headers(key))
-    try:
-        response = urllib.request.urlopen(request, timeout=60)
-    except urllib.error.HTTPError as exc:
-        yield {"error": "OpenRouter error: %s" % _http_error_detail(exc)}
-        return
-    except urllib.error.URLError as exc:
-        yield {"error": "Could not reach OpenRouter: %s" % exc.reason}
-        return
-
-    try:
-        for raw_line in response:
-            line = raw_line.decode("utf-8", "replace").strip()
-            if not line or not line.startswith("data:"):
-                continue
-            data = line[len("data:"):].strip()
-            if data == "[DONE]":
-                break
-            try:
-                event = json.loads(data)
-            except ValueError:
-                continue
-            choices = event.get("choices") or []
-            if choices:
-                delta = (choices[0].get("delta") or {}).get("content")
-                if delta:
-                    yield {"delta": delta}
-            if event.get("usage"):
-                yield {"usage": event["usage"]}
-    except (urllib.error.URLError, OSError) as exc:
-        yield {"error": "Lost connection to OpenRouter: %s" % exc}
-    finally:
-        response.close()
 
 
 _models_cache = {"ts": 0.0, "models": None}
