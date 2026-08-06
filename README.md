@@ -296,10 +296,12 @@ rotates away. If the agent has this on, it separately keeps its own copy:
 
 ### Docker events
 
-An **Events** button on each host shows what Docker itself reported
-happening — containers starting, stopping, dying, getting OOM-killed,
-health checks changing, images being pulled — not just the current state a
-poll would show.
+An **Events** tab shows what Docker itself reported happening, across every
+host at once — containers starting, stopping, dying, getting OOM-killed,
+health checks changing, images being pulled, networks and volumes being
+created or removed — not just the current state a poll would show. The host
+filter and search box (both shared with the other tabs) narrow it down; it
+polls for new events every 10 seconds while the tab is open.
 
 - **Bounded polls, not a live stream.** `docker events` normally holds a
   connection open forever; passing it both `since` and `until` instead makes
@@ -315,6 +317,17 @@ poll would show.
 - **The assistant can read these too** (`list_events`), for "did anything
   restart" or "what happened to X" questions the current running state
   alone can't answer.
+
+### Compose stacks
+
+A **Compose** tab (shown once any host reports a stack) groups containers by
+the `com.docker.compose.project` label Docker Compose already sets — no
+agent change needed, that label was already collected per-container. Each
+stack shows how many of its services are running and a rolled-up status
+(the worst status among its services — an update available on any one
+service surfaces at the stack level too), and expands to the same per-service
+detail the Containers tab shows. Read-only for now: starting, stopping or
+redeploying a stack as a unit is a later phase.
 
 ### AI assistant
 
@@ -391,12 +404,14 @@ shared by everyone signed in:
 
 ## OS package updates
 
-The dashboard has two tabs. **Containers** is the image view; **OS updates**
-lists pending packages per host. Each tab has its own status filter, host
-filter and search — the search box follows whichever tab you are on and keeps a
-separate query for each, so switching never applies a search meant for the
-other list. On the containers tab each host still shows a one-line OS summary,
-and *See N packages* jumps straight to that host on the OS tab.
+The dashboard has four tabs: **Containers** (the image view), **Compose**
+(containers grouped into stacks, hidden until one exists), **OS updates**
+(pending packages per host) and **Events** (a cross-host timeline). Each tab
+keeps its own status filter and search query — the search box follows
+whichever tab you are on, so switching never applies a search meant for the
+other list — while the host filter is shared across all four. On the
+containers tab each host still shows a one-line OS summary, and *See N
+packages* jumps straight to that host on the OS tab.
 
 Each host reports its pending OS package updates, ranked so the ones that
 matter are not buried:
@@ -717,7 +732,8 @@ tokens are never returned.
 | GET | `/api/hosts/<name>/containers/<id>/recreate/job/<job_id>` | that recreate's status and log |
 | GET | `/api/hosts/<name>/containers/<id>/logs?tail=200` | recent stdout/stderr lines |
 | GET | `/api/hosts/<name>/containers/<id>/logs/history?since=&until=&limit=` | stored log lines, if the agent has history on |
-| GET | `/api/hosts/<name>/events?since=&until=&limit=` | recent Docker events, if the agent has event history on |
+| GET | `/api/hosts/<name>/events?since=&until=&limit=` | recent Docker events for one host, if the agent has event history on |
+| GET | `/api/events?host=&since=&until=&limit=` | recent Docker events across every (or one) host, merged and sorted newest first -- backs the Events tab |
 | POST | `/api/ai/chat` | the assistant: `{"messages", "confirm"?, "pending"?}` → `{"status": "final"\|"needs_confirmation"\|"error", ...}` — refused unless an OpenRouter key is configured |
 | GET | `/api/ai/models` | OpenRouter's model catalog, for the Settings model picker |
 | GET | `/api/settings` | current dashboard-wide preferences |

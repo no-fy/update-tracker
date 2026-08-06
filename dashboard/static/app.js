@@ -24,9 +24,11 @@
     data: null, tab: "containers",
     status: "", query: "",            // containers tab
     severity: "", osQuery: "",        // OS tab
+    composeQuery: "", composeStatus: "", // compose tab
+    eventsQuery: "", eventsData: null, // events tab
     host: "", open: {}, picked: {}, osJobs: {}, canAddHosts: false,
     containerJobs: {}, logsOpen: {}, logs: {}, renaming: {}, settings: {}, logsRange: {},
-    eventsOpen: {}, events: {},
+    stackOpen: {},
     assistant: { open: false, wire: [], display: [], loading: false, error: null }
   };
   var el = {};
@@ -239,16 +241,32 @@
     ));
   }
 
+  function searchPlaceholder(tab) {
+    if (tab === "os") return "Search package or version…";
+    if (tab === "compose") return "Search stack or service…";
+    if (tab === "events") return "Search events…";
+    return "Search name or image…";
+  }
+
+  function queryFor(tab) {
+    if (tab === "os") return state.osQuery;
+    if (tab === "compose") return state.composeQuery;
+    if (tab === "events") return state.eventsQuery;
+    return state.query;
+  }
+
   function renderTabs(data) {
     var summary = data.summary || {};
     el.tabContainersCount.textContent = summary.containers_total || 0;
     el.tabOsCount.textContent = summary.os_updates_total || 0;
+    el.tabComposeCount.textContent = summary.stacks_total || 0;
     el.tabContainers.setAttribute("aria-selected", state.tab === "containers" ? "true" : "false");
     el.tabOs.setAttribute("aria-selected", state.tab === "os" ? "true" : "false");
+    el.tabCompose.setAttribute("aria-selected", state.tab === "compose" ? "true" : "false");
+    el.tabEvents.setAttribute("aria-selected", state.tab === "events" ? "true" : "false");
     el.tabOs.hidden = !summary.os_hosts_reporting && !osHosts(data).length;
-    el.search.placeholder = state.tab === "os"
-      ? "Search package or version…"
-      : "Search name or image…";
+    el.tabCompose.hidden = !summary.stacks_total;
+    el.search.placeholder = searchPlaceholder(state.tab);
   }
 
   function selectTab(tab) {
@@ -256,7 +274,13 @@
     state.tab = tab;
     // Each tab keeps its own query, so switching never applies a search that
     // was meant for the other list.
-    el.search.value = tab === "os" ? state.osQuery : state.query;
+    el.search.value = queryFor(tab);
+    if (tab === "events") {
+      loadAllEvents();
+      startEventsPolling();
+    } else {
+      stopEventsPolling();
+    }
     render();
   }
 
@@ -376,6 +400,150 @@
       card.appendChild(body);
     }
     return card;
+  }
+
+  // ---- Compose stacks -------------------------------------------------------
+
+  function stackKey(host, stack) { return host.name + "/" + stack.project; }
+
+  function stackMatches(stack) {
+    if (!state.composeQuery) return true;
+    var q = state.composeQuery;
+    if (stack.project.toLowerCase().indexOf(q) !== -1) return true;
+    return stack.services.some(function (s) {
+      return (s.service || "").toLowerCase().indexOf(q) !== -1 ||
+        (s.container_name || "").toLowerCase().indexOf(q) !== -1;
+    });
+  }
+
+  function stacksForHost(host) {
+    return (host.stacks || []).filter(stackMatches);
+  }
+
+  function renderComposeFilters(data) {
+    var stacks = [];
+    (data.hosts || []).forEach(function (host) { stacks = stacks.concat(host.stacks || []); });
+    var attention = stacks.filter(function (s) { return s.needs_attention; }).length;
+    var options = [{ key: "", label: "All", count: stacks.length }];
+    if (attention) options.push({ key: "attention", label: "Needs attention", count: attention });
+    chipRow(el.statusFilters, options, state.composeStatus || "", function (key) {
+      state.composeStatus = state.composeStatus === key ? "" : key;
+      render();
+    });
+    fillHostFilter((data.hosts || []).filter(function (h) { return (h.stacks || []).length; }));
+  }
+
+  function renderComposeHosts(data) {
+    el.hosts.textContent = "";
+    var hosts = (data.hosts || []).filter(function (host) {
+      return !state.host || host.name === state.host;
+    });
+
+    var shown = 0;
+    hosts.forEach(function (host) {
+      var stacks = stacksForHost(host).filter(function (s) {
+        return !state.composeStatus || (state.composeStatus === "attention" && s.needs_attention);
+      });
+      shown += stacks.length;
+      if (!stacks.length) return;
+      el.hosts.appendChild(hostComposeCard(host, stacks));
+    });
+
+    if (!shown && !el.hosts.children.length) {
+      el.empty.hidden = false;
+      el.empty.textContent = state.composeQuery || state.composeStatus
+        ? "No stacks match the current filter."
+        : "No Compose stacks detected -- containers need the com.docker.compose.project label, " +
+          "which Docker Compose sets on its own.";
+    } else {
+      el.empty.hidden = true;
+    }
+  }
+
+  function hostComposeCard(host, stacks) {
+    var card = text("section", "host");
+    var head = text("div", "host-head");
+    var title = text("div", "host-title");
+    title.appendChild(dot(
+      !host.online ? "error" : (stacks.some(function (s) { return s.needs_attention; })
+        ? "update-available" : "up-to-date")
+    ));
+    title.appendChild(text("span", "name", host.label || host.name));
+    head.appendChild(title);
+    var meta = text("div", "host-meta");
+    meta.appendChild(text("span", null, stacks.length + " " + plural(stacks.length, "stack", "stacks")));
+    head.appendChild(meta);
+    card.appendChild(head);
+
+    var scroll = text("div", "table-scroll");
+    var table = document.createElement("table");
+    var thead = document.createElement("thead");
+    var headRow = document.createElement("tr");
+    [["Stack", ""], ["Services", ""], ["Status", ""]].forEach(function (column) {
+      headRow.appendChild(text("th", column[1], column[0]));
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+    var tbody = document.createElement("tbody");
+    stacks.forEach(function (stack) {
+      stackRows(stack, host).forEach(function (node) { tbody.appendChild(node); });
+    });
+    table.appendChild(tbody);
+    scroll.appendChild(table);
+    card.appendChild(scroll);
+    return card;
+  }
+
+  function stackRows(stack, host) {
+    var key = stackKey(host, stack);
+    var row = text("tr", "row");
+    row.tabIndex = 0;
+
+    var name = text("td", "c-name");
+    name.appendChild(text("span", null, stack.project));
+    if (stack.workdir) name.appendChild(text("span", "sub", stack.workdir));
+    row.appendChild(name);
+
+    row.appendChild(text("td", null,
+      stack.services_running + "/" + stack.services_total + " running"));
+
+    var status = text("td", "c-status");
+    status.appendChild(badge(stack.update_status));
+    row.appendChild(status);
+
+    var detail = text("tr", "detail");
+    var cell = document.createElement("td");
+    cell.colSpan = 3;
+    var body = text("div", "detail-body");
+    var serviceTable = text("table", "stack-services");
+    var serviceHead = document.createElement("tr");
+    ["Service", "Container", "State", "Image", "Update"].forEach(function (label) {
+      serviceHead.appendChild(text("th", null, label));
+    });
+    serviceTable.appendChild(serviceHead);
+    stack.services.forEach(function (service) {
+      var serviceRow = document.createElement("tr");
+      serviceRow.appendChild(text("td", null, service.service));
+      serviceRow.appendChild(text("td", null, service.container_name));
+      serviceRow.appendChild(text("td", null, service.status || service.state || "—"));
+      serviceRow.appendChild(text("td", "c-image", service.image || "—"));
+      var updateCell = document.createElement("td");
+      updateCell.appendChild(badge(service.update_status));
+      serviceRow.appendChild(updateCell);
+      serviceTable.appendChild(serviceRow);
+    });
+    body.appendChild(serviceTable);
+    cell.appendChild(body);
+    detail.appendChild(cell);
+    detail.hidden = !state.stackOpen[key];
+
+    function toggle() { state.stackOpen[key] = !state.stackOpen[key]; detail.hidden = !state.stackOpen[key]; }
+    row.addEventListener("click", toggle);
+    row.addEventListener("keydown", function (event) {
+      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); toggle(); }
+    });
+
+    return [row, detail];
   }
 
   function pickedFor(host) {
@@ -1293,10 +1461,13 @@
 
   var EVENT_STATUS = {
     start: "up-to-date", create: "up-to-date", unpause: "up-to-date",
+    connect: "up-to-date", mount: "up-to-date",
     die: "error", kill: "error", stop: "error", oom: "error", destroy: "error",
+    remove: "error", disconnect: "error", unmount: "error",
     pause: "unknown", rename: "unknown",
     pull: "update-available", health_status: "update-available"
   };
+  var EVENT_TYPE_LABELS = { container: "Container", image: "Image", network: "Network", volume: "Volume" };
 
   function eventStatus(event) {
     return EVENT_STATUS[event.action] || "unknown";
@@ -1312,86 +1483,95 @@
     return bits.join(" · ");
   }
 
-  var eventTimers = {};
-  var EVENT_REFRESH_SECONDS = 10;
-
-  function eventsToggleButton(host) {
-    var btn = text("button", "button small");
-    btn.type = "button";
-    btn.textContent = state.eventsOpen[host.name] ? "Hide events" : "Events";
-    btn.addEventListener("click", function () {
-      var opening = !state.eventsOpen[host.name];
-      state.eventsOpen[host.name] = opening;
-      if (opening) {
-        loadEvents(host);
-        eventTimers[host.name] = setInterval(function () {
-          if (!state.eventsOpen[host.name]) {
-            clearInterval(eventTimers[host.name]);
-            delete eventTimers[host.name];
-            return;
-          }
-          loadEvents(host, true);
-        }, EVENT_REFRESH_SECONDS * 1000);
-      } else if (eventTimers[host.name]) {
-        clearInterval(eventTimers[host.name]);
-        delete eventTimers[host.name];
-      }
-      render();
-    });
-    return btn;
+  function eventMatches(event) {
+    if (!state.eventsQuery) return true;
+    var haystack = [event.name, event.actor_id, event.action, event.type, event.image]
+      .filter(Boolean).join(" ").toLowerCase();
+    return haystack.indexOf(state.eventsQuery) !== -1;
   }
 
-  function loadEvents(host, silent) {
+  var EVENTS_POLL_SECONDS = 10;
+  var eventsPollTimer = null;
+
+  function startEventsPolling() {
+    stopEventsPolling();
+    eventsPollTimer = setInterval(function () { loadAllEvents(true); }, EVENTS_POLL_SECONDS * 1000);
+  }
+
+  function stopEventsPolling() {
+    if (eventsPollTimer) { clearInterval(eventsPollTimer); eventsPollTimer = null; }
+  }
+
+  function loadAllEvents(silent) {
     if (!silent) {
-      state.events[host.name] = { loading: true };
+      state.eventsData = { loading: true };
       render();
     }
-    fetch("/api/hosts/" + encodeURIComponent(host.name) + "/events?limit=100")
+    var params = ["limit=300"];
+    if (state.host) params.push("host=" + encodeURIComponent(state.host));
+    fetch("/api/events?" + params.join("&"))
       .then(function (r) { return r.json(); })
       .then(function (result) {
         if (result.error) throw new Error(result.error);
-        if (result.enabled === false) {
-          state.events[host.name] = { error: "Event history is not enabled on this host." };
-        } else {
-          state.events[host.name] = { items: result.events || [] };
-        }
+        state.eventsData = { items: result.events || [] };
         render();
       })
       .catch(function (err) {
-        state.events[host.name] = { error: err.message || "Could not load events." };
+        state.eventsData = { error: err.message || "Could not load events." };
         render();
       });
   }
 
-  function eventsPanel(host) {
-    var wrap = text("div", "events-panel");
-    var entry = state.events[host.name];
+  function renderEventsFilters(data) {
+    el.statusFilters.textContent = "";
+    fillHostFilter(data.hosts || []);
+  }
 
-    if (entry && entry.loading) {
-      wrap.appendChild(text("span", "os-running", "Loading events…"));
-      return wrap;
+  function renderEventsTab(data) {
+    el.hosts.textContent = "";
+    var entry = state.eventsData;
+
+    if (!entry || entry.loading) {
+      el.hosts.appendChild(text("p", "os-running", "Loading events…"));
+      el.empty.hidden = true;
+      return;
     }
-    if (entry && entry.error) {
-      wrap.appendChild(text("p", "os-readonly", entry.error));
-      return wrap;
+    if (entry.error) {
+      el.empty.hidden = false;
+      el.empty.textContent = entry.error;
+      return;
     }
 
-    var items = (entry && entry.items) || [];
+    var items = (entry.items || []).filter(eventMatches);
     if (!items.length) {
-      wrap.appendChild(text("p", "ai-chat-hint", "No events recorded yet."));
-      return wrap;
+      el.empty.hidden = false;
+      el.empty.textContent = (entry.items || []).length
+        ? "Nothing matches the current filter."
+        : "No events recorded yet -- either nothing has happened, or event history isn't enabled on these hosts.";
+      return;
     }
+    el.empty.hidden = true;
 
-    var list = text("ul", "events-list");
+    var section = text("section", "host");
+    var list = text("ul", "timeline");
     items.forEach(function (event) {
-      var li = text("li", "events-item");
+      var li = text("li", "timeline-item");
       li.appendChild(dot(eventStatus(event)));
-      li.appendChild(text("span", "events-when", relativeTime(event.ts) + " ago"));
-      li.appendChild(text("span", "events-label", eventLabel(event)));
+      var body = text("div", "timeline-body");
+      var head = text("div", "timeline-head");
+      head.appendChild(text("span", "timeline-label", eventLabel(event)));
+      head.appendChild(text("span", "tag", EVENT_TYPE_LABELS[event.type] || event.type));
+      body.appendChild(head);
+      var meta = text("div", "timeline-meta");
+      meta.appendChild(text("span", null, event.host_label || event.host || ""));
+      meta.appendChild(text("span", "sep", "·"));
+      meta.appendChild(text("span", null, relativeTime(event.ts) + " ago"));
+      body.appendChild(meta);
+      li.appendChild(body);
       list.appendChild(li);
     });
-    wrap.appendChild(list);
-    return wrap;
+    section.appendChild(list);
+    el.hosts.appendChild(section);
   }
 
   function renderFilters(data) {
@@ -1556,11 +1736,8 @@
     });
     var headRight = text("div", "host-head-right");
     headRight.appendChild(meta);
-    if (host.online) headRight.appendChild(eventsToggleButton(host));
     head.appendChild(headRight);
     card.appendChild(head);
-
-    if (state.eventsOpen[host.name]) card.appendChild(eventsPanel(host));
 
     if (!host.online) {
       var error = text("div", "host-error");
@@ -1776,6 +1953,12 @@
     if (state.tab === "os") {
       renderOsFilters(data);
       renderOsHosts(data);
+    } else if (state.tab === "compose") {
+      renderComposeFilters(data);
+      renderComposeHosts(data);
+    } else if (state.tab === "events") {
+      renderEventsFilters(data);
+      renderEventsTab(data);
     } else {
       renderFilters(data);
       renderHosts(data);
@@ -2136,8 +2319,11 @@
       addHost: $("add-host"),
       tabContainers: $("tab-containers"),
       tabOs: $("tab-os"),
+      tabCompose: $("tab-compose"),
+      tabEvents: $("tab-events"),
       tabContainersCount: $("tab-containers-count"),
       tabOsCount: $("tab-os-count"),
+      tabComposeCount: $("tab-compose-count"),
       setupDialog: $("setup-dialog"),
       setupForm: $("setup-form"),
       setupUsername: $("setup-username"),
@@ -2213,6 +2399,8 @@
     el.addHost.addEventListener("click", openHostDialog);
     el.tabContainers.addEventListener("click", function () { selectTab("containers"); });
     el.tabOs.addEventListener("click", function () { selectTab("os"); });
+    el.tabCompose.addEventListener("click", function () { selectTab("compose"); });
+    el.tabEvents.addEventListener("click", function () { selectTab("events"); });
     el.setupForm.addEventListener("submit", submitSetup);
     el.hostForm.addEventListener("submit", submitHost);
     el.hostCancel.addEventListener("click", function () { el.hostDialog.close(); });
@@ -2231,6 +2419,7 @@
     });
     el.hostFilter.addEventListener("change", function () {
       state.host = el.hostFilter.value;
+      if (state.tab === "events") { loadAllEvents(); return; }
       render();
     });
 
@@ -2239,7 +2428,10 @@
       if (searchTimer) clearTimeout(searchTimer);
       searchTimer = setTimeout(function () {
         var value = el.search.value.trim().toLowerCase();
-        if (state.tab === "os") state.osQuery = value; else state.query = value;
+        if (state.tab === "os") state.osQuery = value;
+        else if (state.tab === "compose") state.composeQuery = value;
+        else if (state.tab === "events") state.eventsQuery = value;
+        else state.query = value;
         render();
       }, 120);
     });

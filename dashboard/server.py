@@ -384,6 +384,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(200, {"enrollments": self.server.enrollments.list()})
             return
 
+        if path == "/api/events":
+            self._handle_all_events()
+            return
+
         if path.startswith("/api/hosts/") and path.endswith("/events"):
             self._handle_host_events(
                 urllib.parse.unquote(path[len("/api/hosts/"):-len("/events")]))
@@ -667,6 +671,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
             return
         self._json(200, result)
+
+    def _handle_all_events(self):
+        config, _ = self.server.load_config()
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        hosts = config.get("hosts", [])
+        host_filter = (query.get("host") or [None])[0]
+        if host_filter:
+            hosts = [h for h in hosts if h.get("name") == host_filter]
+        hosts = [h for h in hosts if h.get("enabled", True)]
+
+        try:
+            events = collector.all_events(
+                hosts,
+                since=(query.get("since") or [None])[0],
+                until=(query.get("until") or [None])[0],
+                limit=(query.get("limit") or [None])[0],
+            )
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self._json(200, {"events": events})
 
     def _handle_host_events(self, name):
         config, _ = self.server.load_config()
