@@ -31,8 +31,8 @@ DEFAULT_MAX_ROWS = 50000
 PRUNE_INTERVAL_SECONDS = 600
 POLL_INTERVAL_SECONDS = 5
 # Docker's own event types worth a dashboard's attention -- skips the
-# noisier network/volume/builder chatter by default.
-EVENT_FILTERS = {"type": ["container", "image"]}
+# noisier builder/plugin/config chatter by default.
+EVENT_FILTERS = {"type": ["container", "image", "network", "volume"]}
 
 
 def events_enabled():

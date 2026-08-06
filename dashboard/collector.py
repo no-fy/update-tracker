@@ -409,6 +409,41 @@ def host_events(host, since=None, until=None, limit=200, timeout=20):
                           verify_tls=host.get("verify_tls", True))
 
 
+def all_events(hosts, since=None, until=None, limit=200, timeout=20, max_workers=8):
+    """Docker events across every enabled host, merged and sorted newest
+    first -- the same fan-out shape as poll_hosts, just for events instead
+    of the full snapshot. A host that errors is dropped silently rather
+    than failing the whole timeline over one unreachable agent."""
+    if not hosts:
+        return []
+    try:
+        limit = int(limit) if limit not in (None, "") else 200
+    except (TypeError, ValueError):
+        limit = 200
+
+    workers = max(1, min(max_workers, len(hosts)))
+    merged = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(host_events, host, since, until, limit, timeout): host
+            for host in hosts
+        }
+        for future in concurrent.futures.as_completed(futures):
+            host = futures[future]
+            try:
+                result = future.result()
+            except Exception:
+                continue
+            for event in (result.get("events") or []):
+                event = dict(event)
+                event["host"] = host.get("name")
+                event["host_label"] = host.get("label") or host.get("name")
+                merged.append(event)
+
+    merged.sort(key=lambda e: e.get("ts") or 0, reverse=True)
+    return merged[:limit]
+
+
 def _http_post_json(url, payload, token=None, timeout=30, verify_tls=True):
     data = json.dumps(payload or {}).encode("utf-8")
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
@@ -560,6 +595,60 @@ def enrich_with_registry(host_results, registry_client, max_workers=6):
     return host_results
 
 
+def compute_stacks(host_results):
+    """Group each host's containers by the compose project label Docker
+    Compose already sets -- no agent change needed, the data is already in
+    every container's snapshot. Containers with no compose label are not
+    part of any stack and stay container-tab-only."""
+    for host in host_results:
+        projects = {}
+        for container in host.get("containers") or []:
+            project = container.get("compose_project")
+            if not project:
+                continue
+            stack = projects.setdefault(project, {
+                "project": project,
+                "host": host.get("name"),
+                "workdir": None,
+                "config_files": None,
+                "services": [],
+            })
+            if not stack["workdir"] and container.get("compose_workdir"):
+                stack["workdir"] = container["compose_workdir"]
+            if not stack["config_files"] and container.get("compose_config"):
+                stack["config_files"] = container["compose_config"]
+            stack["services"].append({
+                "service": container.get("compose_service") or container.get("name"),
+                "container_id": container.get("id"),
+                "container_name": container.get("name"),
+                "state": container.get("state"),
+                "status": container.get("status"),
+                "update_status": container.get("update_status"),
+                "detail": container.get("detail"),
+                "image": container.get("image_display") or container.get("image_ref"),
+            })
+
+        stacks = []
+        for stack in projects.values():
+            stack["services"].sort(key=lambda s: s.get("service") or "")
+            statuses = [s.get("update_status") for s in stack["services"] if s.get("update_status")]
+            worst = "unknown"
+            if statuses:
+                worst = min(
+                    statuses,
+                    key=lambda s: STATUS_ORDER.index(s) if s in STATUS_ORDER else len(STATUS_ORDER),
+                )
+            stack["update_status"] = worst
+            stack["needs_attention"] = worst in NEEDS_ATTENTION
+            stack["services_total"] = len(stack["services"])
+            stack["services_running"] = sum(
+                1 for s in stack["services"] if s.get("state") == "running")
+            stacks.append(stack)
+        stacks.sort(key=lambda s: s["project"])
+        host["stacks"] = stacks
+    return host_results
+
+
 def summarise(host_results):
     counts = {status: 0 for status in STATUS_ORDER}
     total = 0
@@ -589,6 +678,10 @@ def summarise(host_results):
         if os_data.get("reboot_required"):
             reboots += 1
 
+    stacks_total = sum(len(h.get("stacks") or []) for h in host_results)
+    stacks_needing_attention = sum(
+        1 for h in host_results for s in (h.get("stacks") or []) if s.get("needs_attention"))
+
     return {
         "containers_total": total,
         "containers_running": running,
@@ -601,6 +694,8 @@ def summarise(host_results):
         "os_counts": os_counts,
         "os_hosts_reporting": os_hosts,
         "os_reboots_required": reboots,
+        "stacks_total": stacks_total,
+        "stacks_needing_attention": stacks_needing_attention,
     }
 
 
@@ -650,6 +745,7 @@ class Poller:
                 client,
                 max_workers=settings.get("max_parallel_registry_lookups", 6),
             )
+            compute_stacks(results)
             snapshot = {
                 "generated_at": time.time(),
                 "duration_seconds": round(time.time() - started, 2),
