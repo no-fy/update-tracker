@@ -384,6 +384,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(200, {"enrollments": self.server.enrollments.list()})
             return
 
+        if path.startswith("/api/hosts/") and path.endswith("/events"):
+            self._handle_host_events(
+                urllib.parse.unquote(path[len("/api/hosts/"):-len("/events")]))
+            return
+
         if path.startswith("/api/hosts/") and "/containers/" in path and path.endswith("/logs/history"):
             self._handle_container_logs_history(path)
             return
@@ -654,6 +659,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             result = collector.container_logs_history(
                 host, container_id,
+                since=(query.get("since") or [None])[0],
+                until=(query.get("until") or [None])[0],
+                limit=(query.get("limit") or [None])[0],
+            )
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self._json(200, result)
+
+    def _handle_host_events(self, name):
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        try:
+            result = collector.host_events(
+                host,
                 since=(query.get("since") or [None])[0],
                 until=(query.get("until") or [None])[0],
                 limit=(query.get("limit") or [None])[0],
@@ -979,9 +1004,11 @@ def build_server(config_path=None, bind=None, port=None, verbose=False):
     local_host = next(
         (h for h in config.get("hosts", []) if h.get("mode") == "local"), None)
     if local_host is not None:
+        import eventstore
         import logstore
         import osupdate
         logstore.init(local_host.get("docker_socket"))
+        eventstore.init(local_host.get("docker_socket"))
         osupdate.start_auto_refresh(
             on_finish=lambda job: collector.agent_module.os_updates(force=True))
 

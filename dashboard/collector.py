@@ -74,6 +74,7 @@ def poll_host(host, timeout=20, include_stopped=True):
         os=None,
         container_actions=None,
         log_history=None,
+        event_history=None,
     )
 
     if not host.get("enabled", True):
@@ -106,6 +107,7 @@ def poll_host(host, timeout=20, include_stopped=True):
         result["containers"] = containers
         result["container_actions"] = snapshot.get("container_actions")
         result["log_history"] = snapshot.get("log_history")
+        result["event_history"] = snapshot.get("event_history")
         result["os"] = _poll_os(host, timeout)
     except agent_module.DockerError as exc:
         result["error"] = str(exc)
@@ -376,6 +378,32 @@ def container_logs_history(host, container_id, since=None, until=None, limit=500
     url = "%s://%s:%s/v1/containers/%s/logs/history%s" % (
         scheme, host.get("address"), host.get("port", 9713),
         urllib.parse.quote(container_id, safe=""),
+        ("?" + "&".join(query)) if query else "")
+    return _http_get_json(url, token=host.get("token"), timeout=timeout,
+                          verify_tls=host.get("verify_tls", True))
+
+
+def host_events(host, since=None, until=None, limit=200, timeout=20):
+    """Docker events for one host -- start/stop/die/oom/health and image
+    pulls -- if the agent has event history on."""
+    if host.get("mode") == "local":
+        import eventstore
+
+        if eventstore.STORE is None:
+            return {"events": [], "enabled": False}
+        events = eventstore.STORE.query(since=since, until=until, limit=limit)
+        return {"events": events, "enabled": True}
+
+    scheme = "https" if host.get("tls") else "http"
+    query = []
+    if since is not None:
+        query.append("since=%s" % since)
+    if until is not None:
+        query.append("until=%s" % until)
+    if limit is not None:
+        query.append("limit=%s" % limit)
+    url = "%s://%s:%s/v1/events%s" % (
+        scheme, host.get("address"), host.get("port", 9713),
         ("?" + "&".join(query)) if query else "")
     return _http_get_json(url, token=host.get("token"), timeout=timeout,
                           verify_tls=host.get("verify_tls", True))

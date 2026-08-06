@@ -29,9 +29,9 @@ services:
       # package manager's own database. Drop this and CUD_HOST_ROOT below to
       # track containers only.
       - /:/host:ro
-      # Historical container logs, so they survive a restart of this
-      # container. Drop this and set CUD_LOG_HISTORY=0 below to keep only
-      # the live tail Docker itself still has.
+      # Historical container logs and Docker events, so they survive a
+      # restart of this container. Drop this and set CUD_LOG_HISTORY=0 and
+      # CUD_EVENTS=0 below to keep only what Docker itself still has.
       - cud-logs:/var/lib/container-update-agent
     environment:
       CUD_HOST_ROOT: /host
@@ -43,6 +43,9 @@ services:
       # Historical logs are on by default too, once there is somewhere to
       # put them (the cud-logs volume above). Days of history to keep:
       # CUD_LOG_RETENTION_DAYS: "7"
+      # Docker events (start/stop/die/oom/health/pulls) are on by default
+      # too, stored the same way. Days of history to keep:
+      # CUD_EVENTS_RETENTION_DAYS: "14"
       # OS package lists refresh themselves every 6 hours by default (needs
       # the same pid/privileged access as installing updates does, above).
       # 0 turns this off; there is also a manual "Refresh package lists"

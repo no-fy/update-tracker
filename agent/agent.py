@@ -196,6 +196,15 @@ class DockerClient:
             "&timestamps=1" if timestamps else "")
         return self.raw_get(path)
 
+    def events(self, since, until, filters=None):
+        """Bounded, not a live stream: passing `until` makes Docker send
+        whatever matches and close the connection, rather than holding it
+        open -- the same reason logstore.py polls instead of following."""
+        path = "/%s/events?since=%d&until=%d" % (API_VERSION, int(since), int(until))
+        if filters:
+            path += "&filters=" + urllib.parse.quote(json.dumps(filters), safe="")
+        return self.raw_get(path)
+
     def delete(self, path):
         conn = self._connect()
         try:
@@ -375,6 +384,11 @@ def _logstore():
     return logstore
 
 
+def _eventstore():
+    import eventstore
+    return eventstore
+
+
 def collect_snapshot(client, include_stopped=True):
     """Return ``{"info": {...}, "containers": [...]}`` for one Docker host."""
     try:
@@ -456,6 +470,7 @@ def collect_snapshot(client, include_stopped=True):
         "containers": containers,
         "container_actions": _containerctl().capability(),
         "log_history": _logstore().capability(),
+        "event_history": _eventstore().capability(),
     }
 
 
@@ -517,6 +532,18 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     self._send(404, {"error": "no such job"})
                 else:
                     self._send(200, job.snapshot())
+            elif path == "/v1/events":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                store = _eventstore().STORE
+                if store is None:
+                    self._send(200, {"events": [], "enabled": False})
+                else:
+                    events = store.query(
+                        since=(query.get("since") or [None])[0],
+                        until=(query.get("until") or [None])[0],
+                        limit=(query.get("limit") or [None])[0],
+                    )
+                    self._send(200, {"events": events, "enabled": True})
             elif path.startswith("/v1/containers/") and path.endswith("/logs/history"):
                 container_id = path[len("/v1/containers/"):-len("/logs/history")]
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -711,6 +738,7 @@ def serve(token, bind="0.0.0.0", port=DEFAULT_PORT, docker_endpoint=None,
     )
     sys.stderr.flush()
     _logstore().init(docker_endpoint)
+    _eventstore().init(docker_endpoint)
     _osupdate().start_auto_refresh(on_finish=lambda job: os_updates(force=True))
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()

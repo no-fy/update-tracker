@@ -26,6 +26,7 @@
     severity: "", osQuery: "",        // OS tab
     host: "", open: {}, picked: {}, osJobs: {}, canAddHosts: false,
     containerJobs: {}, logsOpen: {}, logs: {}, renaming: {}, settings: {}, logsRange: {},
+    eventsOpen: {}, events: {},
     assistant: { open: false, wire: [], display: [], loading: false, error: null }
   };
   var el = {};
@@ -1288,6 +1289,111 @@
     renderAssistantPanel();
   }
 
+  // ---- Docker events -------------------------------------------------------
+
+  var EVENT_STATUS = {
+    start: "up-to-date", create: "up-to-date", unpause: "up-to-date",
+    die: "error", kill: "error", stop: "error", oom: "error", destroy: "error",
+    pause: "unknown", rename: "unknown",
+    pull: "update-available", health_status: "update-available"
+  };
+
+  function eventStatus(event) {
+    return EVENT_STATUS[event.action] || "unknown";
+  }
+
+  function eventLabel(event) {
+    var who = event.name || event.actor_id || "";
+    var bits = [event.action || event.type];
+    if (who) bits.push(who);
+    if (event.exit_code !== null && event.exit_code !== undefined && event.exit_code !== "") {
+      bits.push("exit " + event.exit_code);
+    }
+    return bits.join(" · ");
+  }
+
+  var eventTimers = {};
+  var EVENT_REFRESH_SECONDS = 10;
+
+  function eventsToggleButton(host) {
+    var btn = text("button", "button small");
+    btn.type = "button";
+    btn.textContent = state.eventsOpen[host.name] ? "Hide events" : "Events";
+    btn.addEventListener("click", function () {
+      var opening = !state.eventsOpen[host.name];
+      state.eventsOpen[host.name] = opening;
+      if (opening) {
+        loadEvents(host);
+        eventTimers[host.name] = setInterval(function () {
+          if (!state.eventsOpen[host.name]) {
+            clearInterval(eventTimers[host.name]);
+            delete eventTimers[host.name];
+            return;
+          }
+          loadEvents(host, true);
+        }, EVENT_REFRESH_SECONDS * 1000);
+      } else if (eventTimers[host.name]) {
+        clearInterval(eventTimers[host.name]);
+        delete eventTimers[host.name];
+      }
+      render();
+    });
+    return btn;
+  }
+
+  function loadEvents(host, silent) {
+    if (!silent) {
+      state.events[host.name] = { loading: true };
+      render();
+    }
+    fetch("/api/hosts/" + encodeURIComponent(host.name) + "/events?limit=100")
+      .then(function (r) { return r.json(); })
+      .then(function (result) {
+        if (result.error) throw new Error(result.error);
+        if (result.enabled === false) {
+          state.events[host.name] = { error: "Event history is not enabled on this host." };
+        } else {
+          state.events[host.name] = { items: result.events || [] };
+        }
+        render();
+      })
+      .catch(function (err) {
+        state.events[host.name] = { error: err.message || "Could not load events." };
+        render();
+      });
+  }
+
+  function eventsPanel(host) {
+    var wrap = text("div", "events-panel");
+    var entry = state.events[host.name];
+
+    if (entry && entry.loading) {
+      wrap.appendChild(text("span", "os-running", "Loading events…"));
+      return wrap;
+    }
+    if (entry && entry.error) {
+      wrap.appendChild(text("p", "os-readonly", entry.error));
+      return wrap;
+    }
+
+    var items = (entry && entry.items) || [];
+    if (!items.length) {
+      wrap.appendChild(text("p", "ai-chat-hint", "No events recorded yet."));
+      return wrap;
+    }
+
+    var list = text("ul", "events-list");
+    items.forEach(function (event) {
+      var li = text("li", "events-item");
+      li.appendChild(dot(eventStatus(event)));
+      li.appendChild(text("span", "events-when", relativeTime(event.ts) + " ago"));
+      li.appendChild(text("span", "events-label", eventLabel(event)));
+      list.appendChild(li);
+    });
+    wrap.appendChild(list);
+    return wrap;
+  }
+
   function renderFilters(data) {
     var counts = (data.summary || {}).counts || {};
     var total = (data.summary || {}).containers_total || 0;
@@ -1448,8 +1554,13 @@
       if (index) meta.appendChild(text("span", "sep", "·"));
       meta.appendChild(text("span", null, bit));
     });
-    head.appendChild(meta);
+    var headRight = text("div", "host-head-right");
+    headRight.appendChild(meta);
+    if (host.online) headRight.appendChild(eventsToggleButton(host));
+    head.appendChild(headRight);
     card.appendChild(head);
+
+    if (state.eventsOpen[host.name]) card.appendChild(eventsPanel(host));
 
     if (!host.online) {
       var error = text("div", "host-error");

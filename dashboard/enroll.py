@@ -89,8 +89,9 @@ def agent_command(enrollment, dashboard_url, socket_path="/var/run/docker.sock")
     `-e CUD_ALLOW_CONTAINER_ACTIONS=0` for an agent that only ever reports.
 
     `-v {name}-logs:/var/lib/container-update-agent` is where it keeps
-    history for those logs, in its own SQLite file. Drop it (and set
-    `CUD_LOG_HISTORY=0`) for an agent that only reports the live tail.
+    history for those logs and for Docker events, each in its own SQLite
+    file. Drop it (and set `CUD_LOG_HISTORY=0`/`CUD_EVENTS=0`) for an agent
+    that only reports the live tail and current state.
 
     For an agent that only ever reports OS updates, drop `--pid=host
     --privileged` and add `-e CUD_ALLOW_UPDATES=0`. Everything except
