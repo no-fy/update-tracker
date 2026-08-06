@@ -294,6 +294,28 @@ rotates away. If the agent has this on, it separately keeps its own copy:
   `CUD_LOG_MAX_ROWS_PER_CONTAINER` (default 200,000) are both enforced, so a
   chatty container can't fill the disk between prunes.
 
+### Docker events
+
+An **Events** button on each host shows what Docker itself reported
+happening — containers starting, stopping, dying, getting OOM-killed,
+health checks changing, images being pulled — not just the current state a
+poll would show.
+
+- **Bounded polls, not a live stream.** `docker events` normally holds a
+  connection open forever; passing it both `since` and `until` instead makes
+  Docker send whatever matches and close the connection, so this can poll it
+  the same safe way log history does, every few seconds, with nothing
+  long-lived to leak or wedge.
+- **On by default, once there's somewhere to put it.** Stored in SQLite at
+  `CUD_EVENTS_DB`, default `/var/lib/container-update-agent/events.db` —
+  the same volume mount log history already needs covers this too.
+  `CUD_EVENTS=0` turns it off outright.
+- **Pruned automatically.** `CUD_EVENTS_RETENTION_DAYS` (default 14) and
+  `CUD_EVENTS_MAX_ROWS` (default 50,000) are both enforced.
+- **The assistant can read these too** (`list_events`), for "did anything
+  restart" or "what happened to X" questions the current running state
+  alone can't answer.
+
 ### AI assistant
 
 An **Ask AI** button floats in the corner on every page — one assistant for
@@ -695,6 +717,7 @@ tokens are never returned.
 | GET | `/api/hosts/<name>/containers/<id>/recreate/job/<job_id>` | that recreate's status and log |
 | GET | `/api/hosts/<name>/containers/<id>/logs?tail=200` | recent stdout/stderr lines |
 | GET | `/api/hosts/<name>/containers/<id>/logs/history?since=&until=&limit=` | stored log lines, if the agent has history on |
+| GET | `/api/hosts/<name>/events?since=&until=&limit=` | recent Docker events, if the agent has event history on |
 | POST | `/api/ai/chat` | the assistant: `{"messages", "confirm"?, "pending"?}` → `{"status": "final"\|"needs_confirmation"\|"error", ...}` — refused unless an OpenRouter key is configured |
 | GET | `/api/ai/models` | OpenRouter's model catalog, for the Settings model picker |
 | GET | `/api/settings` | current dashboard-wide preferences |
@@ -719,7 +742,7 @@ The agent's own API is `/healthz` (open) plus `/v1/containers`, `/v1/info`,
 `/v1/os`, `POST /v1/os/update`, `POST /v1/os/refresh`, `/v1/os/job/<id>`,
 `POST /v1/containers/<id>/{start,stop,restart,pause,unpause,rename,recreate}`,
 `DELETE /v1/containers/<id>`, `/v1/containers/<id>/logs`,
-`/v1/containers/<id>/logs/history` and
+`/v1/containers/<id>/logs/history`, `/v1/events` and
 `/v1/containers/<id>/recreate/job/<job_id>` (bearer token).
 
 ## Security notes

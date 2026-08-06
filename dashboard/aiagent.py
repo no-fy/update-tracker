@@ -37,7 +37,7 @@ if __package__ in (None, ""):
 else:
     from . import aihelper, collector, config as config_mod
 
-MAX_ROUNDS = 6
+MAX_ROUNDS = 16
 HEX_ID = re.compile(r"^[a-fA-F0-9]{12,64}$")
 
 SYSTEM_PROMPT = (
@@ -47,15 +47,23 @@ SYSTEM_PROMPT = (
     "updates before answering -- call list_hosts and/or list_containers "
     "first rather than guessing a host or container. Container and package "
     "names are ambiguous across hosts; always pass the exact host name a "
-    "tool gave you.\n\n"
+    "tool gave you. You may call several read-only tools in the same turn "
+    "(e.g. get_logs for every container on a host) rather than one at a "
+    "time -- that is faster and does not need confirmation.\n\n"
     "Actions that change something -- starting, stopping, restarting, "
     "pausing, unpausing, renaming, removing or recreating a container, or "
-    "installing OS updates -- require the user's explicit confirmation and "
-    "only run after they approve it in a dialog the app shows them. Call "
-    "the tool as soon as you have enough information to propose the "
-    "action; don't ask 'are you sure' yourself first, the confirm step "
-    "already does that. If the user declines, don't retry the same action "
-    "without them asking again."
+    "installing/refreshing OS updates -- require the user's explicit "
+    "confirmation and only run after they approve it in a dialog the app "
+    "shows them. Call the tool as soon as you have enough information to "
+    "propose the action; don't ask 'are you sure' yourself first, the "
+    "confirm step already does that. Only one such action can be proposed "
+    "per turn. If the user declines, don't retry the same action without "
+    "them asking again.\n\n"
+    "install_os_updates and any refresh return immediately with the job "
+    "still \"running\" -- that is not the same as finished. Check its "
+    "status with check_os_job before telling the user it succeeded or "
+    "failed; if it's still running, say so and offer to check again "
+    "rather than guessing the outcome."
 )
 
 SIMPLE_ACTIONS = {
@@ -71,7 +79,6 @@ CONTAINER_ARG_TOOLS = set(SIMPLE_ACTIONS) | {
 WRITE_TOOLS = set(SIMPLE_ACTIONS) | {
     "rename_container", "remove_container", "recreate_container", "install_os_updates",
 }
-READ_TOOLS = {"list_hosts", "list_containers", "get_logs", "get_logs_history", "list_os_updates"}
 
 
 def _tool(name, description, properties, required=()):
@@ -122,6 +129,15 @@ TOOLS = [
     _tool("list_os_updates", "List pending OS package updates, for one host or all of them.",
           {"host": _HOST_PROP,
            "severity": {"type": "string", "enum": ["security", "important", "routine"]}}),
+    _tool("list_events", "List recent Docker events on a host -- container "
+          "start/stop/die/kill/oom/health changes and image pulls -- if the host has event "
+          "history enabled. Useful for \"did anything restart\" or \"what happened to X\" "
+          "questions the current running state alone can't answer.",
+          {"host": _HOST_PROP,
+           "since_seconds": {"type": "integer", "description": "Only events from this many "
+                              "seconds ago onward. Omit for as far back as retention allows."},
+           "limit": {"type": "integer", "description": "Max events. Defaults to 200."}},
+          required=["host"]),
     _tool("start_container", "Start a stopped container. Requires user confirmation.",
           {"host": _HOST_PROP, "container": _CONTAINER_PROP}, required=["host", "container"]),
     _tool("stop_container", "Stop a running container. Requires user confirmation.",
@@ -143,15 +159,22 @@ TOOLS = [
           "place, keeping its config (env, ports, networks, volumes). Only meaningful when "
           "the container has an update available. Requires user confirmation.",
           {"host": _HOST_PROP, "container": _CONTAINER_PROP}, required=["host", "container"]),
-    _tool("install_os_updates", "Install pending OS package updates on a host: either "
-          "specific packages, or an entire severity tier. Requires user confirmation.",
+    _tool("install_os_updates", "Install pending OS package updates on a host: specific "
+          "packages, an entire severity tier, or everything pending. Requires user "
+          "confirmation.",
           {"host": _HOST_PROP,
            "packages": {"type": "array", "items": {"type": "string"},
-                        "description": "Specific package names. Omit to use severity instead."},
-           "severity": {"type": "string", "enum": ["security", "important", "routine"],
-                        "description": "Install every pending package at this severity. "
-                        "Omit if using packages."}},
+                        "description": "Specific package names to install. Omit this and "
+                        "severity to install everything pending."},
+           "severity": {"type": "string", "enum": ["security", "important", "routine", "all"],
+                        "description": "Install every pending package at this severity, or "
+                        "'all' for every pending package regardless of severity. Omit if "
+                        "using packages instead."}},
           required=["host"]),
+    _tool("check_os_job", "Check the status of a previously started OS-update install or "
+          "package-list refresh job -- poll this until status is no longer \"running\" "
+          "before telling the user it finished, and relay its output if it failed.",
+          {"host": _HOST_PROP, "job_id": {"type": "string"}}, required=["host", "job_id"]),
 ]
 
 
@@ -267,16 +290,37 @@ def execute_tool(name, args, config, poller):
             return _list_containers(poller, args)
         if name == "list_os_updates":
             return _list_os_updates(poller, args)
+        if name == "list_events":
+            host = config_mod.find_host(config, (args.get("host") or "").strip())
+            if not host:
+                return {"error": "no such host: %r" % args.get("host")}
+            since = time.time() - float(args["since_seconds"]) if args.get("since_seconds") else None
+            return collector.host_events(host, since=since, limit=args.get("limit") or 200)
 
         if name == "install_os_updates":
             host = config_mod.find_host(config, (args.get("host") or "").strip())
             if not host:
                 return {"error": "no such host: %r" % args.get("host")}
+            # An empty list and "all" both mean "no filter" -- collector.start_os_update
+            # only treats an actual None as "everything pending", so normalise here
+            # rather than have a model's `"packages": []` silently install nothing.
+            packages = args.get("packages") or None
+            severity = args.get("severity") or None
+            if severity == "all":
+                severity = None
             try:
-                return collector.start_os_update(
-                    host, packages=args.get("packages"), severity=args.get("severity"))
+                return collector.start_os_update(host, packages=packages, severity=severity)
             except collector.OsUpdateRefused as exc:
                 return {"error": str(exc)}
+
+        if name == "check_os_job":
+            host = config_mod.find_host(config, (args.get("host") or "").strip())
+            if not host:
+                return {"error": "no such host: %r" % args.get("host")}
+            job = collector.get_os_job(host, (args.get("job_id") or "").strip())
+            if job is None:
+                return {"error": "no such job"}
+            return job
 
         if name in CONTAINER_ARG_TOOLS:
             host, container_id, err = _prepare_target(poller, config, args)
@@ -343,7 +387,7 @@ def describe_pending(name, args):
             "danger": False, "confirm_label": "Recreate",
         }
     if name == "install_os_updates":
-        if args.get("severity"):
+        if args.get("severity") and args["severity"] != "all":
             target = "every pending %s package" % args["severity"]
         elif args.get("packages"):
             target = ", ".join(args["packages"])
@@ -396,35 +440,57 @@ def _run(messages, config, poller, api_key, model):
             return {"status": "final", "messages": messages,
                     "reply": assistant_message.get("content") or "", "usage": usage}
 
-        primary = tool_calls[0]
-        extra = tool_calls[1:]
-        fn = primary.get("function") or {}
-        name = fn.get("name")
-        try:
-            args = json.loads(fn.get("arguments") or "{}")
-        except ValueError:
-            args = {}
+        parsed = []
+        for tc in tool_calls:
+            fn = tc.get("function") or {}
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except ValueError:
+                args = {}
+            parsed.append((tc, fn.get("name"), args))
 
-        skipped = [
-            {"role": "tool", "tool_call_id": tc.get("id"),
-             "content": json.dumps({"skipped": "only one tool call runs per turn -- ask again"})}
-            for tc in extra
-        ]
+        write_index = next(
+            (i for i, (_, name, _) in enumerate(parsed) if name in WRITE_TOOLS), None)
 
-        if name in WRITE_TOOLS:
+        if write_index is not None:
+            # Anything read-only earlier in the same batch is safe to run
+            # now; the write tool itself pauses for confirmation, and
+            # anything requested after it in this batch is deferred rather
+            # than silently run out of order once that confirmation lands.
+            tool_messages = []
+            for i, (tc, name, args) in enumerate(parsed):
+                if i < write_index:
+                    result = execute_tool(name, args, config, poller)
+                    tool_messages.append({
+                        "role": "tool", "tool_call_id": tc.get("id"),
+                        "content": json.dumps(result, default=str)[:8000],
+                    })
+                elif i > write_index:
+                    tool_messages.append({
+                        "role": "tool", "tool_call_id": tc.get("id"),
+                        "content": json.dumps({
+                            "skipped": "only one action tool runs per turn -- ask again"}),
+                    })
+            pending_tc, pending_name, pending_args = parsed[write_index]
             return {
                 "status": "needs_confirmation",
-                "messages": messages + skipped,
-                "pending": {"id": primary.get("id"), "name": name, "arguments": args,
-                            "confirm": describe_pending(name, args)},
+                "messages": messages + tool_messages,
+                "pending": {"id": pending_tc.get("id"), "name": pending_name,
+                            "arguments": pending_args,
+                            "confirm": describe_pending(pending_name, pending_args)},
                 "usage": usage,
             }
 
-        result = execute_tool(name, args, config, poller)
-        messages = messages + [
-            {"role": "tool", "tool_call_id": primary.get("id"),
-             "content": json.dumps(result, default=str)[:8000]}
-        ] + skipped
+        # No write tool in this batch -- every read tool the model asked
+        # for runs now, in one round, rather than one per model turn.
+        tool_messages = []
+        for tc, name, args in parsed:
+            result = execute_tool(name, args, config, poller)
+            tool_messages.append({
+                "role": "tool", "tool_call_id": tc.get("id"),
+                "content": json.dumps(result, default=str)[:8000],
+            })
+        messages = messages + tool_messages
 
     return {"status": "error", "error": "Stopped after too many tool calls in a row."}
 
