@@ -96,6 +96,13 @@ def agent_command(enrollment, dashboard_url, socket_path="/var/run/docker.sock")
     For an agent that only ever reports OS updates, drop `--pid=host
     --privileged` and add `-e CUD_ALLOW_UPDATES=0`. Everything except
     installing and refreshing the package lists keeps working.
+
+    Deploying a Compose stack needs one more thing this command does not
+    add by default: a host path bind-mounted onto itself (e.g.
+    `-v /opt/cud-stacks:/opt/cud-stacks -e CUD_STACKS_DIR=/opt/cud-stacks`)
+    so the compose file this agent writes is somewhere docker compose can
+    still find once it's running via the host's own namespaces. Without
+    it, the Deploy stack button simply does not list this host.
     """
     return (
         "docker run -d --name {name} --restart unless-stopped \\\n"

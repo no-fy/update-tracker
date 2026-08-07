@@ -4,7 +4,7 @@ FROM python:3.12-alpine
 # (util-linux-misc) runs OS updates in the host's namespaces.
 RUN apk add --no-cache su-exec util-linux-misc
 
-COPY agent/agent.py agent/containerctl.py agent/eventstore.py agent/logstore.py agent/ospackages.py agent/osupdate.py /app/
+COPY agent/agent.py agent/containerctl.py agent/eventstore.py agent/imagectl.py agent/logstore.py agent/ospackages.py agent/osupdate.py agent/stackctl.py /app/
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 

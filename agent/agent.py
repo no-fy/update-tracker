@@ -285,10 +285,16 @@ class DockerClient:
         )
 
     def create_container(self, name, body):
-        return self.post_json(
-            "/%s/containers/create?name=%s" % (API_VERSION, urllib.parse.quote(name, safe="")),
-            body,
-        )
+        path = "/%s/containers/create" % API_VERSION
+        if name:
+            path += "?name=%s" % urllib.parse.quote(name, safe="")
+        return self.post_json(path, body)
+
+    def create_volume(self, body):
+        return self.post_json("/%s/volumes/create" % API_VERSION, body)
+
+    def create_network(self, body):
+        return self.post_json("/%s/networks/create" % API_VERSION, body)
 
     def connect_network(self, network_id, container_id, endpoint_config=None):
         self.post_json(
@@ -320,6 +326,51 @@ class DockerClient:
                             pass
             if resp.status >= 400:
                 raise DockerError("docker API pull returned %s" % resp.status)
+        except (OSError, http.client.HTTPException) as exc:
+            raise DockerError("docker API request failed: %s" % exc) from exc
+        finally:
+            conn.close()
+
+    def build_image(self, tar_bytes, tag=None, on_line=None):
+        """Build from a tar context (just a Dockerfile, for the paste/upload
+        flow this agent offers) -- same streamed-NDJSON shape as pull_image."""
+        query = "?rm=1&forcerm=1"
+        if tag:
+            query += "&t=%s" % urllib.parse.quote(tag, safe="")
+        path = "/%s/build%s" % (API_VERSION, query)
+        conn = self._connect()
+        try:
+            headers = {
+                "Host": "docker",
+                "Content-Type": "application/x-tar",
+                "Content-Length": str(len(tar_bytes)),
+            }
+            conn.request("POST", path, body=tar_bytes, headers=headers)
+            resp = conn.getresponse()
+            buf = b""
+            error = None
+            while True:
+                chunk = resp.read(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line.decode("utf-8", "replace"))
+                    except ValueError:
+                        continue
+                    if on_line:
+                        on_line(event)
+                    if event.get("error"):
+                        error = event["error"]
+            if resp.status >= 400 and not error:
+                error = "docker API build returned %s" % resp.status
+            if error:
+                raise DockerError(error)
         except (OSError, http.client.HTTPException) as exc:
             raise DockerError("docker API request failed: %s" % exc) from exc
         finally:
@@ -396,6 +447,16 @@ def _logstore():
 def _eventstore():
     import eventstore
     return eventstore
+
+
+def _imagectl():
+    import imagectl
+    return imagectl
+
+
+def _stackctl():
+    import stackctl
+    return stackctl
 
 
 def collect_snapshot(client, include_stopped=True):
@@ -489,6 +550,7 @@ def collect_snapshot(client, include_stopped=True):
         "container_actions": _containerctl().capability(),
         "log_history": _logstore().capability(),
         "event_history": _eventstore().capability(),
+        "stack_deploy": _stackctl().capability(),
     }
 
 
@@ -652,6 +714,26 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     self._send(404, {"error": "no such job"})
                 else:
                     self._send(200, job.snapshot())
+            elif path.startswith("/v1/containers/") and path.endswith("/clone-spec"):
+                container_id = path[len("/v1/containers/"):-len("/clone-spec")]
+                try:
+                    self._send(200, _containerctl().clone_spec(client, container_id))
+                except _containerctl().ActionError as exc:
+                    self._send(400, {"error": str(exc)})
+            elif "/images/job/" in path:
+                job_id = path.rsplit("/", 1)[-1]
+                job = _imagectl().RUNNER.get(job_id)
+                if job is None:
+                    self._send(404, {"error": "no such job"})
+                else:
+                    self._send(200, job.snapshot())
+            elif "/stacks/job/" in path:
+                job_id = path.rsplit("/", 1)[-1]
+                job = _stackctl().RUNNER.get(job_id)
+                if job is None:
+                    self._send(404, {"error": "no such job"})
+                else:
+                    self._send(200, job.snapshot())
             else:
                 self._send(404, {"error": "no such endpoint", "path": path})
         except DockerError as exc:
@@ -675,6 +757,82 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
         except ValueError:
             body = {}
+
+        if path == "/v1/containers/create":
+            client = DockerClient(self.server.docker_endpoint)
+            containerctl = _containerctl()
+            try:
+                container_id = containerctl.run_create(
+                    client, body, start=bool(body.get("start", True)))
+            except containerctl.ActionError as exc:
+                self._send(400, {"error": str(exc)})
+                return
+            except DockerError as exc:
+                self._send(503, {"error": str(exc)})
+                return
+            self._send(201, {"ok": True, "container": container_id})
+            return
+
+        if path == "/v1/volumes":
+            client = DockerClient(self.server.docker_endpoint)
+            containerctl = _containerctl()
+            try:
+                result = containerctl.create_volume(client, body)
+            except containerctl.ActionError as exc:
+                self._send(400, {"error": str(exc)})
+                return
+            except DockerError as exc:
+                self._send(503, {"error": str(exc)})
+                return
+            self._send(201, result)
+            return
+
+        if path == "/v1/networks":
+            client = DockerClient(self.server.docker_endpoint)
+            containerctl = _containerctl()
+            try:
+                result = containerctl.create_network(client, body)
+            except containerctl.ActionError as exc:
+                self._send(400, {"error": str(exc)})
+                return
+            except DockerError as exc:
+                self._send(503, {"error": str(exc)})
+                return
+            self._send(201, result)
+            return
+
+        if path == "/v1/images/pull":
+            client = DockerClient(self.server.docker_endpoint)
+            try:
+                job = _imagectl().RUNNER.start_pull(
+                    client, (body.get("repository") or "").strip(),
+                    (body.get("reference") or "latest").strip())
+            except _containerctl().ActionError as exc:
+                self._send(400, {"error": str(exc)})
+                return
+            self._send(202, job.snapshot())
+            return
+
+        if path == "/v1/images/build":
+            client = DockerClient(self.server.docker_endpoint)
+            try:
+                job = _imagectl().RUNNER.start_build(
+                    client, body.get("dockerfile") or "",
+                    tag=(body.get("tag") or "").strip() or None)
+            except _containerctl().ActionError as exc:
+                self._send(400, {"error": str(exc)})
+                return
+            self._send(202, job.snapshot())
+            return
+
+        if path == "/v1/stacks":
+            try:
+                job = _stackctl().RUNNER.start_deploy(body.get("project"), body.get("compose"))
+            except _containerctl().ActionError as exc:
+                self._send(400, {"error": str(exc)})
+                return
+            self._send(202, job.snapshot())
+            return
 
         if path.startswith("/v1/containers/"):
             rest = path[len("/v1/containers/"):]

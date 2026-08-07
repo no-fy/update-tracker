@@ -75,6 +75,7 @@ def poll_host(host, timeout=20, include_stopped=True):
         container_actions=None,
         log_history=None,
         event_history=None,
+        stack_deploy=None,
     )
 
     if not host.get("enabled", True):
@@ -108,6 +109,7 @@ def poll_host(host, timeout=20, include_stopped=True):
         result["container_actions"] = snapshot.get("container_actions")
         result["log_history"] = snapshot.get("log_history")
         result["event_history"] = snapshot.get("event_history")
+        result["stack_deploy"] = snapshot.get("stack_deploy")
         result["os"] = _poll_os(host, timeout)
     except agent_module.DockerError as exc:
         result["error"] = str(exc)
@@ -438,6 +440,169 @@ def host_networks(host, timeout=20):
     url = "%s://%s:%s/v1/networks" % (scheme, host.get("address"), host.get("port", 9713))
     return _http_get_json(url, token=host.get("token"), timeout=timeout,
                           verify_tls=host.get("verify_tls", True))
+
+
+def create_volume(host, spec, timeout=30):
+    if host.get("mode") == "local":
+        import containerctl
+
+        client = agent_module.DockerClient(host.get("docker_socket"))
+        try:
+            return containerctl.create_volume(client, spec)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/volumes" % (scheme, host.get("address"), host.get("port", 9713))
+    return _http_post_json(url, spec, token=host.get("token"), timeout=timeout,
+                           verify_tls=host.get("verify_tls", True))
+
+
+def create_network(host, spec, timeout=30):
+    if host.get("mode") == "local":
+        import containerctl
+
+        client = agent_module.DockerClient(host.get("docker_socket"))
+        try:
+            return containerctl.create_network(client, spec)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/networks" % (scheme, host.get("address"), host.get("port", 9713))
+    return _http_post_json(url, spec, token=host.get("token"), timeout=timeout,
+                           verify_tls=host.get("verify_tls", True))
+
+
+def create_container(host, spec, start=True, timeout=30):
+    if host.get("mode") == "local":
+        import containerctl
+
+        client = agent_module.DockerClient(host.get("docker_socket"))
+        try:
+            container_id = containerctl.run_create(client, spec, start=start)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+        return {"ok": True, "container": container_id}
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/containers/create" % (scheme, host.get("address"), host.get("port", 9713))
+    body = dict(spec)
+    body["start"] = start
+    return _http_post_json(url, body, token=host.get("token"), timeout=timeout,
+                           verify_tls=host.get("verify_tls", True))
+
+
+def container_clone_spec(host, container_id, timeout=20):
+    if host.get("mode") == "local":
+        import containerctl
+
+        client = agent_module.DockerClient(host.get("docker_socket"))
+        try:
+            return containerctl.clone_spec(client, container_id)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/containers/%s/clone-spec" % (
+        scheme, host.get("address"), host.get("port", 9713),
+        urllib.parse.quote(container_id, safe=""))
+    return _http_get_json(url, token=host.get("token"), timeout=timeout,
+                          verify_tls=host.get("verify_tls", True))
+
+
+def pull_image(host, repository, reference, timeout=30):
+    if host.get("mode") == "local":
+        import containerctl
+        import imagectl
+
+        client = agent_module.DockerClient(host.get("docker_socket"))
+        try:
+            job = imagectl.RUNNER.start_pull(client, repository, reference)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+        return job.snapshot()
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/images/pull" % (scheme, host.get("address"), host.get("port", 9713))
+    return _http_post_json(url, {"repository": repository, "reference": reference},
+                           token=host.get("token"), timeout=timeout,
+                           verify_tls=host.get("verify_tls", True))
+
+
+def build_image(host, dockerfile, tag=None, timeout=30):
+    if host.get("mode") == "local":
+        import containerctl
+        import imagectl
+
+        client = agent_module.DockerClient(host.get("docker_socket"))
+        try:
+            job = imagectl.RUNNER.start_build(client, dockerfile, tag=tag)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+        return job.snapshot()
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/images/build" % (scheme, host.get("address"), host.get("port", 9713))
+    return _http_post_json(url, {"dockerfile": dockerfile, "tag": tag},
+                           token=host.get("token"), timeout=timeout,
+                           verify_tls=host.get("verify_tls", True))
+
+
+def image_job(host, job_id, timeout=20):
+    if host.get("mode") == "local":
+        import imagectl
+
+        job = imagectl.RUNNER.get(job_id)
+        return job.snapshot() if job else None
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/images/job/%s" % (
+        scheme, host.get("address"), host.get("port", 9713), urllib.parse.quote(job_id, safe=""))
+    try:
+        return _http_get_json(url, token=host.get("token"), timeout=timeout,
+                              verify_tls=host.get("verify_tls", True))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise
+
+
+def deploy_stack(host, project, compose, timeout=30):
+    if host.get("mode") == "local":
+        import containerctl
+        import stackctl
+
+        try:
+            job = stackctl.RUNNER.start_deploy(project, compose)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+        return job.snapshot()
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/stacks" % (scheme, host.get("address"), host.get("port", 9713))
+    return _http_post_json(url, {"project": project, "compose": compose},
+                           token=host.get("token"), timeout=timeout,
+                           verify_tls=host.get("verify_tls", True))
+
+
+def stack_job(host, job_id, timeout=20):
+    if host.get("mode") == "local":
+        import stackctl
+
+        job = stackctl.RUNNER.get(job_id)
+        return job.snapshot() if job else None
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/stacks/job/%s" % (
+        scheme, host.get("address"), host.get("port", 9713), urllib.parse.quote(job_id, safe=""))
+    try:
+        return _http_get_json(url, token=host.get("token"), timeout=timeout,
+                              verify_tls=host.get("verify_tls", True))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise
 
 
 def all_events(hosts, since=None, until=None, limit=200, timeout=20, max_workers=8):

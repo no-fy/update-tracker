@@ -33,6 +33,11 @@ services:
       # restart of this container. Drop this and set CUD_LOG_HISTORY=0 and
       # CUD_EVENTS=0 below to keep only what Docker itself still has.
       - cud-logs:/var/lib/container-update-agent
+      # Off unless both this line and CUD_STACKS_DIR below are set --
+      # "Deploy stack" needs a host path to write compose files to, and
+      # it must be the *same* path on both sides for docker compose to
+      # find them again once it's running via the host's own namespaces:
+      # - /opt/cud-stacks:/opt/cud-stacks
     environment:
       CUD_HOST_ROOT: /host
       # There is no auth by default. Set this if the port is reachable beyond
@@ -51,6 +56,9 @@ services:
       # 0 turns this off; there is also a manual "Refresh package lists"
       # button per host either way.
       # CUD_OS_REFRESH_HOURS: "6"
+      # "Deploy stack" is off unless this is also set to the identical
+      # path as the bind mount above:
+      # CUD_STACKS_DIR: /opt/cud-stacks
       # A dashboard-wide "Ask AI" assistant that can look at hosts,
       # containers, logs and OS updates -- and, with your approval, act on
       # them -- via OpenRouter (Claude Haiku by default, pick any model at

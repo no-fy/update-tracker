@@ -101,6 +101,186 @@ def run_remove(client, container_id, expected_name=None):
     client.remove_container(container_id)
 
 
+# ---- creating a container from a form-friendly spec ------------------------
+# Not Docker's own Config/HostConfig shape -- the dashboard's create-container
+# form sends the fields a person actually fills in, and this translates them.
+
+SAFE_RESOURCE_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
+
+
+def build_create_spec(spec):
+    image = (spec.get("image") or "").strip()
+    if not image:
+        raise ActionError("An image is required.")
+    name = (spec.get("name") or "").strip()
+    if name and not SAFE_NAME.match(name):
+        raise ActionError("%r is not a valid container name." % name)
+
+    body = {"Image": image}
+
+    command = spec.get("command")
+    if command:
+        body["Cmd"] = command if isinstance(command, list) else str(command).split()
+
+    env = [str(e) for e in (spec.get("env") or []) if e and "=" in str(e)]
+    if env:
+        body["Env"] = env
+
+    exposed = {}
+    bindings = {}
+    for port in spec.get("ports") or []:
+        container_port = str(port.get("container_port") or "").strip()
+        if not container_port:
+            continue
+        proto = (port.get("protocol") or "tcp").strip().lower()
+        if proto not in ("tcp", "udp"):
+            raise ActionError("%r is not a valid port protocol." % proto)
+        key = "%s/%s" % (container_port, proto)
+        exposed[key] = {}
+        host_port = str(port.get("host_port") or "").strip()
+        bindings.setdefault(key, []).append({"HostPort": host_port} if host_port else {})
+    if exposed:
+        body["ExposedPorts"] = exposed
+
+    binds = []
+    for vol in spec.get("volumes") or []:
+        source = (vol.get("source") or "").strip()
+        destination = (vol.get("destination") or "").strip()
+        if not source or not destination:
+            continue
+        mode = (vol.get("mode") or "rw").strip() or "rw"
+        binds.append("%s:%s:%s" % (source, destination, mode))
+
+    host_config = {}
+    if bindings:
+        host_config["PortBindings"] = bindings
+    if binds:
+        host_config["Binds"] = binds
+    restart = (spec.get("restart_policy") or "").strip() or "no"
+    if restart != "no":
+        if restart not in ("always", "unless-stopped", "on-failure"):
+            raise ActionError("%r is not a valid restart policy." % restart)
+        host_config["RestartPolicy"] = {"Name": restart}
+    if host_config:
+        body["HostConfig"] = host_config
+
+    network = (spec.get("network") or "").strip()
+    if network:
+        body["NetworkingConfig"] = {"EndpointsConfig": {network: {}}}
+
+    return name, body
+
+
+def run_create(client, spec, start=True):
+    _require_allowed()
+    name, body = build_create_spec(spec)
+    try:
+        created = client.create_container(name, body)
+    except Exception as exc:
+        raise ActionError(str(exc))
+    container_id = (created or {}).get("Id")
+    if start and container_id:
+        client.container_action(container_id, "start")
+    return container_id
+
+
+def clone_spec(client, container_id):
+    """An existing container's config, read back out as a create-spec --
+    for the Create Container form to pre-fill. Creates nothing itself."""
+    _require_id(container_id)
+    info = client.inspect_container(container_id) or {}
+    config = info.get("Config") or {}
+    host_config = info.get("HostConfig") or {}
+    networks = (info.get("NetworkSettings") or {}).get("Networks") or {}
+
+    ports = []
+    for key, host_bindings in (host_config.get("PortBindings") or {}).items():
+        container_port, _, proto = key.partition("/")
+        for binding in (host_bindings or [{}]):
+            ports.append({
+                "container_port": container_port,
+                "protocol": proto or "tcp",
+                "host_port": (binding or {}).get("HostPort") or "",
+            })
+
+    volumes = []
+    for bind in (host_config.get("Binds") or []):
+        parts = bind.split(":")
+        if len(parts) >= 2:
+            volumes.append({
+                "source": parts[0],
+                "destination": parts[1],
+                "mode": parts[2] if len(parts) > 2 else "rw",
+            })
+
+    return {
+        "image": config.get("Image") or "",
+        "command": config.get("Cmd") or [],
+        "env": config.get("Env") or [],
+        "ports": ports,
+        "volumes": volumes,
+        "restart_policy": (host_config.get("RestartPolicy") or {}).get("Name") or "no",
+        "network": next(iter(networks), ""),
+    }
+
+
+def create_volume(client, spec):
+    _require_allowed()
+    name = (spec.get("name") or "").strip()
+    if name and not SAFE_RESOURCE_NAME.match(name):
+        raise ActionError("%r is not a valid volume name." % name)
+    body = {}
+    if name:
+        body["Name"] = name
+    driver = (spec.get("driver") or "").strip()
+    if driver:
+        body["Driver"] = driver
+    opts = spec.get("driver_opts") or {}
+    if opts:
+        body["DriverOpts"] = {str(k): str(v) for k, v in opts.items()}
+    labels = spec.get("labels") or {}
+    if labels:
+        body["Labels"] = {str(k): str(v) for k, v in labels.items()}
+    try:
+        return client.create_volume(body)
+    except Exception as exc:
+        raise ActionError(str(exc))
+
+
+def create_network(client, spec):
+    _require_allowed()
+    name = (spec.get("name") or "").strip()
+    if not name:
+        raise ActionError("A network name is required.")
+    if not SAFE_RESOURCE_NAME.match(name):
+        raise ActionError("%r is not a valid network name." % name)
+    body = {"Name": name, "Driver": (spec.get("driver") or "bridge").strip() or "bridge"}
+    if spec.get("internal"):
+        body["Internal"] = True
+    subnet = (spec.get("subnet") or "").strip()
+    gateway = (spec.get("gateway") or "").strip()
+    if subnet:
+        config = {"Subnet": subnet}
+        if gateway:
+            config["Gateway"] = gateway
+        body["IPAM"] = {"Config": [config]}
+    try:
+        network = client.create_network(body)
+    except Exception as exc:
+        raise ActionError(str(exc))
+
+    for container_id in spec.get("attach_containers") or []:
+        _require_id(container_id)
+        try:
+            client.connect_network(network.get("Id") or name, container_id)
+        except Exception as exc:
+            # The network itself was created fine; a failed attach is worth
+            # surfacing but not worth rolling the whole thing back over.
+            network.setdefault("attach_errors", []).append(
+                "%s: %s" % (container_id, exc))
+    return network
+
+
 # ---- recreate: pull the image, then swap the container for a new one ------
 
 def _split_image_ref(ref):
