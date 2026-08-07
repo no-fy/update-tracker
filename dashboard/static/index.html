@@ -70,6 +70,8 @@
         <span class="visually-hidden">Search containers</span>
         <input id="search" type="search" placeholder="Search name or image…" autocomplete="off">
       </label>
+      <button id="tab-action-2" class="button" type="button" hidden></button>
+      <button id="tab-action" class="button primary" type="button" hidden></button>
     </div>
   </section>
 
@@ -235,6 +237,219 @@
     <div class="dialog-actions">
       <button type="button" class="button" id="settings-cancel">Cancel</button>
       <button class="button primary" id="settings-save" value="save">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="pull-image-dialog" class="dialog">
+  <form id="pull-image-form">
+    <h2>Pull an image</h2>
+    <label class="stack">
+      <span>Host</span>
+      <select id="pull-image-host" required></select>
+    </label>
+    <div class="dialog-row">
+      <label class="stack">
+        <span>Repository</span>
+        <input id="pull-image-repo" placeholder="nginx" required>
+      </label>
+      <label class="stack">
+        <span>Tag</span>
+        <input id="pull-image-tag" placeholder="latest">
+      </label>
+    </div>
+    <pre class="joblog" id="pull-image-log" hidden></pre>
+    <p class="dialog-error" id="pull-image-error" hidden></p>
+    <div class="dialog-actions">
+      <button type="button" class="button" id="pull-image-cancel">Close</button>
+      <button class="button primary" id="pull-image-submit" type="submit">Pull</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="build-image-dialog" class="dialog">
+  <form id="build-image-form">
+    <h2>Build an image</h2>
+    <p class="dialog-lede">A single Dockerfile as the build context -- no other files are sent.</p>
+    <div class="dialog-row">
+      <label class="stack">
+        <span>Host</span>
+        <select id="build-image-host" required></select>
+      </label>
+      <label class="stack">
+        <span>Tag <small>optional</small></span>
+        <input id="build-image-tag" placeholder="myapp:latest">
+      </label>
+    </div>
+    <label class="stack">
+      <span>Dockerfile</span>
+      <textarea id="build-image-dockerfile" rows="10" placeholder="FROM alpine:latest&#10;RUN ..." required></textarea>
+    </label>
+    <pre class="joblog" id="build-image-log" hidden></pre>
+    <p class="dialog-error" id="build-image-error" hidden></p>
+    <div class="dialog-actions">
+      <button type="button" class="button" id="build-image-cancel">Close</button>
+      <button class="button primary" id="build-image-submit" type="submit">Build</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="create-volume-dialog" class="dialog">
+  <form id="create-volume-form">
+    <h2>Create a volume</h2>
+    <label class="stack">
+      <span>Host</span>
+      <select id="create-volume-host" required></select>
+    </label>
+    <label class="stack">
+      <span>Name <small>optional -- Docker generates one if blank</small></span>
+      <input id="create-volume-name" placeholder="my-data">
+    </label>
+    <label class="stack">
+      <span>Driver <small>optional</small></span>
+      <input id="create-volume-driver" placeholder="local">
+    </label>
+    <p class="dialog-error" id="create-volume-error" hidden></p>
+    <div class="dialog-actions">
+      <button type="button" class="button" id="create-volume-cancel">Cancel</button>
+      <button class="button primary" id="create-volume-submit" type="submit">Create</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="create-network-dialog" class="dialog">
+  <form id="create-network-form">
+    <h2>Create a network</h2>
+    <label class="stack">
+      <span>Host</span>
+      <select id="create-network-host" required></select>
+    </label>
+    <label class="stack">
+      <span>Name</span>
+      <input id="create-network-name" placeholder="my-network" required>
+    </label>
+    <div class="dialog-row">
+      <label class="stack">
+        <span>Driver</span>
+        <input id="create-network-driver" placeholder="bridge">
+      </label>
+      <label class="check">
+        <input type="checkbox" id="create-network-internal">
+        <span>Internal <small>no external connectivity</small></span>
+      </label>
+    </div>
+    <div class="dialog-row">
+      <label class="stack">
+        <span>Subnet <small>optional</small></span>
+        <input id="create-network-subnet" placeholder="172.28.0.0/16">
+      </label>
+      <label class="stack">
+        <span>Gateway <small>optional</small></span>
+        <input id="create-network-gateway" placeholder="172.28.0.1">
+      </label>
+    </div>
+    <p class="dialog-error" id="create-network-error" hidden></p>
+    <div class="dialog-actions">
+      <button type="button" class="button" id="create-network-cancel">Cancel</button>
+      <button class="button primary" id="create-network-submit" type="submit">Create</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="create-container-dialog" class="dialog wide-dialog">
+  <form id="create-container-form">
+    <h2 id="create-container-title">Create a container</h2>
+    <label class="stack">
+      <span>Host</span>
+      <select id="create-container-host" required></select>
+    </label>
+    <div class="dialog-row">
+      <label class="stack">
+        <span>Name <small>optional</small></span>
+        <input id="create-container-name" placeholder="my-app">
+      </label>
+      <label class="stack">
+        <span>Image</span>
+        <input id="create-container-image" placeholder="nginx:latest" required>
+      </label>
+    </div>
+    <label class="stack">
+      <span>Command <small>optional</small></span>
+      <input id="create-container-command" placeholder="nginx -g 'daemon off;'">
+    </label>
+
+    <div class="stack">
+      <span>Environment variables</span>
+      <div class="spec-rows" id="create-container-env-rows"></div>
+      <button type="button" class="button small" id="create-container-env-add">Add variable</button>
+    </div>
+
+    <div class="stack">
+      <span>Ports</span>
+      <div class="spec-rows" id="create-container-port-rows"></div>
+      <button type="button" class="button small" id="create-container-port-add">Add port</button>
+    </div>
+
+    <div class="stack">
+      <span>Volumes</span>
+      <div class="spec-rows" id="create-container-volume-rows"></div>
+      <button type="button" class="button small" id="create-container-volume-add">Add volume</button>
+    </div>
+
+    <div class="dialog-row">
+      <label class="stack">
+        <span>Restart policy</span>
+        <select id="create-container-restart">
+          <option value="no">Don't restart</option>
+          <option value="unless-stopped">Unless stopped</option>
+          <option value="always">Always</option>
+          <option value="on-failure">On failure</option>
+        </select>
+      </label>
+      <label class="stack">
+        <span>Network <small>optional</small></span>
+        <input id="create-container-network" placeholder="my-network" list="create-container-network-list">
+        <datalist id="create-container-network-list"></datalist>
+      </label>
+    </div>
+
+    <label class="check">
+      <input type="checkbox" id="create-container-start" checked>
+      <span>Start it right away</span>
+    </label>
+
+    <p class="dialog-error" id="create-container-error" hidden></p>
+    <div class="dialog-actions">
+      <button type="button" class="button" id="create-container-cancel">Cancel</button>
+      <button class="button primary" id="create-container-submit" type="submit">Create</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="deploy-stack-dialog" class="dialog wide-dialog">
+  <form id="deploy-stack-form">
+    <h2>Deploy a stack</h2>
+    <p class="dialog-lede">Runs the host's own <code>docker compose up -d</code> against this file --
+      needs <code>CUD_STACKS_DIR</code> configured on that host's agent.</p>
+    <div class="dialog-row">
+      <label class="stack">
+        <span>Host</span>
+        <select id="deploy-stack-host" required></select>
+      </label>
+      <label class="stack">
+        <span>Stack name</span>
+        <input id="deploy-stack-project" placeholder="my-stack" required>
+      </label>
+    </div>
+    <label class="stack">
+      <span>docker-compose.yml</span>
+      <textarea id="deploy-stack-compose" rows="14" placeholder="services:&#10;  web:&#10;    image: nginx:latest&#10;    ports:&#10;      - &quot;8080:80&quot;" required></textarea>
+    </label>
+    <pre class="joblog" id="deploy-stack-log" hidden></pre>
+    <p class="dialog-error" id="deploy-stack-error" hidden></p>
+    <div class="dialog-actions">
+      <button type="button" class="button" id="deploy-stack-cancel">Close</button>
+      <button class="button primary" id="deploy-stack-submit" type="submit">Deploy</button>
     </div>
   </form>
 </dialog>

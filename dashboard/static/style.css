@@ -458,6 +458,39 @@ tr.detail td { padding: 0 18px 14px; background: transparent; }
 .confirm-dialog { width: min(420px, calc(100vw - 32px)); }
 .confirm-dialog .dialog-lede { margin: 0; }
 
+.wide-dialog {
+  width: min(680px, calc(100vw - 32px));
+  max-height: calc(100vh - 64px);
+}
+.wide-dialog form { max-height: calc(100vh - 64px); overflow-y: auto; }
+
+.spec-rows { display: flex; flex-direction: column; gap: 7px; }
+.spec-row { display: flex; gap: 7px; align-items: center; }
+.spec-row input, .spec-row select {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 9px;
+  border: 1px solid var(--rule);
+  border-radius: 7px;
+  background: var(--plane);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 0.82rem;
+}
+.spec-row .spec-remove {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--rule);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.9rem;
+  line-height: 1;
+}
+.spec-row .spec-remove:hover { color: var(--text-primary); border-color: var(--text-muted); }
+
 .dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
 
 .dialog form { display: flex; flex-direction: column; gap: 14px; padding: 22px; }

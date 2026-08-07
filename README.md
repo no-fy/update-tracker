@@ -232,6 +232,14 @@ The lifecycle actions and a **Logs** button sit right on each container's row
 | **Rename** | An inline field, not a prompt — type the new name and save. |
 | **Remove** | Only offered once a container is stopped. |
 | **Recreate with latest image** | Only shown when the container is **update available** or **restart pending** — this is the button that closes the loop the dashboard started with. It pulls the tag's current image, then swaps the container for a new one built from the same config (env, labels, ports, volumes, restart policy, networks and aliases), streaming progress the same way an OS update does. |
+| **Clone** | Reads the container's current config back out (image, command, env, ports, volumes, restart policy, network) and opens **Create container** pre-filled with it, name suffixed `-copy` — nothing is created until you save. |
+
+**Create container** (also in the Containers tab's header) opens the same
+form empty: image, an optional name, command, environment variables, ports,
+volumes and a restart policy, plus which network to attach and whether to
+start it right away. It builds Docker's own container-create request from
+those fields; it does not pull the image first, so pick one that's already
+on the host (pull it from the Images tab if it isn't).
 
 Clicking a container still expands it, now just for **Details** (image,
 digests, ports, compose info) and whatever the **Logs** button opens.
@@ -326,8 +334,33 @@ agent change needed, that label was already collected per-container. Each
 stack shows how many of its services are running and a rolled-up status
 (the worst status among its services — an update available on any one
 service surfaces at the stack level too), and expands to the same per-service
-detail the Containers tab shows. Read-only for now: starting, stopping or
-redeploying a stack as a unit is a later phase.
+detail the Containers tab shows. Starting, stopping or redeploying an
+*existing* stack as a unit is still a later phase — what exists today is
+deploying one.
+
+**Deploy stack** runs the host's own `docker compose up -d` against a file
+you paste in, rather than this project reimplementing compose's YAML
+semantics — profiles, build contexts, env-file interpolation and everything
+else compose does are things this tool has no business getting subtly wrong.
+That needs somewhere on the host itself to put the file, so it is off by
+default:
+
+- **Set `CUD_STACKS_DIR` to a host path, and bind-mount that *same* path
+  onto itself**: `-v /opt/cud-stacks:/opt/cud-stacks -e
+  CUD_STACKS_DIR=/opt/cud-stacks`. The reason it has to be the identical
+  path on both sides: deploying runs via the same host-namespace mechanism
+  as OS updates (`nsenter`), and once inside the host's own mount namespace,
+  only genuinely host-side paths mean anything — a container-only path like
+  `/var/lib/container-update-agent` does not exist there. This is the only
+  feature in the project that needs a mount like this; nothing else writes
+  to the host's filesystem.
+- Needs the same `--pid=host --privileged` access OS updates already do,
+  for the same reason.
+- If `CUD_STACKS_DIR` isn't set, isn't writable, or the agent can't reach the
+  host's namespaces, that host just doesn't appear as a deploy target — the
+  same "explain why, don't fail silently" pattern as everything else here.
+
+### AI assistant
 
 ### AI assistant
 
@@ -437,8 +470,20 @@ often than containers, so there's no reason to fetch them every cycle):
   the same way — from each container's own `NetworkSettings.Networks`,
   already present in the list response.
 
-Nothing here writes anything yet; creating, pruning or removing any of these
-is a later phase.
+Each tab's header also has what you'd expect to create one:
+
+- **Pull image** and **Build image** (Images tab). Pulling just needs a
+  repository and tag. Building sends a single Dockerfile as the entire build
+  context — paste it in, optionally tag it, and the daemon's own build output
+  streams back the same way an OS update's does. There's no upload for
+  additional files alongside the Dockerfile; anything a build needs has to
+  come from what the `FROM` image or `RUN` commands can reach on their own.
+- **Create volume** (Volumes tab): a name (optional — Docker generates one)
+  and a driver.
+- **Create network** (Networks tab): name, driver, and an optional
+  subnet/gateway.
+
+Pruning/removing any of these is a later phase — this is add-only for now.
 
 Each host reports its pending OS package updates, ranked so the ones that
 matter are not buried:
@@ -764,6 +809,15 @@ tokens are never returned.
 | GET | `/api/hosts/<name>/images` | that host's images, with tags, size and whether they're dangling |
 | GET | `/api/hosts/<name>/volumes` | that host's volumes, with driver and mountpoint |
 | GET | `/api/hosts/<name>/networks` | that host's networks, with driver and subnet/gateway |
+| POST | `/api/hosts/<name>/images/pull` | pull an image: `{"repository", "reference"}` (202 + job) |
+| POST | `/api/hosts/<name>/images/build` | build from a pasted Dockerfile: `{"dockerfile", "tag"}` (202 + job) |
+| GET | `/api/hosts/<name>/images/job/<id>` | that pull's or build's status and output |
+| POST | `/api/hosts/<name>/volumes` | create a volume: `{"name", "driver", "driver_opts", "labels"}` |
+| POST | `/api/hosts/<name>/networks` | create a network: `{"name", "driver", "internal", "subnet", "gateway"}` |
+| POST | `/api/hosts/<name>/containers/create` | create a container from a form-friendly spec (see below) |
+| GET | `/api/hosts/<name>/containers/<id>/clone-spec` | that container's config, shaped as a create spec, to pre-fill Clone |
+| POST | `/api/hosts/<name>/stacks` | deploy a stack: `{"project", "compose"}` (202 + job) -- refused unless `CUD_STACKS_DIR` is configured |
+| GET | `/api/hosts/<name>/stacks/job/<id>` | that deploy's status and output |
 | POST | `/api/ai/chat` | the assistant: `{"messages", "confirm"?, "pending"?}` → `{"status": "final"\|"needs_confirmation"\|"error", ...}` — refused unless an OpenRouter key is configured |
 | GET | `/api/ai/models` | OpenRouter's model catalog, for the Settings model picker |
 | GET | `/api/settings` | current dashboard-wide preferences |
@@ -784,12 +838,22 @@ tokens are never returned.
 is refused until they do — an unauthenticated dashboard will not hand out
 enrolment tokens to whoever can reach the port.
 
+The container-create spec (used by both `POST .../containers/create` and
+what `GET .../clone-spec` returns) is dashboard-shaped, not Docker's own
+Config/HostConfig JSON: `{"name", "image", "command", "env": [...],
+"ports": [{"container_port", "host_port", "protocol"}], "volumes":
+[{"source", "destination", "mode"}], "restart_policy", "network", "start"}`.
+The agent translates it into a real container-create request server-side.
+
 The agent's own API is `/healthz` (open) plus `/v1/containers`, `/v1/info`,
 `/v1/os`, `POST /v1/os/update`, `POST /v1/os/refresh`, `/v1/os/job/<id>`,
 `POST /v1/containers/<id>/{start,stop,restart,pause,unpause,rename,recreate}`,
 `DELETE /v1/containers/<id>`, `/v1/containers/<id>/logs`,
-`/v1/containers/<id>/logs/history`, `/v1/events` and
-`/v1/containers/<id>/recreate/job/<job_id>` (bearer token).
+`/v1/containers/<id>/logs/history`, `/v1/events`,
+`/v1/containers/<id>/recreate/job/<job_id>`, `/v1/images`, `/v1/volumes`,
+`/v1/networks`, `POST /v1/containers/create`, `/v1/containers/<id>/clone-spec`,
+`POST /v1/images/{pull,build}`, `/v1/images/job/<id>`, `POST /v1/stacks` and
+`/v1/stacks/job/<id>` (bearer token).
 
 ## Security notes
 

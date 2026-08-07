@@ -278,6 +278,7 @@
     el.tabOs.hidden = !summary.os_hosts_reporting && !osHosts(data).length;
     el.tabCompose.hidden = !summary.stacks_total;
     el.search.placeholder = searchPlaceholder(state.tab);
+    updateTabAction();
   }
 
   function selectTab(tab) {
@@ -893,6 +894,472 @@
     return card;
   }
 
+  // ---- creation flows: pull/build image, create volume/network/container,
+  // clone a container, deploy a stack. Every host select below is filtered
+  // to hosts that actually allow it -- capability re-checked server-side
+  // regardless of what this list shows, same as every other write path.
+
+  function eligibleHosts(data, capabilityOf) {
+    return (data.hosts || []).filter(function (host) {
+      if (!host.online) return false;
+      var cap = capabilityOf(host);
+      return !!(cap && (cap.can_manage || cap.can_deploy));
+    });
+  }
+
+  function fillSelect(select, hosts, emptyLabel) {
+    select.innerHTML = "";
+    if (!hosts.length) {
+      var opt = text("option", null, emptyLabel || "No eligible hosts");
+      opt.value = "";
+      opt.disabled = true;
+      opt.selected = true;
+      select.appendChild(opt);
+      return;
+    }
+    hosts.forEach(function (host) {
+      var option = text("option", null, host.label || host.name);
+      option.value = host.name;
+      select.appendChild(option);
+    });
+  }
+
+  function watchJob(url, logEl, onDone) {
+    fetch(url)
+      .then(function (r) { return r.json(); })
+      .then(function (job) {
+        if (job.error) throw new Error(job.error);
+        logEl.textContent = (job.lines || []).join("\n");
+        logEl.scrollTop = logEl.scrollHeight;
+        if (job.status === "running") {
+          setTimeout(function () { watchJob(url, logEl, onDone); }, 1000);
+        } else if (onDone) {
+          onDone(job);
+        }
+      })
+      .catch(function () {
+        setTimeout(function () { watchJob(url, logEl, onDone); }, 2000);
+      });
+  }
+
+  function afterWrite() {
+    fetch("/api/refresh", { method: "POST" }).then(function () { setTimeout(load, 1200); });
+  }
+
+  // -- Pull image --
+
+  function openPullImage() {
+    var hosts = eligibleHosts(state.data, function (h) { return h.container_actions; });
+    fillSelect(el.pullImageHost, hosts);
+    el.pullImageRepo.value = "";
+    el.pullImageTag.value = "";
+    el.pullImageLog.hidden = true;
+    el.pullImageLog.textContent = "";
+    hide(el.pullImageError);
+    el.pullImageSubmit.disabled = false;
+    if (typeof el.pullImageDialog.showModal === "function") el.pullImageDialog.showModal();
+  }
+
+  function submitPullImage(event) {
+    event.preventDefault();
+    var host = el.pullImageHost.value;
+    var repo = el.pullImageRepo.value.trim();
+    var tag = el.pullImageTag.value.trim() || "latest";
+    if (!host || !repo) return;
+    el.pullImageSubmit.disabled = true;
+    hide(el.pullImageError);
+    postJSON("/api/hosts/" + encodeURIComponent(host) + "/images/pull",
+      { repository: repo, reference: tag })
+      .then(function (job) {
+        if (job.error) throw new Error(job.error);
+        el.pullImageLog.hidden = false;
+        watchJob(
+          "/api/hosts/" + encodeURIComponent(host) + "/images/job/" + encodeURIComponent(job.id),
+          el.pullImageLog,
+          function (finalJob) {
+            el.pullImageSubmit.disabled = false;
+            if (finalJob.status === "ok" && state.tab === "images") loadImages(true);
+          }
+        );
+      })
+      .catch(function (err) {
+        el.pullImageSubmit.disabled = false;
+        showError(el.pullImageError, err.message || "Could not start the pull.");
+      });
+  }
+
+  // -- Build image --
+
+  function openBuildImage() {
+    var hosts = eligibleHosts(state.data, function (h) { return h.container_actions; });
+    fillSelect(el.buildImageHost, hosts);
+    el.buildImageTag.value = "";
+    el.buildImageDockerfile.value = "";
+    el.buildImageLog.hidden = true;
+    el.buildImageLog.textContent = "";
+    hide(el.buildImageError);
+    el.buildImageSubmit.disabled = false;
+    if (typeof el.buildImageDialog.showModal === "function") el.buildImageDialog.showModal();
+  }
+
+  function submitBuildImage(event) {
+    event.preventDefault();
+    var host = el.buildImageHost.value;
+    var dockerfile = el.buildImageDockerfile.value;
+    if (!host || !dockerfile.trim()) return;
+    el.buildImageSubmit.disabled = true;
+    hide(el.buildImageError);
+    postJSON("/api/hosts/" + encodeURIComponent(host) + "/images/build",
+      { dockerfile: dockerfile, tag: el.buildImageTag.value.trim() })
+      .then(function (job) {
+        if (job.error) throw new Error(job.error);
+        el.buildImageLog.hidden = false;
+        watchJob(
+          "/api/hosts/" + encodeURIComponent(host) + "/images/job/" + encodeURIComponent(job.id),
+          el.buildImageLog,
+          function (finalJob) {
+            el.buildImageSubmit.disabled = false;
+            if (finalJob.status === "ok" && state.tab === "images") loadImages(true);
+          }
+        );
+      })
+      .catch(function (err) {
+        el.buildImageSubmit.disabled = false;
+        showError(el.buildImageError, err.message || "Could not start the build.");
+      });
+  }
+
+  // -- Create volume --
+
+  function openCreateVolume() {
+    var hosts = eligibleHosts(state.data, function (h) { return h.container_actions; });
+    fillSelect(el.createVolumeHost, hosts);
+    el.createVolumeName.value = "";
+    el.createVolumeDriver.value = "";
+    hide(el.createVolumeError);
+    if (typeof el.createVolumeDialog.showModal === "function") el.createVolumeDialog.showModal();
+  }
+
+  function submitCreateVolume(event) {
+    event.preventDefault();
+    var host = el.createVolumeHost.value;
+    if (!host) return;
+    hide(el.createVolumeError);
+    postJSON("/api/hosts/" + encodeURIComponent(host) + "/volumes", {
+      name: el.createVolumeName.value.trim(),
+      driver: el.createVolumeDriver.value.trim(),
+    })
+      .then(function (result) {
+        if (result.error) throw new Error(result.error);
+        el.createVolumeDialog.close();
+        if (state.tab === "volumes") loadVolumes(true);
+      })
+      .catch(function (err) {
+        showError(el.createVolumeError, err.message || "Could not create the volume.");
+      });
+  }
+
+  // -- Create network --
+
+  function openCreateNetwork() {
+    var hosts = eligibleHosts(state.data, function (h) { return h.container_actions; });
+    fillSelect(el.createNetworkHost, hosts);
+    el.createNetworkName.value = "";
+    el.createNetworkDriver.value = "";
+    el.createNetworkInternal.checked = false;
+    el.createNetworkSubnet.value = "";
+    el.createNetworkGateway.value = "";
+    hide(el.createNetworkError);
+    if (typeof el.createNetworkDialog.showModal === "function") el.createNetworkDialog.showModal();
+  }
+
+  function submitCreateNetwork(event) {
+    event.preventDefault();
+    var host = el.createNetworkHost.value;
+    var name = el.createNetworkName.value.trim();
+    if (!host || !name) return;
+    hide(el.createNetworkError);
+    postJSON("/api/hosts/" + encodeURIComponent(host) + "/networks", {
+      name: name,
+      driver: el.createNetworkDriver.value.trim(),
+      internal: el.createNetworkInternal.checked,
+      subnet: el.createNetworkSubnet.value.trim(),
+      gateway: el.createNetworkGateway.value.trim(),
+    })
+      .then(function (result) {
+        if (result.error) throw new Error(result.error);
+        el.createNetworkDialog.close();
+        if (state.tab === "networks") loadNetworks(true);
+      })
+      .catch(function (err) {
+        showError(el.createNetworkError, err.message || "Could not create the network.");
+      });
+  }
+
+  // -- Create / clone container --
+
+  function specRemoveButton(row) {
+    var remove = text("button", "spec-remove", "×");
+    remove.type = "button";
+    remove.setAttribute("aria-label", "Remove");
+    remove.addEventListener("click", function () { row.remove(); });
+    return remove;
+  }
+
+  function addEnvRow(value) {
+    var row = text("div", "spec-row");
+    var input = document.createElement("input");
+    input.placeholder = "KEY=value";
+    input.value = value || "";
+    row.appendChild(input);
+    row.appendChild(specRemoveButton(row));
+    el.createContainerEnvRows.appendChild(row);
+  }
+
+  function addPortRow(port) {
+    port = port || {};
+    var row = text("div", "spec-row");
+    var containerPort = document.createElement("input");
+    containerPort.placeholder = "container port";
+    containerPort.value = port.container_port || "";
+    var hostPort = document.createElement("input");
+    hostPort.placeholder = "host port (blank = random)";
+    hostPort.value = port.host_port || "";
+    var proto = document.createElement("select");
+    ["tcp", "udp"].forEach(function (p) {
+      var opt = text("option", null, p.toUpperCase());
+      opt.value = p;
+      if ((port.protocol || "tcp") === p) opt.selected = true;
+      proto.appendChild(opt);
+    });
+    row.appendChild(containerPort);
+    row.appendChild(hostPort);
+    row.appendChild(proto);
+    row.appendChild(specRemoveButton(row));
+    el.createContainerPortRows.appendChild(row);
+  }
+
+  function addVolumeRow(vol) {
+    vol = vol || {};
+    var row = text("div", "spec-row");
+    var source = document.createElement("input");
+    source.placeholder = "volume name or host path";
+    source.value = vol.source || "";
+    var destination = document.createElement("input");
+    destination.placeholder = "/path/in/container";
+    destination.value = vol.destination || "";
+    var mode = document.createElement("select");
+    ["rw", "ro"].forEach(function (m) {
+      var opt = text("option", null, m);
+      opt.value = m;
+      if ((vol.mode || "rw") === m) opt.selected = true;
+      mode.appendChild(opt);
+    });
+    row.appendChild(source);
+    row.appendChild(destination);
+    row.appendChild(mode);
+    row.appendChild(specRemoveButton(row));
+    el.createContainerVolumeRows.appendChild(row);
+  }
+
+  function rowInputs(container) {
+    return Array.prototype.slice.call(container.children);
+  }
+
+  function collectEnvRows() {
+    return rowInputs(el.createContainerEnvRows)
+      .map(function (row) { return row.querySelector("input").value.trim(); })
+      .filter(Boolean);
+  }
+
+  function collectPortRows() {
+    return rowInputs(el.createContainerPortRows).map(function (row) {
+      var inputs = row.querySelectorAll("input");
+      return {
+        container_port: inputs[0].value.trim(),
+        host_port: inputs[1].value.trim(),
+        protocol: row.querySelector("select").value,
+      };
+    }).filter(function (p) { return p.container_port; });
+  }
+
+  function collectVolumeRows() {
+    return rowInputs(el.createContainerVolumeRows).map(function (row) {
+      var inputs = row.querySelectorAll("input");
+      return {
+        source: inputs[0].value.trim(),
+        destination: inputs[1].value.trim(),
+        mode: row.querySelector("select").value,
+      };
+    }).filter(function (v) { return v.source && v.destination; });
+  }
+
+  function openCreateContainer(prefill, hostName) {
+    var hosts = eligibleHosts(state.data, function (h) { return h.container_actions; });
+    fillSelect(el.createContainerHost, hosts);
+    if (hostName && hosts.some(function (h) { return h.name === hostName; })) {
+      el.createContainerHost.value = hostName;
+    }
+
+    el.createContainerTitle.textContent = prefill ? "Clone container" : "Create a container";
+    el.createContainerName.value = (prefill && prefill.name) ? prefill.name + "-copy" : "";
+    el.createContainerImage.value = (prefill && prefill.image) || "";
+    var command = prefill && prefill.command;
+    el.createContainerCommand.value = Array.isArray(command) ? command.join(" ") : (command || "");
+
+    el.createContainerEnvRows.innerHTML = "";
+    ((prefill && prefill.env) || []).forEach(addEnvRow);
+    el.createContainerPortRows.innerHTML = "";
+    ((prefill && prefill.ports) || []).forEach(addPortRow);
+    el.createContainerVolumeRows.innerHTML = "";
+    ((prefill && prefill.volumes) || []).forEach(addVolumeRow);
+
+    el.createContainerRestart.value = (prefill && prefill.restart_policy) || "no";
+    el.createContainerNetwork.value = (prefill && prefill.network) || "";
+    el.createContainerStart.checked = true;
+    hide(el.createContainerError);
+    el.createContainerSubmit.disabled = false;
+
+    el.createContainerNetworkList.innerHTML = "";
+    var selectedHost = el.createContainerHost.value;
+    var netEntry = state.networksData && state.networksData.byHost &&
+      state.networksData.byHost[selectedHost];
+    ((netEntry && netEntry.result && netEntry.result.networks) || []).forEach(function (n) {
+      var opt = document.createElement("option");
+      opt.value = n.name;
+      el.createContainerNetworkList.appendChild(opt);
+    });
+
+    if (typeof el.createContainerDialog.showModal === "function") el.createContainerDialog.showModal();
+  }
+
+  function openCloneContainer(host, container) {
+    fetch("/api/hosts/" + encodeURIComponent(host.name) + "/containers/" +
+      encodeURIComponent(container.id) + "/clone-spec")
+      .then(function (r) { return r.json(); })
+      .then(function (spec) {
+        if (spec.error) throw new Error(spec.error);
+        spec.name = container.name;
+        openCreateContainer(spec, host.name);
+      })
+      .catch(function (err) {
+        window.alert(err.message || "Could not read that container's config.");
+      });
+  }
+
+  function submitCreateContainer(event) {
+    event.preventDefault();
+    var host = el.createContainerHost.value;
+    var image = el.createContainerImage.value.trim();
+    if (!host || !image) return;
+    el.createContainerSubmit.disabled = true;
+    hide(el.createContainerError);
+    postJSON("/api/hosts/" + encodeURIComponent(host) + "/containers/create", {
+      name: el.createContainerName.value.trim(),
+      image: image,
+      command: el.createContainerCommand.value.trim(),
+      env: collectEnvRows(),
+      ports: collectPortRows(),
+      volumes: collectVolumeRows(),
+      restart_policy: el.createContainerRestart.value,
+      network: el.createContainerNetwork.value.trim(),
+      start: el.createContainerStart.checked,
+    })
+      .then(function (result) {
+        if (result.error) throw new Error(result.error);
+        el.createContainerDialog.close();
+        afterWrite();
+      })
+      .catch(function (err) {
+        el.createContainerSubmit.disabled = false;
+        showError(el.createContainerError, err.message || "Could not create the container.");
+      });
+  }
+
+  // -- Deploy stack --
+
+  function openDeployStack() {
+    var hosts = eligibleHosts(state.data, function (h) { return h.stack_deploy; });
+    fillSelect(el.deployStackHost, hosts,
+      "No eligible hosts -- see README for CUD_STACKS_DIR");
+    el.deployStackProject.value = "";
+    el.deployStackCompose.value = "";
+    el.deployStackLog.hidden = true;
+    el.deployStackLog.textContent = "";
+    hide(el.deployStackError);
+    el.deployStackSubmit.disabled = false;
+    if (typeof el.deployStackDialog.showModal === "function") el.deployStackDialog.showModal();
+  }
+
+  function submitDeployStack(event) {
+    event.preventDefault();
+    var host = el.deployStackHost.value;
+    var project = el.deployStackProject.value.trim();
+    var compose = el.deployStackCompose.value;
+    if (!host || !project || !compose.trim()) return;
+    confirmDialog(
+      "Deploy this stack?",
+      "Run docker compose up -d for \"" + project + "\" on " + host + "? This can create, " +
+      "recreate or remove containers, networks and volumes to match the file.",
+      { confirmLabel: "Deploy" }
+    ).then(function (ok) {
+      if (!ok) return;
+      el.deployStackSubmit.disabled = true;
+      hide(el.deployStackError);
+      postJSON("/api/hosts/" + encodeURIComponent(host) + "/stacks",
+        { project: project, compose: compose })
+        .then(function (job) {
+          if (job.error) throw new Error(job.error);
+          el.deployStackLog.hidden = false;
+          watchJob(
+            "/api/hosts/" + encodeURIComponent(host) + "/stacks/job/" + encodeURIComponent(job.id),
+            el.deployStackLog,
+            function (finalJob) {
+              el.deployStackSubmit.disabled = false;
+              if (finalJob.status === "ok") afterWrite();
+            }
+          );
+        })
+        .catch(function (err) {
+          el.deployStackSubmit.disabled = false;
+          showError(el.deployStackError, err.message || "Could not start the deploy.");
+        });
+    });
+  }
+
+  // -- per-tab action button --
+
+  function updateTabAction() {
+    el.tabAction.hidden = true;
+    el.tabAction2.hidden = true;
+    el.tabAction.onclick = null;
+    el.tabAction2.onclick = null;
+    if (state.tab === "images") {
+      el.tabAction.hidden = false;
+      el.tabAction.textContent = "Pull image";
+      el.tabAction.onclick = openPullImage;
+      el.tabAction2.hidden = false;
+      el.tabAction2.textContent = "Build image";
+      el.tabAction2.onclick = openBuildImage;
+    } else if (state.tab === "volumes") {
+      el.tabAction.hidden = false;
+      el.tabAction.textContent = "Create volume";
+      el.tabAction.onclick = openCreateVolume;
+    } else if (state.tab === "networks") {
+      el.tabAction.hidden = false;
+      el.tabAction.textContent = "Create network";
+      el.tabAction.onclick = openCreateNetwork;
+    } else if (state.tab === "containers") {
+      el.tabAction.hidden = false;
+      el.tabAction.textContent = "Create container";
+      el.tabAction.onclick = function () { openCreateContainer(null, state.host || null); };
+    } else if (state.tab === "compose") {
+      el.tabAction.hidden = false;
+      el.tabAction.textContent = "Deploy stack";
+      el.tabAction.onclick = openDeployStack;
+    }
+  }
+
   function pickedFor(host) {
     return Object.keys(state.picked).filter(function (key) {
       return state.picked[key] && key.indexOf(host.name + "/") === 0;
@@ -1169,6 +1636,11 @@
       });
       manage.appendChild(removeBtn);
     }
+    var cloneBtn = text("button", "button small");
+    cloneBtn.type = "button";
+    cloneBtn.textContent = "Clone";
+    cloneBtn.addEventListener("click", function () { openCloneContainer(host, container); });
+    manage.appendChild(cloneBtn);
     bar.appendChild(manage);
 
     if (job && job.status && job.status !== "running") {
@@ -2687,6 +3159,79 @@
       tabContainersCount: $("tab-containers-count"),
       tabOsCount: $("tab-os-count"),
       tabComposeCount: $("tab-compose-count"),
+      tabAction: $("tab-action"),
+      tabAction2: $("tab-action-2"),
+
+      pullImageDialog: $("pull-image-dialog"),
+      pullImageForm: $("pull-image-form"),
+      pullImageHost: $("pull-image-host"),
+      pullImageRepo: $("pull-image-repo"),
+      pullImageTag: $("pull-image-tag"),
+      pullImageLog: $("pull-image-log"),
+      pullImageError: $("pull-image-error"),
+      pullImageSubmit: $("pull-image-submit"),
+      pullImageCancel: $("pull-image-cancel"),
+
+      buildImageDialog: $("build-image-dialog"),
+      buildImageForm: $("build-image-form"),
+      buildImageHost: $("build-image-host"),
+      buildImageTag: $("build-image-tag"),
+      buildImageDockerfile: $("build-image-dockerfile"),
+      buildImageLog: $("build-image-log"),
+      buildImageError: $("build-image-error"),
+      buildImageSubmit: $("build-image-submit"),
+      buildImageCancel: $("build-image-cancel"),
+
+      createVolumeDialog: $("create-volume-dialog"),
+      createVolumeForm: $("create-volume-form"),
+      createVolumeHost: $("create-volume-host"),
+      createVolumeName: $("create-volume-name"),
+      createVolumeDriver: $("create-volume-driver"),
+      createVolumeError: $("create-volume-error"),
+      createVolumeCancel: $("create-volume-cancel"),
+
+      createNetworkDialog: $("create-network-dialog"),
+      createNetworkForm: $("create-network-form"),
+      createNetworkHost: $("create-network-host"),
+      createNetworkName: $("create-network-name"),
+      createNetworkDriver: $("create-network-driver"),
+      createNetworkInternal: $("create-network-internal"),
+      createNetworkSubnet: $("create-network-subnet"),
+      createNetworkGateway: $("create-network-gateway"),
+      createNetworkError: $("create-network-error"),
+      createNetworkCancel: $("create-network-cancel"),
+
+      createContainerDialog: $("create-container-dialog"),
+      createContainerForm: $("create-container-form"),
+      createContainerTitle: $("create-container-title"),
+      createContainerHost: $("create-container-host"),
+      createContainerName: $("create-container-name"),
+      createContainerImage: $("create-container-image"),
+      createContainerCommand: $("create-container-command"),
+      createContainerEnvRows: $("create-container-env-rows"),
+      createContainerEnvAdd: $("create-container-env-add"),
+      createContainerPortRows: $("create-container-port-rows"),
+      createContainerPortAdd: $("create-container-port-add"),
+      createContainerVolumeRows: $("create-container-volume-rows"),
+      createContainerVolumeAdd: $("create-container-volume-add"),
+      createContainerRestart: $("create-container-restart"),
+      createContainerNetwork: $("create-container-network"),
+      createContainerNetworkList: $("create-container-network-list"),
+      createContainerStart: $("create-container-start"),
+      createContainerError: $("create-container-error"),
+      createContainerSubmit: $("create-container-submit"),
+      createContainerCancel: $("create-container-cancel"),
+
+      deployStackDialog: $("deploy-stack-dialog"),
+      deployStackForm: $("deploy-stack-form"),
+      deployStackHost: $("deploy-stack-host"),
+      deployStackProject: $("deploy-stack-project"),
+      deployStackCompose: $("deploy-stack-compose"),
+      deployStackLog: $("deploy-stack-log"),
+      deployStackError: $("deploy-stack-error"),
+      deployStackSubmit: $("deploy-stack-submit"),
+      deployStackCancel: $("deploy-stack-cancel"),
+
       setupDialog: $("setup-dialog"),
       setupForm: $("setup-form"),
       setupUsername: $("setup-username"),
@@ -2767,6 +3312,23 @@
     el.tabImages.addEventListener("click", function () { selectTab("images"); });
     el.tabVolumes.addEventListener("click", function () { selectTab("volumes"); });
     el.tabNetworks.addEventListener("click", function () { selectTab("networks"); });
+
+    el.pullImageForm.addEventListener("submit", submitPullImage);
+    el.pullImageCancel.addEventListener("click", function () { el.pullImageDialog.close(); });
+    el.buildImageForm.addEventListener("submit", submitBuildImage);
+    el.buildImageCancel.addEventListener("click", function () { el.buildImageDialog.close(); });
+    el.createVolumeForm.addEventListener("submit", submitCreateVolume);
+    el.createVolumeCancel.addEventListener("click", function () { el.createVolumeDialog.close(); });
+    el.createNetworkForm.addEventListener("submit", submitCreateNetwork);
+    el.createNetworkCancel.addEventListener("click", function () { el.createNetworkDialog.close(); });
+    el.createContainerForm.addEventListener("submit", submitCreateContainer);
+    el.createContainerCancel.addEventListener("click", function () { el.createContainerDialog.close(); });
+    el.createContainerEnvAdd.addEventListener("click", function () { addEnvRow(); });
+    el.createContainerPortAdd.addEventListener("click", function () { addPortRow(); });
+    el.createContainerVolumeAdd.addEventListener("click", function () { addVolumeRow(); });
+    el.deployStackForm.addEventListener("submit", submitDeployStack);
+    el.deployStackCancel.addEventListener("click", function () { el.deployStackDialog.close(); });
+
     el.setupForm.addEventListener("submit", submitSetup);
     el.hostForm.addEventListener("submit", submitHost);
     el.hostCancel.addEventListener("click", function () { el.hostDialog.close(); });

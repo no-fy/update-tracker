@@ -411,6 +411,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 collector.host_networks)
             return
 
+        if path.startswith("/api/hosts/") and "/containers/" in path and path.endswith("/clone-spec"):
+            self._handle_container_clone_spec(path)
+            return
+
+        if path.startswith("/api/hosts/") and "/images/job/" in path:
+            self._handle_image_job(path)
+            return
+
+        if path.startswith("/api/hosts/") and "/stacks/job/" in path:
+            self._handle_stack_job(path)
+            return
+
         if path.startswith("/api/hosts/") and "/containers/" in path and path.endswith("/logs/history"):
             self._handle_container_logs_history(path)
             return
@@ -507,6 +519,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path.startswith("/api/hosts/") and path.endswith("/os/refresh"):
             self._handle_os_refresh(
                 urllib.parse.unquote(path[len("/api/hosts/"):-len("/os/refresh")]))
+            return
+
+        if path.startswith("/api/hosts/") and path.endswith("/containers/create"):
+            self._handle_container_create(
+                urllib.parse.unquote(path[len("/api/hosts/"):-len("/containers/create")]))
+            return
+
+        if path.startswith("/api/hosts/") and path.endswith("/volumes"):
+            self._handle_create_volume(
+                urllib.parse.unquote(path[len("/api/hosts/"):-len("/volumes")]))
+            return
+
+        if path.startswith("/api/hosts/") and path.endswith("/networks"):
+            self._handle_create_network(
+                urllib.parse.unquote(path[len("/api/hosts/"):-len("/networks")]))
+            return
+
+        if path.startswith("/api/hosts/") and path.endswith("/images/pull"):
+            self._handle_image_pull(
+                urllib.parse.unquote(path[len("/api/hosts/"):-len("/images/pull")]))
+            return
+
+        if path.startswith("/api/hosts/") and path.endswith("/images/build"):
+            self._handle_image_build(
+                urllib.parse.unquote(path[len("/api/hosts/"):-len("/images/build")]))
+            return
+
+        if path.startswith("/api/hosts/") and path.endswith("/stacks"):
+            self._handle_stack_deploy(
+                urllib.parse.unquote(path[len("/api/hosts/"):-len("/stacks")]))
             return
 
         if path.startswith("/api/hosts/") and "/containers/" in path:
@@ -745,6 +787,175 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
             return
         self._json(200, result)
+
+    def _handle_container_clone_spec(self, path):
+        name, container_id = self._split_container_path(path, "/clone-spec")
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+        try:
+            result = collector.container_clone_spec(host, container_id)
+        except collector.ContainerActionRefused as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self._json(200, result)
+
+    def _handle_container_create(self, name):
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+        body = self._read_body()
+        start = bool(body.pop("start", True)) if isinstance(body, dict) else True
+        try:
+            result = collector.create_container(host, body, start=start)
+        except collector.ContainerActionRefused as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")
+            try:
+                self._json(exc.code, json.loads(detail))
+            except ValueError:
+                self._json(exc.code, {"error": detail[:300] or "agent refused"})
+            return
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self.server.poller.refresh_async()
+        self._json(201, result)
+
+    def _handle_create_volume(self, name):
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+        try:
+            result = collector.create_volume(host, self._read_body())
+        except collector.ContainerActionRefused as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self._json(201, result)
+
+    def _handle_create_network(self, name):
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+        try:
+            result = collector.create_network(host, self._read_body())
+        except collector.ContainerActionRefused as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self._json(201, result)
+
+    def _handle_image_pull(self, name):
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+        body = self._read_body()
+        repository = (body.get("repository") or "").strip()
+        reference = (body.get("reference") or "latest").strip()
+        if not repository:
+            self._json(400, {"error": "An image repository is required."})
+            return
+        try:
+            job = collector.pull_image(host, repository, reference)
+        except collector.ContainerActionRefused as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self._json(202, job)
+
+    def _handle_image_build(self, name):
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+        body = self._read_body()
+        try:
+            job = collector.build_image(
+                host, body.get("dockerfile") or "", tag=(body.get("tag") or "").strip() or None)
+        except collector.ContainerActionRefused as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self._json(202, job)
+
+    def _handle_image_job(self, path):
+        rest = path[len("/api/hosts/"):]
+        name, _, tail = rest.partition("/images/job/")
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, urllib.parse.unquote(name))
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+        try:
+            job = collector.image_job(host, urllib.parse.unquote(tail))
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        if job is None:
+            self._json(404, {"error": "no such job"})
+            return
+        self._json(200, job)
+
+    def _handle_stack_deploy(self, name):
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+        body = self._read_body()
+        try:
+            job = collector.deploy_stack(host, body.get("project"), body.get("compose"))
+        except collector.ContainerActionRefused as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self.server.poller.refresh_async()
+        self._json(202, job)
+
+    def _handle_stack_job(self, path):
+        rest = path[len("/api/hosts/"):]
+        name, _, tail = rest.partition("/stacks/job/")
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, urllib.parse.unquote(name))
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+        try:
+            job = collector.stack_job(host, urllib.parse.unquote(tail))
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        if job is None:
+            self._json(404, {"error": "no such job"})
+            return
+        self._json(200, job)
 
     def _handle_container_rename(self, path):
         name, container_id = self._split_container_path(path, "/rename")
