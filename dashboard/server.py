@@ -423,6 +423,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_stack_job(path)
             return
 
+        if path.startswith("/api/hosts/") and path.endswith("/stacks/file"):
+            self._handle_stack_file_read(
+                urllib.parse.unquote(path[len("/api/hosts/"):-len("/stacks/file")]))
+            return
+
+        if path == "/api/stack-templates":
+            self._handle_list_stack_templates()
+            return
+
         if path.startswith("/api/hosts/") and "/containers/" in path and path.endswith("/logs/history"):
             self._handle_container_logs_history(path)
             return
@@ -549,6 +558,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path.startswith("/api/hosts/") and path.endswith("/stacks"):
             self._handle_stack_deploy(
                 urllib.parse.unquote(path[len("/api/hosts/"):-len("/stacks")]))
+            return
+
+        if path.startswith("/api/hosts/") and path.endswith("/stacks/redeploy"):
+            self._handle_stack_redeploy(
+                urllib.parse.unquote(path[len("/api/hosts/"):-len("/stacks/redeploy")]))
+            return
+
+        if path.startswith("/api/hosts/") and path.endswith("/stacks/validate"):
+            self._handle_stack_validate(
+                urllib.parse.unquote(path[len("/api/hosts/"):-len("/stacks/validate")]))
+            return
+
+        if path.startswith("/api/hosts/") and path.endswith("/stacks/file"):
+            self._handle_stack_file_write(
+                urllib.parse.unquote(path[len("/api/hosts/"):-len("/stacks/file")]))
+            return
+
+        if path == "/api/stack-templates":
+            self._handle_save_stack_template()
             return
 
         if path.startswith("/api/hosts/") and "/containers/" in path:
@@ -939,6 +967,95 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.server.poller.refresh_async()
         self._json(202, job)
 
+    def _handle_stack_redeploy(self, name):
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+        body = self._read_body()
+        try:
+            job = collector.redeploy_stack(host, body.get("project"), body.get("path"))
+        except collector.ContainerActionRefused as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self.server.poller.refresh_async()
+        self._json(202, job)
+
+    def _handle_stack_validate(self, name):
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+        body = self._read_body()
+        try:
+            result = collector.validate_stack(host, body.get("project"), body.get("compose"))
+        except collector.ContainerActionRefused as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self._json(200, result)
+
+    def _handle_stack_file_read(self, name):
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        path = (query.get("path") or [""])[0]
+        try:
+            result = collector.read_stack_file(host, path)
+        except collector.ContainerActionRefused as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self._json(200, result)
+
+    def _handle_stack_file_write(self, name):
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+        body = self._read_body()
+        try:
+            result = collector.write_stack_file(host, body.get("path"), body.get("content") or "")
+        except collector.ContainerActionRefused as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self._json(200, result)
+
+    def _handle_list_stack_templates(self):
+        config, _ = self.server.load_config()
+        self._json(200, {"templates": config.get("stack_templates", [])})
+
+    def _handle_save_stack_template(self):
+        body = self._read_body()
+        name = (body.get("name") or "").strip()
+        compose = body.get("compose") or ""
+        if not name:
+            self._json(400, {"error": "A template name is required."})
+            return
+        if not compose.strip():
+            self._json(400, {"error": "A compose file is required."})
+            return
+        config, config_path = self.server.load_config()
+        entry = config_mod.upsert_stack_template(config, name, compose)
+        config_mod.save_config(config, config_path)
+        self._json(200, entry)
+
     def _handle_stack_job(self, path):
         rest = path[len("/api/hosts/"):]
         name, _, tail = rest.partition("/stacks/job/")
@@ -1191,6 +1308,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             item_id = urllib.parse.unquote(path[len("/api/enrollments/"):])
             removed = self.server.enrollments.delete(item_id)
             self._json(200 if removed else 404, {"removed": removed, "id": item_id})
+            return
+
+        if path.startswith("/api/stack-templates/"):
+            name = urllib.parse.unquote(path[len("/api/stack-templates/"):])
+            config, config_path = self.server.load_config()
+            removed = config_mod.remove_stack_template(config, name)
+            if not removed:
+                self._json(404, {"error": "no such template: %s" % name})
+                return
+            config_mod.save_config(config, config_path)
+            self._json(200, {"removed": removed})
             return
 
         if path.startswith("/api/hosts/") and "/containers/" in path:

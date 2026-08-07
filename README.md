@@ -334,9 +334,7 @@ agent change needed, that label was already collected per-container. Each
 stack shows how many of its services are running and a rolled-up status
 (the worst status among its services — an update available on any one
 service surfaces at the stack level too), and expands to the same per-service
-detail the Containers tab shows. Starting, stopping or redeploying an
-*existing* stack as a unit is still a later phase — what exists today is
-deploying one.
+detail the Containers tab shows.
 
 **Deploy stack** runs the host's own `docker compose up -d` against a file
 you paste in, rather than this project reimplementing compose's YAML
@@ -359,8 +357,30 @@ default:
 - If `CUD_STACKS_DIR` isn't set, isn't writable, or the agent can't reach the
   host's namespaces, that host just doesn't appear as a deploy target — the
   same "explain why, don't fail silently" pattern as everything else here.
+- **Validate** (in the same dialog) asks the host's real `docker compose
+  config` to resolve the file — the same YAML parser and interpolation an
+  actual deploy would use, so a syntax error or an undefined `${VAR}` is
+  caught before anything runs, not guessed at by a hand-rolled checker. It
+  also cross-checks the ports the file would publish against containers
+  already running on that host, flagging conflicts.
+- **Templates** save a compose file under a name in `config.json`, for
+  reuse across deploys — small and textual, so it lives alongside the rest
+  of the dashboard's settings rather than needing anything else.
 
-### AI assistant
+**Redeploy** (per stack, once it exists) pulls current images and re-runs
+`docker compose up -d` against that stack's own compose file — and this
+one works for *any* stack the dashboard can see, not just ones deployed
+through it. The reason: redeploying runs `docker compose -f <path>` via
+the host's own namespaces directly, using the path Docker Compose already
+recorded in the container's own labels — it never needs to read or write
+that file from this container's side at all, so `CUD_STACKS_DIR` plays no
+part here, only the same `--pid=host --privileged` access OS updates need.
+
+**View/Edit** opens that same compose file. Reading works for any stack
+(the same read-only host view OS updates already use to read package
+databases). Saving only works if the file lives under `CUD_STACKS_DIR` —
+a stack deployed some other way is view-only, with a clear reason if you
+try to save anyway, rather than silently failing.
 
 ### AI assistant
 
@@ -817,7 +837,14 @@ tokens are never returned.
 | POST | `/api/hosts/<name>/containers/create` | create a container from a form-friendly spec (see below) |
 | GET | `/api/hosts/<name>/containers/<id>/clone-spec` | that container's config, shaped as a create spec, to pre-fill Clone |
 | POST | `/api/hosts/<name>/stacks` | deploy a stack: `{"project", "compose"}` (202 + job) -- refused unless `CUD_STACKS_DIR` is configured |
-| GET | `/api/hosts/<name>/stacks/job/<id>` | that deploy's status and output |
+| POST | `/api/hosts/<name>/stacks/redeploy` | pull + `up -d` an existing stack: `{"project", "path"}` (202 + job) -- works for any stack, not just ones deployed here |
+| POST | `/api/hosts/<name>/stacks/validate` | resolve a compose file via the host's real `docker compose config`: `{"project", "compose"}` → `{"valid", "errors", "ports"}` |
+| GET | `/api/hosts/<name>/stacks/file?path=` | read a compose file (any stack, via the read-only host view) |
+| POST | `/api/hosts/<name>/stacks/file` | write a compose file: `{"path", "content"}` -- refused unless `path` is under `CUD_STACKS_DIR` |
+| GET | `/api/hosts/<name>/stacks/job/<id>` | that deploy's or redeploy's status and output |
+| GET | `/api/stack-templates` | saved compose templates |
+| POST | `/api/stack-templates` | save one: `{"name", "compose"}` |
+| DELETE | `/api/stack-templates/<name>` | remove one |
 | POST | `/api/ai/chat` | the assistant: `{"messages", "confirm"?, "pending"?}` → `{"status": "final"\|"needs_confirmation"\|"error", ...}` — refused unless an OpenRouter key is configured |
 | GET | `/api/ai/models` | OpenRouter's model catalog, for the Settings model picker |
 | GET | `/api/settings` | current dashboard-wide preferences |
@@ -852,8 +879,9 @@ The agent's own API is `/healthz` (open) plus `/v1/containers`, `/v1/info`,
 `/v1/containers/<id>/logs/history`, `/v1/events`,
 `/v1/containers/<id>/recreate/job/<job_id>`, `/v1/images`, `/v1/volumes`,
 `/v1/networks`, `POST /v1/containers/create`, `/v1/containers/<id>/clone-spec`,
-`POST /v1/images/{pull,build}`, `/v1/images/job/<id>`, `POST /v1/stacks` and
-`/v1/stacks/job/<id>` (bearer token).
+`POST /v1/images/{pull,build}`, `/v1/images/job/<id>`,
+`POST /v1/stacks{,/redeploy,/validate}`, `/v1/stacks/job/<id>` and
+`/v1/stacks/file` (GET to read, POST to write; bearer token).
 
 ## Security notes
 

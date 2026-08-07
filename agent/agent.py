@@ -551,6 +551,7 @@ def collect_snapshot(client, include_stopped=True):
         "log_history": _logstore().capability(),
         "event_history": _eventstore().capability(),
         "stack_deploy": _stackctl().capability(),
+        "stack_redeploy": _stackctl().redeploy_capability(),
     }
 
 
@@ -734,6 +735,15 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     self._send(404, {"error": "no such job"})
                 else:
                     self._send(200, job.snapshot())
+            elif path == "/v1/stacks/file":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                file_path = (query.get("path") or [""])[0]
+                try:
+                    content = _stackctl().read_compose_file(file_path)
+                except _containerctl().ActionError as exc:
+                    self._send(400, {"error": str(exc)})
+                    return
+                self._send(200, {"path": file_path, "content": content})
             else:
                 self._send(404, {"error": "no such endpoint", "path": path})
         except DockerError as exc:
@@ -832,6 +842,33 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._send(400, {"error": str(exc)})
                 return
             self._send(202, job.snapshot())
+            return
+
+        if path == "/v1/stacks/redeploy":
+            try:
+                job = _stackctl().RUNNER.start_redeploy(body.get("project"), body.get("path"))
+            except _containerctl().ActionError as exc:
+                self._send(400, {"error": str(exc)})
+                return
+            self._send(202, job.snapshot())
+            return
+
+        if path == "/v1/stacks/validate":
+            try:
+                result = _stackctl().validate(body.get("project"), body.get("compose"))
+            except _containerctl().ActionError as exc:
+                self._send(400, {"error": str(exc)})
+                return
+            self._send(200, result)
+            return
+
+        if path == "/v1/stacks/file":
+            try:
+                _stackctl().write_compose_file(body.get("path"), body.get("content") or "")
+            except _containerctl().ActionError as exc:
+                self._send(400, {"error": str(exc)})
+                return
+            self._send(200, {"ok": True})
             return
 
         if path.startswith("/v1/containers/"):

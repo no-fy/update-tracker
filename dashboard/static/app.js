@@ -31,7 +31,7 @@
     networksQuery: "", networksData: null,                   // networks tab
     host: "", open: {}, picked: {}, osJobs: {}, canAddHosts: false,
     containerJobs: {}, logsOpen: {}, logs: {}, renaming: {}, settings: {}, logsRange: {},
-    stackOpen: {},
+    stackOpen: {}, stackTemplates: [], stackFileContext: null,
     assistant: { open: false, wire: [], display: [], loading: false, error: null }
   };
   var el = {};
@@ -496,7 +496,7 @@
     var table = document.createElement("table");
     var thead = document.createElement("thead");
     var headRow = document.createElement("tr");
-    [["Stack", ""], ["Services", ""], ["Status", ""]].forEach(function (column) {
+    [["Stack", ""], ["Services", ""], ["Status", ""], ["Actions", ""]].forEach(function (column) {
       headRow.appendChild(text("th", column[1], column[0]));
     });
     thead.appendChild(headRow);
@@ -528,9 +528,30 @@
     status.appendChild(badge(stack.update_status));
     row.appendChild(status);
 
+    var actionsCell = text("td", "c-actions");
+    actionsCell.addEventListener("click", function (event) { event.stopPropagation(); });
+    if (stackConfigPath(stack)) {
+      var redeployBtn = text("button", "button small");
+      redeployBtn.type = "button";
+      redeployBtn.textContent = "Redeploy";
+      redeployBtn.disabled = !(host.stack_redeploy && host.stack_redeploy.can_redeploy);
+      redeployBtn.title = redeployBtn.disabled
+        ? ((host.stack_redeploy && host.stack_redeploy.reason) || "Not available on this host.")
+        : "";
+      redeployBtn.addEventListener("click", function () { runRedeployStack(host, stack); });
+      actionsCell.appendChild(redeployBtn);
+
+      var viewBtn = text("button", "button small");
+      viewBtn.type = "button";
+      viewBtn.textContent = "View/Edit";
+      viewBtn.addEventListener("click", function () { openStackFile(host, stack); });
+      actionsCell.appendChild(viewBtn);
+    }
+    row.appendChild(actionsCell);
+
     var detail = text("tr", "detail");
     var cell = document.createElement("td");
-    cell.colSpan = 3;
+    cell.colSpan = 4;
     var body = text("div", "detail-body");
     var serviceTable = text("table", "stack-services");
     var serviceHead = document.createElement("tr");
@@ -929,8 +950,10 @@
       .then(function (r) { return r.json(); })
       .then(function (job) {
         if (job.error) throw new Error(job.error);
-        logEl.textContent = (job.lines || []).join("\n");
-        logEl.scrollTop = logEl.scrollHeight;
+        if (logEl) {
+          logEl.textContent = (job.lines || []).join("\n");
+          logEl.scrollTop = logEl.scrollHeight;
+        }
         if (job.status === "running") {
           setTimeout(function () { watchJob(url, logEl, onDone); }, 1000);
         } else if (onDone) {
@@ -1278,17 +1301,120 @@
 
   // -- Deploy stack --
 
+  function loadStackTemplates() {
+    return fetch("/api/stack-templates")
+      .then(function (r) { return r.json(); })
+      .then(function (result) {
+        state.stackTemplates = (result && result.templates) || [];
+        el.deployStackTemplatePicker.innerHTML = "";
+        var blank = text("option", null, "Start from scratch");
+        blank.value = "";
+        el.deployStackTemplatePicker.appendChild(blank);
+        state.stackTemplates.forEach(function (tpl) {
+          var opt = text("option", null, tpl.name);
+          opt.value = tpl.name;
+          el.deployStackTemplatePicker.appendChild(opt);
+        });
+      })
+      .catch(function () {});
+  }
+
   function openDeployStack() {
     var hosts = eligibleHosts(state.data, function (h) { return h.stack_deploy; });
     fillSelect(el.deployStackHost, hosts,
       "No eligible hosts -- see README for CUD_STACKS_DIR");
     el.deployStackProject.value = "";
     el.deployStackCompose.value = "";
+    el.deployStackTemplatePicker.value = "";
     el.deployStackLog.hidden = true;
     el.deployStackLog.textContent = "";
+    el.deployStackValidation.hidden = true;
+    el.deployStackValidation.textContent = "";
     hide(el.deployStackError);
     el.deployStackSubmit.disabled = false;
+    loadStackTemplates();
     if (typeof el.deployStackDialog.showModal === "function") el.deployStackDialog.showModal();
+  }
+
+  function applyStackTemplate() {
+    var name = el.deployStackTemplatePicker.value;
+    if (!name) return;
+    var tpl = state.stackTemplates.filter(function (t) { return t.name === name; })[0];
+    if (tpl) el.deployStackCompose.value = tpl.compose;
+  }
+
+  function saveStackTemplate() {
+    var compose = el.deployStackCompose.value;
+    if (!compose.trim()) {
+      showError(el.deployStackError, "Write a compose file before saving it as a template.");
+      return;
+    }
+    var name = window.prompt("Template name:", el.deployStackProject.value.trim());
+    if (!name) return;
+    postJSON("/api/stack-templates", { name: name.trim(), compose: compose })
+      .then(function (result) {
+        if (result.error) throw new Error(result.error);
+        return loadStackTemplates();
+      })
+      .then(function () { el.deployStackTemplatePicker.value = name.trim(); })
+      .catch(function (err) {
+        showError(el.deployStackError, err.message || "Could not save that template.");
+      });
+  }
+
+  function boundHostPorts(hostName) {
+    var host = (state.data.hosts || []).filter(function (h) { return h.name === hostName; })[0];
+    var ports = {};
+    ((host && host.containers) || []).forEach(function (c) {
+      (c.ports || []).forEach(function (p) {
+        var match = /:(\d+)->/.exec(p);
+        if (match) ports[match[1]] = c.name;
+      });
+    });
+    return ports;
+  }
+
+  function runValidateStack() {
+    var host = el.deployStackHost.value;
+    var project = el.deployStackProject.value.trim() || "validate";
+    var compose = el.deployStackCompose.value;
+    if (!host || !compose.trim()) return;
+    el.deployStackValidate.disabled = true;
+    el.deployStackValidation.hidden = false;
+    el.deployStackValidation.textContent = "Validating…";
+    hide(el.deployStackError);
+    postJSON("/api/hosts/" + encodeURIComponent(host) + "/stacks/validate",
+      { project: project, compose: compose })
+      .then(function (result) {
+        el.deployStackValidate.disabled = false;
+        if (result.error) throw new Error(result.error);
+        if (!result.valid) {
+          el.deployStackValidation.className = "dialog-note dialog-error-note";
+          el.deployStackValidation.textContent = "Not valid:\n" + (result.errors || []).join("\n");
+          return;
+        }
+        var bound = boundHostPorts(host);
+        var conflicts = (result.ports || []).filter(function (p) { return bound[p.host_port]; });
+        var lines = ["Valid."];
+        if (result.warning) lines.push(result.warning);
+        if (conflicts.length) {
+          lines.push("Port conflicts with running containers:");
+          conflicts.forEach(function (p) {
+            lines.push("  " + p.host_port + " -> " + p.service + " also used by " + bound[p.host_port]);
+          });
+        } else if (result.ports && result.ports.length) {
+          lines.push("Ports: " + result.ports.map(function (p) {
+            return p.host_port + "->" + p.container_port + "/" + p.protocol + " (" + p.service + ")";
+          }).join(", "));
+        }
+        el.deployStackValidation.className = "dialog-note";
+        el.deployStackValidation.textContent = lines.join("\n");
+      })
+      .catch(function (err) {
+        el.deployStackValidate.disabled = false;
+        el.deployStackValidation.hidden = true;
+        showError(el.deployStackError, err.message || "Could not validate.");
+      });
   }
 
   function submitDeployStack(event) {
@@ -1323,6 +1449,113 @@
         .catch(function (err) {
           el.deployStackSubmit.disabled = false;
           showError(el.deployStackError, err.message || "Could not start the deploy.");
+        });
+    });
+  }
+
+  // -- Redeploy / view / edit an existing stack's compose file --
+
+  function stackConfigPath(stack) {
+    var raw = (stack.config_files || "").split(",")[0];
+    return raw ? raw.trim() : "";
+  }
+
+  function runRedeployStack(host, stack) {
+    var path = stackConfigPath(stack);
+    if (!path) {
+      window.alert("This stack has no known compose file path to redeploy from.");
+      return;
+    }
+    confirmDialog(
+      "Redeploy this stack?",
+      "Pull the latest images and run docker compose up -d for \"" + stack.project +
+      "\" on " + (host.label || host.name) + "?",
+      { confirmLabel: "Redeploy" }
+    ).then(function (ok) {
+      if (!ok) return;
+      postJSON("/api/hosts/" + encodeURIComponent(host.name) + "/stacks/redeploy",
+        { project: stack.project, path: path })
+        .then(function (job) {
+          if (job.error) throw new Error(job.error);
+          watchJob(
+            "/api/hosts/" + encodeURIComponent(host.name) + "/stacks/job/" +
+              encodeURIComponent(job.id),
+            null,
+            function (finalJob) { if (finalJob.status === "ok") afterWrite(); }
+          );
+        })
+        .catch(function (err) {
+          window.alert(err.message || "Could not start the redeploy.");
+        });
+    });
+  }
+
+  function openStackFile(host, stack) {
+    var path = stackConfigPath(stack);
+    if (!path) {
+      window.alert("This stack has no known compose file path.");
+      return;
+    }
+    state.stackFileContext = { host: host, stack: stack, path: path };
+    el.stackFilePath.textContent = path + " on " + (host.label || host.name);
+    el.stackFileContent.value = "Loading…";
+    el.stackFileLog.hidden = true;
+    el.stackFileLog.textContent = "";
+    hide(el.stackFileError);
+    if (typeof el.stackFileDialog.showModal === "function") el.stackFileDialog.showModal();
+    fetch("/api/hosts/" + encodeURIComponent(host.name) + "/stacks/file?path=" +
+      encodeURIComponent(path))
+      .then(function (r) { return r.json(); })
+      .then(function (result) {
+        if (result.error) throw new Error(result.error);
+        el.stackFileContent.value = result.content || "";
+      })
+      .catch(function (err) {
+        el.stackFileContent.value = "";
+        showError(el.stackFileError, err.message || "Could not read that file.");
+      });
+  }
+
+  function saveStackFile() {
+    var ctx = state.stackFileContext;
+    if (!ctx) return;
+    hide(el.stackFileError);
+    postJSON("/api/hosts/" + encodeURIComponent(ctx.host.name) + "/stacks/file",
+      { path: ctx.path, content: el.stackFileContent.value })
+      .then(function (result) {
+        if (result.error) throw new Error(result.error);
+        el.stackFileDialog.close();
+      })
+      .catch(function (err) {
+        showError(el.stackFileError, err.message || "Could not save that file.");
+      });
+  }
+
+  function redeployFromFileDialog() {
+    var ctx = state.stackFileContext;
+    if (!ctx) return;
+    confirmDialog(
+      "Redeploy this stack?",
+      "Pull the latest images and run docker compose up -d for \"" + ctx.stack.project +
+      "\" on " + (ctx.host.label || ctx.host.name) + "?",
+      { confirmLabel: "Redeploy" }
+    ).then(function (ok) {
+      if (!ok) return;
+      hide(el.stackFileError);
+      postJSON("/api/hosts/" + encodeURIComponent(ctx.host.name) + "/stacks/redeploy",
+        { project: ctx.stack.project, path: ctx.path })
+        .then(function (job) {
+          if (job.error) throw new Error(job.error);
+          el.stackFileLog.hidden = false;
+          watchJob(
+            "/api/hosts/" + encodeURIComponent(ctx.host.name) + "/stacks/job/" +
+              encodeURIComponent(job.id),
+            el.stackFileLog,
+            function (finalJob) { if (finalJob.status === "ok") afterWrite(); }
+          );
+        })
+        .catch(function (err) {
+          showError(el.stackFileError, err.message || "Could not start the redeploy.");
         });
     });
   }
@@ -3227,10 +3460,24 @@
       deployStackHost: $("deploy-stack-host"),
       deployStackProject: $("deploy-stack-project"),
       deployStackCompose: $("deploy-stack-compose"),
+      deployStackTemplatePicker: $("deploy-stack-template-picker"),
+      deployStackSaveTemplate: $("deploy-stack-save-template"),
+      deployStackValidation: $("deploy-stack-validation"),
+      deployStackValidate: $("deploy-stack-validate"),
       deployStackLog: $("deploy-stack-log"),
       deployStackError: $("deploy-stack-error"),
       deployStackSubmit: $("deploy-stack-submit"),
       deployStackCancel: $("deploy-stack-cancel"),
+
+      stackFileDialog: $("stack-file-dialog"),
+      stackFileForm: $("stack-file-form"),
+      stackFilePath: $("stack-file-path"),
+      stackFileContent: $("stack-file-content"),
+      stackFileLog: $("stack-file-log"),
+      stackFileError: $("stack-file-error"),
+      stackFileCancel: $("stack-file-cancel"),
+      stackFileRedeploy: $("stack-file-redeploy"),
+      stackFileSave: $("stack-file-save"),
 
       setupDialog: $("setup-dialog"),
       setupForm: $("setup-form"),
@@ -3328,6 +3575,12 @@
     el.createContainerVolumeAdd.addEventListener("click", function () { addVolumeRow(); });
     el.deployStackForm.addEventListener("submit", submitDeployStack);
     el.deployStackCancel.addEventListener("click", function () { el.deployStackDialog.close(); });
+    el.deployStackTemplatePicker.addEventListener("change", applyStackTemplate);
+    el.deployStackSaveTemplate.addEventListener("click", saveStackTemplate);
+    el.deployStackValidate.addEventListener("click", runValidateStack);
+    el.stackFileCancel.addEventListener("click", function () { el.stackFileDialog.close(); });
+    el.stackFileSave.addEventListener("click", saveStackFile);
+    el.stackFileRedeploy.addEventListener("click", redeployFromFileDialog);
 
     el.setupForm.addEventListener("submit", submitSetup);
     el.hostForm.addEventListener("submit", submitHost);

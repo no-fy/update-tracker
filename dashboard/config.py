@@ -34,6 +34,7 @@ DEFAULT_CONFIG = {
     "registries": {},
     "insecure_registries": [],
     "hosts": [],
+    "stack_templates": [],
 }
 
 
@@ -142,6 +143,27 @@ def remove_host(config, name):
     for index, existing in enumerate(hosts):
         if existing.get("name") == name:
             return hosts.pop(index)
+    return None
+
+
+def upsert_stack_template(config, name, compose):
+    """Save/overwrite a reusable compose snippet under `name`. Small and
+    textual, so config.json is enough -- no need for anything else."""
+    templates = config.setdefault("stack_templates", [])
+    entry = {"name": name, "compose": compose}
+    for index, existing in enumerate(templates):
+        if existing.get("name") == name:
+            templates[index] = entry
+            return entry
+    templates.append(entry)
+    return entry
+
+
+def remove_stack_template(config, name):
+    templates = config.setdefault("stack_templates", [])
+    for index, existing in enumerate(templates):
+        if existing.get("name") == name:
+            return templates.pop(index)
     return None
 
 
