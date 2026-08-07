@@ -33,6 +33,7 @@
     containerJobs: {}, logsOpen: {}, logs: {}, renaming: {}, settings: {}, logsRange: {},
     stackOpen: {}, stackTemplates: [], stackFileContext: null,
     configOpen: {}, config: {}, stats: {}, limitsJobs: {}, portMapOpen: false,
+    registries: [],
     assistant: { open: false, wire: [], display: [], loading: false, error: null }
   };
   var el = {};
@@ -1271,6 +1272,32 @@
       });
   }
 
+  function downloadTextFile(filename, contents, mime) {
+    var blob = new Blob([contents], { type: mime || "application/json" });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  }
+
+  function exportContainerConfig(host, container) {
+    fetch("/api/hosts/" + encodeURIComponent(host.name) + "/containers/" +
+      encodeURIComponent(container.id) + "/clone-spec")
+      .then(function (r) { return r.json(); })
+      .then(function (spec) {
+        if (spec.error) throw new Error(spec.error);
+        spec.name = container.name;
+        downloadTextFile(container.name + ".config.json", JSON.stringify(spec, null, 2));
+      })
+      .catch(function (err) {
+        window.alert(err.message || "Could not read that container's config.");
+      });
+  }
+
   function submitCreateContainer(event) {
     event.preventDefault();
     var host = el.createContainerHost.value;
@@ -1875,6 +1902,12 @@
     cloneBtn.textContent = "Clone";
     cloneBtn.addEventListener("click", function () { openCloneContainer(host, container); });
     manage.appendChild(cloneBtn);
+
+    var exportBtn = text("button", "button small");
+    exportBtn.type = "button";
+    exportBtn.textContent = "Export config";
+    exportBtn.addEventListener("click", function () { exportContainerConfig(host, container); });
+    manage.appendChild(exportBtn);
     bar.appendChild(manage);
 
     if (job && job.status && job.status !== "running") {
@@ -3389,6 +3422,67 @@
     if (typeof el.portMapDialog.showModal === "function") el.portMapDialog.showModal();
   }
 
+  // ---- cleanup / prune -----------------------------------------------------
+
+  function openCleanup() {
+    var hosts = eligibleHosts(state.data, function (h) { return h.container_actions; });
+    fillSelect(el.cleanupHost, hosts);
+    el.cleanupLog.hidden = true;
+    el.cleanupLog.textContent = "";
+    hide(el.cleanupError);
+    setCleanupBusy(false);
+    if (typeof el.cleanupDialog.showModal === "function") el.cleanupDialog.showModal();
+  }
+
+  function setCleanupBusy(busy) {
+    [el.cleanupContainers, el.cleanupImages, el.cleanupVolumes, el.cleanupNetworks]
+      .forEach(function (btn) { btn.disabled = busy; });
+  }
+
+  var CLEANUP_KINDS = {
+    containers: { label: "stopped containers", url: "prune/containers" },
+    images: { label: "dangling images", url: "prune/images" },
+    volumes: { label: "unused volumes -- including their data", url: "prune/volumes" },
+    networks: { label: "unused networks", url: "prune/networks" },
+  };
+
+  function runCleanup(kind) {
+    var host = el.cleanupHost.value;
+    if (!host) {
+      showError(el.cleanupError, "Pick a host first.");
+      return;
+    }
+    var info = CLEANUP_KINDS[kind];
+    confirmDialog(
+      "Prune " + info.label + "?",
+      "This permanently removes " + info.label + " on " + host + ". There is no undo.",
+      { confirmLabel: "Prune", danger: true }
+    ).then(function (ok) {
+      if (!ok) return;
+      hide(el.cleanupError);
+      setCleanupBusy(true);
+      postJSON(
+        "/api/hosts/" + encodeURIComponent(host) + "/" + info.url,
+        kind === "images" ? { dangling_only: true } : {}
+      )
+        .then(function (result) {
+          setCleanupBusy(false);
+          if (result.error) throw new Error(result.error);
+          el.cleanupLog.hidden = false;
+          var removed = result.removed || [];
+          var line = "Pruned " + info.label + ": " +
+            (removed.length ? removed.length + " removed" : "nothing to remove") +
+            (result.space_reclaimed ? ", " + bytes(result.space_reclaimed) + " reclaimed" : "");
+          el.cleanupLog.textContent = (el.cleanupLog.textContent ? el.cleanupLog.textContent + "\n" : "") + line;
+          fetch("/api/refresh", { method: "POST" });
+        })
+        .catch(function (err) {
+          setCleanupBusy(false);
+          showError(el.cleanupError, err.message || "Prune failed.");
+        });
+    });
+  }
+
   // ---- first-run setup ---------------------------------------------------
 
   function checkSetup() {
@@ -3422,6 +3516,67 @@
       .catch(function () { return null; });
   }
 
+  function loadRegistries() {
+    return fetch("/api/registries")
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (result) {
+        state.registries = (result && result.registries) || [];
+        renderRegistryList();
+      })
+      .catch(function () {});
+  }
+
+  function renderRegistryList() {
+    el.settingsRegistryList.textContent = "";
+    var registries = state.registries || [];
+    if (!registries.length) {
+      el.settingsRegistryList.appendChild(text("p", "os-readonly", "No registries configured."));
+      return;
+    }
+    registries.forEach(function (reg) {
+      var row = text("div", "registry-row");
+      var label = reg.host + (reg.username ? " (" + reg.username + ")" : "") +
+        (reg.insecure ? " · insecure" : "");
+      row.appendChild(text("span", null, label));
+      var remove = text("button", "button small");
+      remove.type = "button";
+      remove.textContent = "Remove";
+      remove.addEventListener("click", function () {
+        fetch("/api/registries/" + encodeURIComponent(reg.host), { method: "DELETE" })
+          .then(function (r) { return r.json(); })
+          .then(function () { loadRegistries(); });
+      });
+      row.appendChild(remove);
+      el.settingsRegistryList.appendChild(row);
+    });
+  }
+
+  function addRegistry() {
+    var host = el.settingsRegistryHost.value.trim();
+    if (!host) {
+      showError(el.settingsRegistryError, "A registry host is required.");
+      return;
+    }
+    hide(el.settingsRegistryError);
+    postJSON("/api/registries", {
+      host: host,
+      username: el.settingsRegistryUsername.value.trim(),
+      password: el.settingsRegistryPassword.value,
+      insecure: el.settingsRegistryInsecure.checked,
+    })
+      .then(function (result) {
+        if (result.error) throw new Error(result.error);
+        el.settingsRegistryHost.value = "";
+        el.settingsRegistryUsername.value = "";
+        el.settingsRegistryPassword.value = "";
+        el.settingsRegistryInsecure.checked = false;
+        loadRegistries();
+      })
+      .catch(function (err) {
+        showError(el.settingsRegistryError, err.message || "Could not save registry.");
+      });
+  }
+
   function openSettings() {
     var s = state.settings || {};
     el.settingsSkipConfirmations.checked = !!s.skip_confirmations;
@@ -3440,6 +3595,12 @@
       : "Required for the Ask AI button to appear. Get one at openrouter.ai/keys.";
     el.settingsAiModel.value = s.openrouter_model || "";
     hide(el.settingsError);
+    el.settingsRegistryHost.value = "";
+    el.settingsRegistryUsername.value = "";
+    el.settingsRegistryPassword.value = "";
+    el.settingsRegistryInsecure.checked = false;
+    hide(el.settingsRegistryError);
+    loadRegistries();
     loadAiModels();
     if (typeof el.settingsDialog.showModal === "function") el.settingsDialog.showModal();
   }
@@ -3686,6 +3847,16 @@
       portMapOpen: $("port-map-open"),
       portMapDialog: $("port-map-dialog"),
       portMapBody: $("port-map-body"),
+      cleanupOpen: $("cleanup-open"),
+      cleanupDialog: $("cleanup-dialog"),
+      cleanupHost: $("cleanup-host"),
+      cleanupActions: $("cleanup-actions"),
+      cleanupContainers: $("cleanup-containers"),
+      cleanupImages: $("cleanup-images"),
+      cleanupVolumes: $("cleanup-volumes"),
+      cleanupNetworks: $("cleanup-networks"),
+      cleanupLog: $("cleanup-log"),
+      cleanupError: $("cleanup-error"),
       tabContainers: $("tab-containers"),
       tabOs: $("tab-os"),
       tabCompose: $("tab-compose"),
@@ -3780,6 +3951,7 @@
       stackFileLog: $("stack-file-log"),
       stackFileError: $("stack-file-error"),
       stackFileCancel: $("stack-file-cancel"),
+      stackFileDownload: $("stack-file-download"),
       stackFileRedeploy: $("stack-file-redeploy"),
       stackFileSave: $("stack-file-save"),
 
@@ -3820,6 +3992,13 @@
       settingsLogAutoRefresh: $("settings-log-auto-refresh"),
       settingsLogRefresh: $("settings-log-refresh"),
       settingsLogRefreshWrap: $("settings-log-refresh-wrap"),
+      settingsRegistryList: $("settings-registry-list"),
+      settingsRegistryHost: $("settings-registry-host"),
+      settingsRegistryUsername: $("settings-registry-username"),
+      settingsRegistryPassword: $("settings-registry-password"),
+      settingsRegistryInsecure: $("settings-registry-insecure"),
+      settingsRegistryAdd: $("settings-registry-add"),
+      settingsRegistryError: $("settings-registry-error"),
       settingsAiKey: $("settings-ai-key"),
       settingsAiKeyHint: $("settings-ai-key-hint"),
       settingsAiModel: $("settings-ai-model"),
@@ -3857,6 +4036,11 @@
     el.refresh.addEventListener("click", refresh);
     el.addHost.addEventListener("click", openHostDialog);
     el.portMapOpen.addEventListener("click", openPortMap);
+    el.cleanupOpen.addEventListener("click", openCleanup);
+    el.cleanupContainers.addEventListener("click", function () { runCleanup("containers"); });
+    el.cleanupImages.addEventListener("click", function () { runCleanup("images"); });
+    el.cleanupVolumes.addEventListener("click", function () { runCleanup("volumes"); });
+    el.cleanupNetworks.addEventListener("click", function () { runCleanup("networks"); });
     el.tabContainers.addEventListener("click", function () { selectTab("containers"); });
     el.tabOs.addEventListener("click", function () { selectTab("os"); });
     el.tabCompose.addEventListener("click", function () { selectTab("compose"); });
@@ -3884,6 +4068,11 @@
     el.deployStackSaveTemplate.addEventListener("click", saveStackTemplate);
     el.deployStackValidate.addEventListener("click", runValidateStack);
     el.stackFileCancel.addEventListener("click", function () { el.stackFileDialog.close(); });
+    el.stackFileDownload.addEventListener("click", function () {
+      var ctx = state.stackFileContext;
+      var name = (ctx && ctx.stack && ctx.stack.project) || "docker-compose";
+      downloadTextFile(name + ".yml", el.stackFileContent.value, "text/yaml");
+    });
     el.stackFileSave.addEventListener("click", saveStackFile);
     el.stackFileRedeploy.addEventListener("click", redeployFromFileDialog);
 
@@ -3893,6 +4082,7 @@
     el.hostCopy.addEventListener("click", copyCommand);
     el.confirmCancel.addEventListener("click", function () { el.confirmDialog.close(""); });
     el.settingsOpen.addEventListener("click", openSettings);
+    el.settingsRegistryAdd.addEventListener("click", addRegistry);
     el.settingsForm.addEventListener("submit", submitSettings);
     el.settingsCancel.addEventListener("click", function () { el.settingsDialog.close(); });
     el.settingsLogAutoRefresh.addEventListener("change", function () {

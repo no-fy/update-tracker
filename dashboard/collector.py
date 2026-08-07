@@ -607,6 +607,71 @@ def image_job(host, job_id, timeout=20):
         raise
 
 
+def prune_containers(host, timeout=30):
+    if host.get("mode") == "local":
+        import containerctl
+
+        client = agent_module.DockerClient(host.get("docker_socket"))
+        try:
+            return containerctl.prune_containers(client)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/prune/containers" % (scheme, host.get("address"), host.get("port", 9713))
+    return _http_post_json(url, {}, token=host.get("token"), timeout=timeout,
+                           verify_tls=host.get("verify_tls", True))
+
+
+def prune_volumes(host, timeout=30):
+    if host.get("mode") == "local":
+        import containerctl
+
+        client = agent_module.DockerClient(host.get("docker_socket"))
+        try:
+            return containerctl.prune_volumes(client)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/prune/volumes" % (scheme, host.get("address"), host.get("port", 9713))
+    return _http_post_json(url, {}, token=host.get("token"), timeout=timeout,
+                           verify_tls=host.get("verify_tls", True))
+
+
+def prune_networks(host, timeout=30):
+    if host.get("mode") == "local":
+        import containerctl
+
+        client = agent_module.DockerClient(host.get("docker_socket"))
+        try:
+            return containerctl.prune_networks(client)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/prune/networks" % (scheme, host.get("address"), host.get("port", 9713))
+    return _http_post_json(url, {}, token=host.get("token"), timeout=timeout,
+                           verify_tls=host.get("verify_tls", True))
+
+
+def prune_images(host, dangling_only=True, timeout=30):
+    if host.get("mode") == "local":
+        import containerctl
+        import imagectl
+
+        client = agent_module.DockerClient(host.get("docker_socket"))
+        try:
+            return imagectl.prune_images(client, dangling_only=dangling_only)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/prune/images" % (scheme, host.get("address"), host.get("port", 9713))
+    return _http_post_json(url, {"dangling_only": dangling_only}, token=host.get("token"),
+                           timeout=timeout, verify_tls=host.get("verify_tls", True))
+
+
 def deploy_stack(host, project, compose, timeout=30):
     if host.get("mode") == "local":
         import containerctl

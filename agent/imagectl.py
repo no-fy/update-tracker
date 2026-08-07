@@ -145,6 +145,25 @@ class Runner(object):
 RUNNER = Runner()
 
 
+def prune_images(client, dangling_only=True):
+    if not containerctl.actions_allowed():
+        raise containerctl.ActionError(
+            "This agent was started with CUD_ALLOW_CONTAINER_ACTIONS=0, so it "
+            "cannot remove images.")
+    try:
+        raw = client.prune_images(dangling_only=dangling_only)
+    except Exception as exc:
+        raise containerctl.ActionError(str(exc))
+    removed = [
+        (entry.get("Untagged") or entry.get("Deleted") or "")
+        for entry in (raw.get("ImagesDeleted") or [])
+    ]
+    return {
+        "removed": [r for r in removed if r],
+        "space_reclaimed": raw.get("SpaceReclaimed") or 0,
+    }
+
+
 def _build_context_tar(dockerfile_text):
     """A build context of exactly one file -- the Dockerfile itself, for the
     paste/upload flow this agent offers. No other files are ever sent."""
