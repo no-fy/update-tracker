@@ -26,6 +26,9 @@
     severity: "", osQuery: "",        // OS tab
     composeQuery: "", composeStatus: "", // compose tab
     eventsQuery: "", eventsData: null, // events tab
+    imagesQuery: "", imagesFilter: "", imagesData: null,     // images tab
+    volumesQuery: "", volumesFilter: "", volumesData: null,  // volumes tab
+    networksQuery: "", networksData: null,                   // networks tab
     host: "", open: {}, picked: {}, osJobs: {}, canAddHosts: false,
     containerJobs: {}, logsOpen: {}, logs: {}, renaming: {}, settings: {}, logsRange: {},
     stackOpen: {},
@@ -245,6 +248,9 @@
     if (tab === "os") return "Search package or version…";
     if (tab === "compose") return "Search stack or service…";
     if (tab === "events") return "Search events…";
+    if (tab === "images") return "Search image tag…";
+    if (tab === "volumes") return "Search volume name…";
+    if (tab === "networks") return "Search network name…";
     return "Search name or image…";
   }
 
@@ -252,18 +258,23 @@
     if (tab === "os") return state.osQuery;
     if (tab === "compose") return state.composeQuery;
     if (tab === "events") return state.eventsQuery;
+    if (tab === "images") return state.imagesQuery;
+    if (tab === "volumes") return state.volumesQuery;
+    if (tab === "networks") return state.networksQuery;
     return state.query;
   }
+
+  var TABS = ["containers", "compose", "os", "events", "images", "volumes", "networks"];
 
   function renderTabs(data) {
     var summary = data.summary || {};
     el.tabContainersCount.textContent = summary.containers_total || 0;
     el.tabOsCount.textContent = summary.os_updates_total || 0;
     el.tabComposeCount.textContent = summary.stacks_total || 0;
-    el.tabContainers.setAttribute("aria-selected", state.tab === "containers" ? "true" : "false");
-    el.tabOs.setAttribute("aria-selected", state.tab === "os" ? "true" : "false");
-    el.tabCompose.setAttribute("aria-selected", state.tab === "compose" ? "true" : "false");
-    el.tabEvents.setAttribute("aria-selected", state.tab === "events" ? "true" : "false");
+    TABS.forEach(function (tab) {
+      el["tab" + tab.charAt(0).toUpperCase() + tab.slice(1)]
+        .setAttribute("aria-selected", state.tab === tab ? "true" : "false");
+    });
     el.tabOs.hidden = !summary.os_hosts_reporting && !osHosts(data).length;
     el.tabCompose.hidden = !summary.stacks_total;
     el.search.placeholder = searchPlaceholder(state.tab);
@@ -275,11 +286,16 @@
     // Each tab keeps its own query, so switching never applies a search that
     // was meant for the other list.
     el.search.value = queryFor(tab);
+    stopEventsPolling();
     if (tab === "events") {
       loadAllEvents();
       startEventsPolling();
-    } else {
-      stopEventsPolling();
+    } else if (tab === "images" && !state.imagesData) {
+      loadImages();
+    } else if (tab === "volumes" && !state.volumesData) {
+      loadVolumes();
+    } else if (tab === "networks" && !state.networksData) {
+      loadNetworks();
     }
     render();
   }
@@ -544,6 +560,337 @@
     });
 
     return [row, detail];
+  }
+
+  // ---- Images / Volumes / Networks -----------------------------------------
+  // Same shape for all three: fetch each online host's list on demand (not
+  // part of the main poll -- these change far less often than containers),
+  // group by host, cross-reference against the containers already in
+  // state.data to show what's using what.
+
+  function loadHostResource(endpoint) {
+    var data = state.data;
+    if (!data) return Promise.resolve({});
+    var hosts = (data.hosts || []).filter(function (h) { return h.online; });
+    return Promise.all(hosts.map(function (host) {
+      return fetch("/api/hosts/" + encodeURIComponent(host.name) + "/" + endpoint)
+        .then(function (r) { return r.json(); })
+        .then(function (result) { return { host: host, result: result }; })
+        .catch(function (err) {
+          return { host: host, result: { error: err.message || "Could not load." } };
+        });
+    })).then(function (entries) {
+      var byHost = {};
+      entries.forEach(function (entry) { byHost[entry.host.name] = entry; });
+      return byHost;
+    });
+  }
+
+  function allContainers(data) {
+    var out = [];
+    (data.hosts || []).forEach(function (host) {
+      (host.containers || []).forEach(function (c) { out.push(c); });
+    });
+    return out;
+  }
+
+  // -- Images --
+
+  function loadImages(silent) {
+    if (!silent) { state.imagesData = { loading: true }; render(); }
+    loadHostResource("images").then(function (byHost) {
+      state.imagesData = { byHost: byHost };
+      render();
+    });
+  }
+
+  function renderImagesFilters(data) {
+    var options = [{ key: "", label: "All" }, { key: "dangling", label: "Dangling only" }];
+    chipRow(el.statusFilters, options, state.imagesFilter || "", function (key) {
+      state.imagesFilter = state.imagesFilter === key ? "" : key;
+      render();
+    });
+    fillHostFilter(data.hosts || []);
+  }
+
+  function renderImagesTab(data) {
+    el.hosts.textContent = "";
+    var entry = state.imagesData;
+    if (!entry || entry.loading) {
+      el.hosts.appendChild(text("p", "os-running", "Loading images…"));
+      el.empty.hidden = true;
+      return;
+    }
+    var containers = allContainers(data);
+    var shown = 0;
+    (data.hosts || []).forEach(function (host) {
+      if (state.host && host.name !== state.host) return;
+      var hostEntry = (entry.byHost || {})[host.name];
+      if (!hostEntry) return;
+      if (hostEntry.result.error) {
+        el.hosts.appendChild(errorCard(host, hostEntry.result.error));
+        return;
+      }
+      var images = (hostEntry.result.images || []).filter(function (img) {
+        if (state.imagesFilter === "dangling" && !img.dangling) return false;
+        if (state.imagesQuery) {
+          var haystack = (img.tags.join(" ") + " " + img.id).toLowerCase();
+          if (haystack.indexOf(state.imagesQuery) === -1) return false;
+        }
+        return true;
+      });
+      shown += images.length;
+      if (!images.length) return;
+      el.hosts.appendChild(imagesCard(host, images, containers));
+    });
+    el.empty.hidden = !!shown;
+    if (!shown) el.empty.textContent = "No images match the current filter.";
+  }
+
+  function imagesCard(host, images, containers) {
+    var card = text("section", "host");
+    var head = text("div", "host-head");
+    var title = text("div", "host-title");
+    title.appendChild(dot("unknown"));
+    title.appendChild(text("span", "name", host.label || host.name));
+    head.appendChild(title);
+    head.appendChild(text("div", "host-meta", images.length + " " + plural(images.length, "image", "images")));
+    card.appendChild(head);
+
+    var scroll = text("div", "table-scroll");
+    var table = document.createElement("table");
+    var thead = document.createElement("thead");
+    var headRow = document.createElement("tr");
+    [["Tags", ""], ["Size", "optional"], ["Created", "optional"], ["Used by", ""]].forEach(function (c) {
+      headRow.appendChild(text("th", c[1], c[0]));
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+    var tbody = document.createElement("tbody");
+    images.forEach(function (img) {
+      var users = containers.filter(function (c) {
+        return c.host === host.name && (c.image_id === img.full_id || c.current_image_id === img.full_id);
+      });
+      var row = text("tr", "row");
+      var nameCell = text("td", "c-name");
+      nameCell.appendChild(text("span", null, img.tags.length ? img.tags.join(", ") : "<dangling>"));
+      nameCell.appendChild(text("span", "sub", img.id));
+      row.appendChild(nameCell);
+      row.appendChild(text("td", "c-age optional", bytes(img.size) || "—"));
+      row.appendChild(text("td", "c-age optional", relativeTime(img.created) || "—"));
+      row.appendChild(text("td", null, users.length
+        ? users.map(function (c) { return c.name; }).join(", ")
+        : "unused"));
+      tbody.appendChild(row);
+    });
+    table.appendChild(tbody);
+    scroll.appendChild(table);
+    card.appendChild(scroll);
+    return card;
+  }
+
+  // -- Volumes --
+
+  function loadVolumes(silent) {
+    if (!silent) { state.volumesData = { loading: true }; render(); }
+    loadHostResource("volumes").then(function (byHost) {
+      state.volumesData = { byHost: byHost };
+      render();
+    });
+  }
+
+  function renderVolumesFilters(data) {
+    var options = [{ key: "", label: "All" }, { key: "orphaned", label: "Orphaned only" }];
+    chipRow(el.statusFilters, options, state.volumesFilter || "", function (key) {
+      state.volumesFilter = state.volumesFilter === key ? "" : key;
+      render();
+    });
+    fillHostFilter(data.hosts || []);
+  }
+
+  function volumeUsers(containers, hostName, volumeName) {
+    return containers.filter(function (c) {
+      if (c.host !== hostName) return false;
+      return (c.mounts || []).some(function (m) { return m.type === "volume" && m.name === volumeName; });
+    });
+  }
+
+  function renderVolumesTab(data) {
+    el.hosts.textContent = "";
+    var entry = state.volumesData;
+    if (!entry || entry.loading) {
+      el.hosts.appendChild(text("p", "os-running", "Loading volumes…"));
+      el.empty.hidden = true;
+      return;
+    }
+    var containers = allContainers(data);
+    var shown = 0;
+    (data.hosts || []).forEach(function (host) {
+      if (state.host && host.name !== state.host) return;
+      var hostEntry = (entry.byHost || {})[host.name];
+      if (!hostEntry) return;
+      if (hostEntry.result.error) {
+        el.hosts.appendChild(errorCard(host, hostEntry.result.error));
+        return;
+      }
+      var volumes = (hostEntry.result.volumes || []).filter(function (vol) {
+        var users = volumeUsers(containers, host.name, vol.name);
+        if (state.volumesFilter === "orphaned" && users.length) return false;
+        if (state.volumesQuery && vol.name.toLowerCase().indexOf(state.volumesQuery) === -1) return false;
+        return true;
+      });
+      shown += volumes.length;
+      if (!volumes.length) return;
+      el.hosts.appendChild(volumesCard(host, volumes, containers));
+    });
+    el.empty.hidden = !!shown;
+    if (!shown) el.empty.textContent = "No volumes match the current filter.";
+  }
+
+  function volumesCard(host, volumes, containers) {
+    var card = text("section", "host");
+    var head = text("div", "host-head");
+    var title = text("div", "host-title");
+    title.appendChild(dot("unknown"));
+    title.appendChild(text("span", "name", host.label || host.name));
+    head.appendChild(title);
+    head.appendChild(text("div", "host-meta", volumes.length + " " + plural(volumes.length, "volume", "volumes")));
+    card.appendChild(head);
+
+    var scroll = text("div", "table-scroll");
+    var table = document.createElement("table");
+    var thead = document.createElement("thead");
+    var headRow = document.createElement("tr");
+    [["Name", ""], ["Driver", "optional"], ["Created", "optional"], ["Used by", ""]].forEach(function (c) {
+      headRow.appendChild(text("th", c[1], c[0]));
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+    var tbody = document.createElement("tbody");
+    volumes.forEach(function (vol) {
+      var users = volumeUsers(containers, host.name, vol.name);
+      var row = text("tr", "row");
+      var nameCell = text("td", "c-name");
+      nameCell.appendChild(text("span", null, vol.name));
+      nameCell.appendChild(text("span", "sub", vol.mountpoint));
+      row.appendChild(nameCell);
+      row.appendChild(text("td", "optional", vol.driver || "—"));
+      row.appendChild(text("td", "c-age optional", relativeTime(vol.created) || "—"));
+      row.appendChild(text("td", null, users.length
+        ? users.map(function (c) { return c.name; }).join(", ")
+        : "orphaned"));
+      tbody.appendChild(row);
+    });
+    table.appendChild(tbody);
+    scroll.appendChild(table);
+    card.appendChild(scroll);
+    return card;
+  }
+
+  // -- Networks --
+
+  function loadNetworks(silent) {
+    if (!silent) { state.networksData = { loading: true }; render(); }
+    loadHostResource("networks").then(function (byHost) {
+      state.networksData = { byHost: byHost };
+      render();
+    });
+  }
+
+  function renderNetworksFilters(data) {
+    el.statusFilters.textContent = "";
+    fillHostFilter(data.hosts || []);
+  }
+
+  function networkUsers(containers, hostName, networkName) {
+    return containers.filter(function (c) {
+      return c.host === hostName && (c.networks || []).indexOf(networkName) !== -1;
+    });
+  }
+
+  function renderNetworksTab(data) {
+    el.hosts.textContent = "";
+    var entry = state.networksData;
+    if (!entry || entry.loading) {
+      el.hosts.appendChild(text("p", "os-running", "Loading networks…"));
+      el.empty.hidden = true;
+      return;
+    }
+    var containers = allContainers(data);
+    var shown = 0;
+    (data.hosts || []).forEach(function (host) {
+      if (state.host && host.name !== state.host) return;
+      var hostEntry = (entry.byHost || {})[host.name];
+      if (!hostEntry) return;
+      if (hostEntry.result.error) {
+        el.hosts.appendChild(errorCard(host, hostEntry.result.error));
+        return;
+      }
+      var networks = (hostEntry.result.networks || []).filter(function (net) {
+        if (!state.networksQuery) return true;
+        return net.name.toLowerCase().indexOf(state.networksQuery) !== -1;
+      });
+      shown += networks.length;
+      if (!networks.length) return;
+      el.hosts.appendChild(networksCard(host, networks, containers));
+    });
+    el.empty.hidden = !!shown;
+    if (!shown) el.empty.textContent = "No networks match the current filter.";
+  }
+
+  function networksCard(host, networks, containers) {
+    var card = text("section", "host");
+    var head = text("div", "host-head");
+    var title = text("div", "host-title");
+    title.appendChild(dot("unknown"));
+    title.appendChild(text("span", "name", host.label || host.name));
+    head.appendChild(title);
+    head.appendChild(text("div", "host-meta", networks.length + " " + plural(networks.length, "network", "networks")));
+    card.appendChild(head);
+
+    var scroll = text("div", "table-scroll");
+    var table = document.createElement("table");
+    var thead = document.createElement("thead");
+    var headRow = document.createElement("tr");
+    [["Name", ""], ["Driver", "optional"], ["Subnet", "optional"], ["Attached", ""]].forEach(function (c) {
+      headRow.appendChild(text("th", c[1], c[0]));
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+    var tbody = document.createElement("tbody");
+    networks.forEach(function (net) {
+      var users = networkUsers(containers, host.name, net.name);
+      var row = text("tr", "row");
+      var nameCell = text("td", "c-name");
+      nameCell.appendChild(text("span", null, net.name));
+      if (net.internal) nameCell.appendChild(text("span", "sub", "internal"));
+      row.appendChild(nameCell);
+      row.appendChild(text("td", "optional", net.driver || "—"));
+      row.appendChild(text("td", "optional", net.subnets.join(", ") || "—"));
+      row.appendChild(text("td", null, users.length
+        ? users.map(function (c) { return c.name; }).join(", ")
+        : "none"));
+      tbody.appendChild(row);
+    });
+    table.appendChild(tbody);
+    scroll.appendChild(table);
+    card.appendChild(scroll);
+    return card;
+  }
+
+  function errorCard(host, message) {
+    var card = text("section", "host");
+    var head = text("div", "host-head");
+    var title = text("div", "host-title");
+    title.appendChild(dot("error"));
+    title.appendChild(text("span", "name", host.label || host.name));
+    head.appendChild(title);
+    card.appendChild(head);
+    var error = text("div", "host-error");
+    error.appendChild(dot("error"));
+    error.appendChild(text("span", null, message));
+    card.appendChild(error);
+    return card;
   }
 
   function pickedFor(host) {
@@ -1959,6 +2306,15 @@
     } else if (state.tab === "events") {
       renderEventsFilters(data);
       renderEventsTab(data);
+    } else if (state.tab === "images") {
+      renderImagesFilters(data);
+      renderImagesTab(data);
+    } else if (state.tab === "volumes") {
+      renderVolumesFilters(data);
+      renderVolumesTab(data);
+    } else if (state.tab === "networks") {
+      renderNetworksFilters(data);
+      renderNetworksTab(data);
     } else {
       renderFilters(data);
       renderHosts(data);
@@ -2018,6 +2374,10 @@
   function refresh() {
     el.refresh.classList.add("busy");
     el.refresh.disabled = true;
+    if (state.tab === "events") loadAllEvents(true);
+    else if (state.tab === "images") loadImages(true);
+    else if (state.tab === "volumes") loadVolumes(true);
+    else if (state.tab === "networks") loadNetworks(true);
     fetch("/api/refresh", { method: "POST" })
       .then(function () { schedulePoll(600); })
       .catch(function () { schedulePoll(2000); });
@@ -2321,6 +2681,9 @@
       tabOs: $("tab-os"),
       tabCompose: $("tab-compose"),
       tabEvents: $("tab-events"),
+      tabImages: $("tab-images"),
+      tabVolumes: $("tab-volumes"),
+      tabNetworks: $("tab-networks"),
       tabContainersCount: $("tab-containers-count"),
       tabOsCount: $("tab-os-count"),
       tabComposeCount: $("tab-compose-count"),
@@ -2401,6 +2764,9 @@
     el.tabOs.addEventListener("click", function () { selectTab("os"); });
     el.tabCompose.addEventListener("click", function () { selectTab("compose"); });
     el.tabEvents.addEventListener("click", function () { selectTab("events"); });
+    el.tabImages.addEventListener("click", function () { selectTab("images"); });
+    el.tabVolumes.addEventListener("click", function () { selectTab("volumes"); });
+    el.tabNetworks.addEventListener("click", function () { selectTab("networks"); });
     el.setupForm.addEventListener("submit", submitSetup);
     el.hostForm.addEventListener("submit", submitHost);
     el.hostCancel.addEventListener("click", function () { el.hostDialog.close(); });
@@ -2431,6 +2797,9 @@
         if (state.tab === "os") state.osQuery = value;
         else if (state.tab === "compose") state.composeQuery = value;
         else if (state.tab === "events") state.eventsQuery = value;
+        else if (state.tab === "images") state.imagesQuery = value;
+        else if (state.tab === "volumes") state.volumesQuery = value;
+        else if (state.tab === "networks") state.networksQuery = value;
         else state.query = value;
         render();
       }, 120);
