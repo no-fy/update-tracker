@@ -324,6 +324,49 @@ def update_limits(client, container_id, spec):
         raise ActionError(str(exc))
 
 
+def disk_usage(client):
+    """Reclaimable space per resource type -- Docker's own /system/df, summed
+    the same way `docker system df` does client-side (the API returns raw
+    per-item lists, not a rollup)."""
+    raw = client.system_df() or {}
+
+    images = raw.get("Images") or []
+    images_size = sum(i.get("Size") or 0 for i in images)
+    images_reclaimable = sum((i.get("Size") or 0) for i in images if not i.get("Containers"))
+
+    containers = raw.get("Containers") or []
+    containers_size = sum(c.get("SizeRw") or 0 for c in containers)
+    containers_reclaimable = sum(
+        (c.get("SizeRw") or 0) for c in containers if c.get("State") != "running")
+
+    volumes = raw.get("Volumes") or []
+    volumes_size = sum(((v.get("UsageData") or {}).get("Size") or 0) for v in volumes)
+    volumes_reclaimable = sum(
+        ((v.get("UsageData") or {}).get("Size") or 0)
+        for v in volumes if ((v.get("UsageData") or {}).get("RefCount") or 0) == 0)
+
+    build_cache = raw.get("BuildCache") or []
+    cache_size = sum(b.get("Size") or 0 for b in build_cache)
+    cache_reclaimable = sum((b.get("Size") or 0) for b in build_cache if not b.get("InUse"))
+
+    return {
+        "images": {"count": len(images), "size": images_size, "reclaimable": images_reclaimable},
+        "containers": {
+            "count": len(containers), "size": containers_size,
+            "reclaimable": containers_reclaimable,
+        },
+        "volumes": {
+            "count": len(volumes), "size": volumes_size, "reclaimable": volumes_reclaimable,
+        },
+        "build_cache": {
+            "count": len(build_cache), "size": cache_size, "reclaimable": cache_reclaimable,
+        },
+        "total_reclaimable": (
+            images_reclaimable + containers_reclaimable + volumes_reclaimable + cache_reclaimable
+        ),
+    }
+
+
 def prune_containers(client):
     _require_allowed()
     try:

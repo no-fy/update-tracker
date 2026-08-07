@@ -421,6 +421,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 collector.host_networks)
             return
 
+        if path.startswith("/api/hosts/") and path.endswith("/disk-usage"):
+            self._handle_host_resource(
+                urllib.parse.unquote(path[len("/api/hosts/"):-len("/disk-usage")]),
+                collector.host_disk_usage)
+            return
+
         if path.startswith("/api/hosts/") and "/containers/" in path and path.endswith("/clone-spec"):
             self._handle_container_clone_spec(path)
             return

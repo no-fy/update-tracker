@@ -354,6 +354,17 @@ main { padding: var(--gap) max(20px, 4vw) 40px; }
 }
 .host-error .dot { margin-top: 6px; }
 
+.host-warnings {
+  padding: 8px 18px;
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  border-top: 1px solid var(--hairline);
+}
+.host-warnings .dot { margin-top: 4px; }
+
 table { width: 100%; border-collapse: collapse; }
 
 .table-scroll { overflow-x: auto; }
@@ -914,6 +925,10 @@ tr.detail td { padding: 0 18px 14px; background: transparent; }
   background: var(--wash);
   font-size: 0.82rem;
 }
+
+.disk-usage { display: flex; flex-direction: column; gap: 4px; margin: 10px 0; font-size: 0.82rem; }
+.disk-usage-row { display: flex; justify-content: space-between; gap: 12px; padding: 4px 2px; }
+.disk-usage-reclaimable { color: var(--text-muted); }
 
 .cleanup-actions { display: flex; flex-direction: column; gap: 10px; margin: 10px 0; }
 .cleanup-row {
