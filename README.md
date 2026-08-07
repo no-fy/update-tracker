@@ -302,6 +302,41 @@ rotates away. If the agent has this on, it separately keeps its own copy:
   `CUD_LOG_MAX_ROWS_PER_CONTAINER` (default 200,000) are both enforced, so a
   chatty container can't fill the disk between prunes.
 
+### Config: env vars, mounts, networks, resource limits
+
+A **Config** button next to Logs opens a per-container panel with the config
+Docker itself holds but doesn't show in the row: full environment variables,
+mounts (bind and named volume, with the container-side path and rw/ro),
+attached networks, and CPU/memory limits alongside current usage.
+
+- **Env and limits come from the same read as Clone** — the existing
+  clone-spec endpoint (`GET .../clone-spec`) already inspects the container
+  and returns this shape; the panel just fetches it lazily when opened rather
+  than adding a new call. Mounts and networks are already in every poll (the
+  same `Mounts`/`NetworkSettings.Networks` data the Volumes and Networks tabs
+  cross-reference), so those need no extra request at all.
+- **Usage is a one-shot snapshot** (`GET .../stats`, Docker's own
+  `stats?stream=0`), not a live stream — CPU% follows the same delta formula
+  the Docker CLI uses. **Refresh usage** re-fetches it on demand.
+- **Editing limits** changes a running container's CPU/memory constraints via
+  Docker's own `/containers/{id}/update` endpoint — no recreate, no
+  downtime. Same capability gate and confirm-dialog pattern as the lifecycle
+  actions above. `0` means unlimited on entry; because Docker's update API
+  can never truly clear a limit once one is set (a zero value is silently
+  ignored, not applied), entering `0` here instead sets the limit to the
+  host's own CPU count / total memory — no tighter than the host allows
+  anyway, which is unlimited in every practical sense. Expect the panel to
+  then show that host figure rather than a literal `0` on the next read.
+
+### Port map
+
+The **Port map** button (top bar) lists every published port across every
+host in one table — host, host port, container port, protocol, and which
+container holds it — built entirely from data already in the current poll,
+no extra requests. Two different containers on the *same host* claiming the
+same host port and protocol are highlighted as a conflict (a container
+publishing on both `0.0.0.0` and `::` for one port is not one).
+
 ### Docker events
 
 An **Events** tab shows what Docker itself reported happening, across every
@@ -835,7 +870,9 @@ tokens are never returned.
 | POST | `/api/hosts/<name>/volumes` | create a volume: `{"name", "driver", "driver_opts", "labels"}` |
 | POST | `/api/hosts/<name>/networks` | create a network: `{"name", "driver", "internal", "subnet", "gateway"}` |
 | POST | `/api/hosts/<name>/containers/create` | create a container from a form-friendly spec (see below) |
-| GET | `/api/hosts/<name>/containers/<id>/clone-spec` | that container's config, shaped as a create spec, to pre-fill Clone |
+| GET | `/api/hosts/<name>/containers/<id>/clone-spec` | that container's config, shaped as a create spec, to pre-fill Clone -- also backs the Config panel (adds `memory_mb`/`cpu_limit`) |
+| GET | `/api/hosts/<name>/containers/<id>/stats` | one-shot CPU/memory usage snapshot |
+| POST | `/api/hosts/<name>/containers/<id>/limits` | update CPU/memory limits on a running container: `{"memory_mb", "cpu_limit"}`, `0` for unlimited |
 | POST | `/api/hosts/<name>/stacks` | deploy a stack: `{"project", "compose"}` (202 + job) -- refused unless `CUD_STACKS_DIR` is configured |
 | POST | `/api/hosts/<name>/stacks/redeploy` | pull + `up -d` an existing stack: `{"project", "path"}` (202 + job) -- works for any stack, not just ones deployed here |
 | POST | `/api/hosts/<name>/stacks/validate` | resolve a compose file via the host's real `docker compose config`: `{"project", "compose"}` → `{"valid", "errors", "ports"}` |

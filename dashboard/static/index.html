@@ -15,6 +15,7 @@
   </div>
   <div class="topbar-actions">
     <button id="add-host" class="button">Add host</button>
+    <button id="port-map-open" class="button">Port map</button>
     <button id="refresh" class="button primary">
       <span class="spinner" aria-hidden="true"></span>
       <span class="button-label">Refresh</span>
@@ -476,6 +477,18 @@
       <button type="button" class="button" id="stack-file-cancel">Close</button>
       <button type="button" class="button" id="stack-file-redeploy">Redeploy</button>
       <button type="button" class="button primary" id="stack-file-save">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="port-map-dialog" class="dialog wide-dialog">
+  <form method="dialog">
+    <h2>Port map</h2>
+    <p class="dialog-lede">Every published port across all hosts. Conflicts (two containers on the
+      same host claiming the same host port) are highlighted.</p>
+    <div id="port-map-body"></div>
+    <div class="dialog-actions">
+      <button type="submit" class="button primary">Close</button>
     </div>
   </form>
 </dialog>

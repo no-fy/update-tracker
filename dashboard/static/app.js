@@ -32,6 +32,7 @@
     host: "", open: {}, picked: {}, osJobs: {}, canAddHosts: false,
     containerJobs: {}, logsOpen: {}, logs: {}, renaming: {}, settings: {}, logsRange: {},
     stackOpen: {}, stackTemplates: [], stackFileContext: null,
+    configOpen: {}, config: {}, stats: {}, limitsJobs: {}, portMapOpen: false,
     assistant: { open: false, wire: [], display: [], loading: false, error: null }
   };
   var el = {};
@@ -2230,6 +2231,218 @@
       });
   }
 
+  function configToggleButton(host, container) {
+    var key = containerKey(container);
+    var btn = text("button", "button small");
+    btn.type = "button";
+    btn.textContent = state.configOpen[key] ? "Hide config" : "Config";
+    btn.addEventListener("click", function () {
+      var opening = !state.configOpen[key];
+      state.configOpen[key] = opening;
+      state.open[key] = true;
+      if (opening && !state.config[key]) {
+        loadContainerConfig(host, container);
+        loadContainerStats(host, container);
+      }
+      render();
+    });
+    return btn;
+  }
+
+  function loadContainerConfig(host, container) {
+    var key = containerKey(container);
+    state.config[key] = { loading: true };
+    render();
+
+    fetch(
+      "/api/hosts/" + encodeURIComponent(host.name) +
+      "/containers/" + encodeURIComponent(container.id) + "/clone-spec"
+    )
+      .then(function (r) { return r.json(); })
+      .then(function (result) {
+        if (result.error) throw new Error(result.error);
+        state.config[key] = result;
+        render();
+      })
+      .catch(function (err) {
+        state.config[key] = { error: err.message || "Could not load container config." };
+        render();
+      });
+  }
+
+  function loadContainerStats(host, container) {
+    var key = containerKey(container);
+    var previous = state.stats[key];
+    state.stats[key] = { loading: true, last: previous && !previous.error ? previous : null };
+    render();
+
+    fetch(
+      "/api/hosts/" + encodeURIComponent(host.name) +
+      "/containers/" + encodeURIComponent(container.id) + "/stats"
+    )
+      .then(function (r) { return r.json(); })
+      .then(function (result) {
+        if (result.error) throw new Error(result.error);
+        state.stats[key] = result;
+        render();
+      })
+      .catch(function (err) {
+        state.stats[key] = { error: err.message || "Could not load usage stats." };
+        render();
+      });
+  }
+
+  function runContainerLimits(host, container, memoryMb, cpuLimit) {
+    var key = containerKey(container);
+    state.limitsJobs[key] = { status: "running" };
+    render();
+
+    postJSON(
+      "/api/hosts/" + encodeURIComponent(host.name) +
+      "/containers/" + encodeURIComponent(container.id) + "/limits",
+      { memory_mb: memoryMb, cpu_limit: cpuLimit }
+    )
+      .then(function (result) {
+        if (result.error) throw new Error(result.error);
+        state.limitsJobs[key] = { status: "ok" };
+        loadContainerConfig(host, container);
+        render();
+        fetch("/api/refresh", { method: "POST" }).then(function () {
+          setTimeout(load, 1200);
+        });
+      })
+      .catch(function (err) {
+        state.limitsJobs[key] = {
+          status: "failed", message: err.message || "Updating limits failed.",
+        };
+        render();
+      });
+  }
+
+  function limitsForm(host, container, config) {
+    var key = containerKey(container);
+    var wrap = text("div", "limits-form");
+
+    var memoryField = text("label", "limits-field");
+    memoryField.appendChild(text("span", null, "Memory (MB, 0 = unlimited)"));
+    var memoryInput = document.createElement("input");
+    memoryInput.type = "number";
+    memoryInput.min = "0";
+    memoryInput.value = config.memory_mb || 0;
+    memoryField.appendChild(memoryInput);
+    wrap.appendChild(memoryField);
+
+    var cpuField = text("label", "limits-field");
+    cpuField.appendChild(text("span", null, "CPU limit (cores, 0 = unlimited)"));
+    var cpuInput = document.createElement("input");
+    cpuInput.type = "number";
+    cpuInput.min = "0";
+    cpuInput.step = "0.1";
+    cpuInput.value = config.cpu_limit || 0;
+    cpuField.appendChild(cpuInput);
+    wrap.appendChild(cpuField);
+
+    var job = state.limitsJobs[key];
+    var save = text("button", "button small primary");
+    save.type = "button";
+    save.textContent = job && job.status === "running" ? "Saving…" : "Save limits";
+    save.disabled = !!(job && job.status === "running");
+    save.addEventListener("click", function () {
+      var memoryMb = Number(memoryInput.value) || 0;
+      var cpuLimit = Number(cpuInput.value) || 0;
+      confirmDialog(
+        "Update resource limits?",
+        "Change " + container.name + "'s limits to " +
+        (memoryMb ? memoryMb + " MB memory" : "unlimited memory") + " and " +
+        (cpuLimit ? cpuLimit + " CPU" : "unlimited CPU") + "? Takes effect immediately.",
+        { confirmLabel: "Update" }
+      ).then(function (ok) {
+        if (ok) runContainerLimits(host, container, memoryMb, cpuLimit);
+      });
+    });
+    wrap.appendChild(save);
+
+    if (job && job.status === "failed") {
+      wrap.appendChild(text("span", "os-readonly", job.message));
+    }
+
+    return wrap;
+  }
+
+  function configSection(host, container) {
+    var key = containerKey(container);
+    var wrap = text("div", "config-section");
+    var entry = state.config[key];
+
+    if (!entry || entry.loading) {
+      wrap.appendChild(text("span", "os-running", "Loading config…"));
+      return wrap;
+    }
+    if (entry.error) {
+      wrap.appendChild(text("span", "os-readonly", entry.error));
+      return wrap;
+    }
+
+    var envBlock = text("div", "config-block");
+    envBlock.appendChild(text("h4", null, "Environment"));
+    if ((entry.env || []).length) {
+      var envList = text("pre", "joblog", entry.env.join("\n"));
+      envBlock.appendChild(envList);
+    } else {
+      envBlock.appendChild(text("span", "os-readonly", "No environment variables set."));
+    }
+    wrap.appendChild(envBlock);
+
+    var mountsBlock = text("div", "config-block");
+    mountsBlock.appendChild(text("h4", null, "Mounts"));
+    var mounts = container.mounts || [];
+    if (mounts.length) {
+      var mountList = text("ul", "config-list");
+      mounts.forEach(function (m) {
+        mountList.appendChild(text("li", null,
+          (m.name || m.source || "?") + " → " + m.destination +
+          (m.rw === false ? " (ro)" : " (rw)") + " · " + (m.type || "bind")));
+      });
+      mountsBlock.appendChild(mountList);
+    } else {
+      mountsBlock.appendChild(text("span", "os-readonly", "No mounts."));
+    }
+    wrap.appendChild(mountsBlock);
+
+    var netBlock = text("div", "config-block");
+    netBlock.appendChild(text("h4", null, "Networks"));
+    netBlock.appendChild(text("p", null, (container.networks || []).join(", ") || "—"));
+    wrap.appendChild(netBlock);
+
+    var limitsBlock = text("div", "config-block");
+    limitsBlock.appendChild(text("h4", null, "Resource limits"));
+    var statsEntry = state.stats[key];
+    var current = statsEntry && !statsEntry.loading && !statsEntry.error ? statsEntry : statsEntry && statsEntry.last;
+    if (current) {
+      limitsBlock.appendChild(text("p", null,
+        "CPU " + current.cpu_percent + "%  ·  Memory " + bytes(current.memory_used) +
+        (current.memory_limit ? " / " + bytes(current.memory_limit) : "") +
+        (current.memory_percent ? " (" + current.memory_percent + "%)" : "")));
+    } else if (statsEntry && statsEntry.error) {
+      limitsBlock.appendChild(text("span", "os-readonly", statsEntry.error));
+    } else {
+      limitsBlock.appendChild(text("span", "os-running", "Loading usage…"));
+    }
+    var refreshStats = text("button", "button small");
+    refreshStats.type = "button";
+    refreshStats.textContent = "Refresh usage";
+    refreshStats.addEventListener("click", function () { loadContainerStats(host, container); });
+    limitsBlock.appendChild(refreshStats);
+
+    var capability = host.container_actions || {};
+    if (capability.can_manage) {
+      limitsBlock.appendChild(limitsForm(host, container, entry));
+    }
+    wrap.appendChild(limitsBlock);
+
+    return wrap;
+  }
+
   // A small, dependency-free markdown renderer -- just enough for what a
   // model actually sends back: paragraphs, headings, lists, fenced code,
   // inline code/bold/italic/links. Not a full spec implementation.
@@ -2723,6 +2936,7 @@
     actionsCell.addEventListener("click", function (event) { event.stopPropagation(); });
     actionsCell.appendChild(containerActionBar(host, container));
     actionsCell.appendChild(logsToggleButton(host, container));
+    actionsCell.appendChild(configToggleButton(host, container));
     row.appendChild(actionsCell);
 
     var detail = text("tr", "detail");
@@ -2732,6 +2946,7 @@
     body.appendChild(text("p", "detail-note", container.detail || ""));
     body.appendChild(containerDetailsPanel(container));
     if (state.logsOpen[key]) body.appendChild(logsSection(host, container));
+    if (state.configOpen[key]) body.appendChild(configSection(host, container));
 
     cell.appendChild(body);
     detail.appendChild(cell);
@@ -3088,6 +3303,92 @@
       .catch(function () { schedulePoll(2000); });
   }
 
+  // ---- port map -----------------------------------------------------------
+
+  var PORT_MAPPING = /^(.+):(\d+)->(\d+)\/(\w+)$/;
+
+  function collectPortMappings() {
+    var rows = [];
+    ((state.data && state.data.hosts) || []).forEach(function (host) {
+      (host.containers || []).forEach(function (container) {
+        (container.ports || []).forEach(function (portText) {
+          var match = PORT_MAPPING.exec(portText);
+          if (!match) return;
+          rows.push({
+            host: host.label || host.name,
+            hostKey: host.name,
+            bindIp: match[1],
+            hostPort: match[2],
+            containerPort: match[3],
+            protocol: match[4],
+            container: container.name,
+          });
+        });
+      });
+    });
+
+    // Group by container too -- a container publishing on both 0.0.0.0 and ::
+    // is one binding, not a conflict with itself.
+    var containersByBinding = {};
+    rows.forEach(function (row) {
+      var conflictKey = row.hostKey + "/" + row.hostPort + "/" + row.protocol;
+      var set = containersByBinding[conflictKey] || (containersByBinding[conflictKey] = {});
+      set[row.container] = true;
+    });
+    rows.forEach(function (row) {
+      var conflictKey = row.hostKey + "/" + row.hostPort + "/" + row.protocol;
+      row.conflict = Object.keys(containersByBinding[conflictKey]).length > 1;
+    });
+
+    rows.sort(function (a, b) {
+      return a.host.localeCompare(b.host) || Number(a.hostPort) - Number(b.hostPort);
+    });
+    return rows;
+  }
+
+  function renderPortMap() {
+    el.portMapBody.textContent = "";
+    var rows = collectPortMappings();
+    if (!rows.length) {
+      el.portMapBody.appendChild(text("p", "os-readonly", "No published ports found."));
+      return;
+    }
+
+    var conflicts = rows.filter(function (r) { return r.conflict; });
+    if (conflicts.length) {
+      el.portMapBody.appendChild(text("p", "os-readonly",
+        conflicts.length + " conflicting port " +
+        plural(conflicts.length, "binding", "bindings") + " found."));
+    }
+
+    var table = document.createElement("table");
+    var thead = document.createElement("thead");
+    var headRow = document.createElement("tr");
+    ["Host", "Host port", "Container port", "Protocol", "Container"].forEach(function (label) {
+      headRow.appendChild(text("th", null, label));
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    var tbody = document.createElement("tbody");
+    rows.forEach(function (row) {
+      var tr = text("tr", row.conflict ? "port-conflict" : null);
+      tr.appendChild(text("td", null, row.host));
+      tr.appendChild(text("td", null, row.hostPort));
+      tr.appendChild(text("td", null, row.containerPort));
+      tr.appendChild(text("td", null, row.protocol));
+      tr.appendChild(text("td", null, row.container));
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    el.portMapBody.appendChild(table);
+  }
+
+  function openPortMap() {
+    renderPortMap();
+    if (typeof el.portMapDialog.showModal === "function") el.portMapDialog.showModal();
+  }
+
   // ---- first-run setup ---------------------------------------------------
 
   function checkSetup() {
@@ -3382,6 +3683,9 @@
       footerMeta: $("footer-meta"),
       legend: $("legend"),
       addHost: $("add-host"),
+      portMapOpen: $("port-map-open"),
+      portMapDialog: $("port-map-dialog"),
+      portMapBody: $("port-map-body"),
       tabContainers: $("tab-containers"),
       tabOs: $("tab-os"),
       tabCompose: $("tab-compose"),
@@ -3552,6 +3856,7 @@
 
     el.refresh.addEventListener("click", refresh);
     el.addHost.addEventListener("click", openHostDialog);
+    el.portMapOpen.addEventListener("click", openPortMap);
     el.tabContainers.addEventListener("click", function () { selectTab("containers"); });
     el.tabOs.addEventListener("click", function () { selectTab("os"); });
     el.tabCompose.addEventListener("click", function () { selectTab("compose"); });
