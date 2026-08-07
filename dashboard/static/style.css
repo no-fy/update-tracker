@@ -885,6 +885,24 @@ tr.detail td { padding: 0 18px 14px; background: transparent; }
 .logs-range { display: flex; flex-wrap: wrap; gap: 6px; flex-basis: 100%; }
 .logs-range .chip { padding: 4px 11px; font-size: 0.76rem; }
 
+.config-section {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+}
+
+.config-block { flex: 1 1 220px; min-width: 220px; }
+.config-block h4 { margin: 0 0 6px; font-size: 0.8rem; color: var(--text-muted); }
+.config-block .joblog { max-height: 160px; }
+.config-list { margin: 0; padding-left: 18px; font-size: 0.79rem; }
+.config-list li { word-break: break-all; }
+
+.limits-form { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; margin-top: 8px; }
+.limits-field { display: flex; flex-direction: column; gap: 3px; font-size: 0.76rem; color: var(--text-muted); }
+.limits-field input { width: 120px; }
+
+.port-conflict td { background: color-mix(in srgb, var(--critical) 12%, transparent); }
+
 .os-row { cursor: pointer; }
 .os-row:hover td { background: var(--wash); }
 .os-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }

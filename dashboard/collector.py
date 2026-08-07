@@ -513,6 +513,43 @@ def container_clone_spec(host, container_id, timeout=20):
                           verify_tls=host.get("verify_tls", True))
 
 
+def container_stats(host, container_id, timeout=20):
+    if host.get("mode") == "local":
+        import containerctl
+
+        client = agent_module.DockerClient(host.get("docker_socket"))
+        try:
+            return containerctl.stats(client, container_id)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/containers/%s/stats" % (
+        scheme, host.get("address"), host.get("port", 9713),
+        urllib.parse.quote(container_id, safe=""))
+    return _http_get_json(url, token=host.get("token"), timeout=timeout,
+                          verify_tls=host.get("verify_tls", True))
+
+
+def container_update_limits(host, container_id, spec, request_timeout=30):
+    if host.get("mode") == "local":
+        import containerctl
+
+        client = agent_module.DockerClient(host.get("docker_socket"))
+        try:
+            containerctl.update_limits(client, container_id, spec)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+        return {"ok": True, "container": container_id}
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/containers/%s/limits" % (
+        scheme, host.get("address"), host.get("port", 9713),
+        urllib.parse.quote(container_id, safe=""))
+    return _http_post_json(url, spec, token=host.get("token"), timeout=request_timeout,
+                           verify_tls=host.get("verify_tls", True))
+
+
 def pull_image(host, repository, reference, timeout=30):
     if host.get("mode") == "local":
         import containerctl

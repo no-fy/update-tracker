@@ -415,6 +415,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_container_clone_spec(path)
             return
 
+        if path.startswith("/api/hosts/") and "/containers/" in path and path.endswith("/stats"):
+            self._handle_container_stats(path)
+            return
+
         if path.startswith("/api/hosts/") and "/images/job/" in path:
             self._handle_image_job(path)
             return
@@ -589,6 +593,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             if tail == "recreate":
                 self._handle_container_recreate(path)
+                return
+            if tail == "limits":
+                self._handle_container_limits(path)
                 return
 
         if path.startswith("/api/hosts/") and path.endswith("/enabled"):
@@ -825,6 +832,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         try:
             result = collector.container_clone_spec(host, container_id)
+        except collector.ContainerActionRefused as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self._json(200, result)
+
+    def _handle_container_stats(self, path):
+        name, container_id = self._split_container_path(path, "/stats")
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+        try:
+            result = collector.container_stats(host, container_id)
         except collector.ContainerActionRefused as exc:
             self._json(400, {"error": str(exc)})
             return
@@ -1089,6 +1113,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         try:
             result = collector.container_rename(host, container_id, new_name)
+        except collector.ContainerActionRefused as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")
+            try:
+                self._json(exc.code, json.loads(detail))
+            except ValueError:
+                self._json(exc.code, {"error": detail[:300] or "agent refused"})
+            return
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self.server.poller.refresh_async()
+        self._json(200, result)
+
+    def _handle_container_limits(self, path):
+        name, container_id = self._split_container_path(path, "/limits")
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+
+        body = self._read_body()
+        try:
+            result = collector.container_update_limits(host, container_id, body)
         except collector.ContainerActionRefused as exc:
             self._json(400, {"error": str(exc)})
             return

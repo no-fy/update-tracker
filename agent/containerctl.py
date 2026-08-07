@@ -213,6 +213,9 @@ def clone_spec(client, container_id):
                 "mode": parts[2] if len(parts) > 2 else "rw",
             })
 
+    memory = host_config.get("Memory") or 0
+    nano_cpus = host_config.get("NanoCpus") or 0
+
     return {
         "image": config.get("Image") or "",
         "command": config.get("Cmd") or [],
@@ -221,7 +224,104 @@ def clone_spec(client, container_id):
         "volumes": volumes,
         "restart_policy": (host_config.get("RestartPolicy") or {}).get("Name") or "no",
         "network": next(iter(networks), ""),
+        "memory_mb": (memory // (1024 * 1024)) if memory else 0,
+        "cpu_limit": (nano_cpus / 1e9) if nano_cpus else 0,
     }
+
+
+MAX_MEMORY_MB = 1024 * 1024  # 1 TiB -- a sanity cap, not a real limit anyone hits.
+MAX_CPU_LIMIT = 256.0
+
+
+def stats(client, container_id):
+    """One-shot CPU/memory usage, shaped from Docker's raw stats blob.
+
+    CPU% follows Docker CLI's own formula: usage delta over the two samples
+    stats(stream=0) already returns (precpu_stats is the prior sample),
+    scaled by system delta and online CPU count.
+    """
+    _require_id(container_id)
+    raw = client.container_stats(container_id) or {}
+
+    cpu = raw.get("cpu_stats") or {}
+    precpu = raw.get("precpu_stats") or {}
+    cpu_usage = (cpu.get("cpu_usage") or {}).get("total_usage") or 0
+    precpu_usage = (precpu.get("cpu_usage") or {}).get("total_usage") or 0
+    system_usage = cpu.get("system_cpu_usage") or 0
+    presystem_usage = precpu.get("system_cpu_usage") or 0
+    online_cpus = cpu.get("online_cpus") or len(
+        (cpu.get("cpu_usage") or {}).get("percpu_usage") or []) or 1
+
+    cpu_delta = cpu_usage - precpu_usage
+    system_delta = system_usage - presystem_usage
+    cpu_percent = (cpu_delta / system_delta) * online_cpus * 100.0 if system_delta > 0 else 0.0
+
+    mem = raw.get("memory_stats") or {}
+    mem_usage = mem.get("usage") or 0
+    mem_cache = (mem.get("stats") or {}).get("cache") or (mem.get("stats") or {}).get("file") or 0
+    mem_used = max(mem_usage - mem_cache, 0)
+    mem_limit = mem.get("limit") or 0
+    mem_percent = (mem_used / mem_limit) * 100.0 if mem_limit > 0 else 0.0
+
+    return {
+        "cpu_percent": round(cpu_percent, 1),
+        "memory_used": mem_used,
+        "memory_limit": mem_limit,
+        "memory_percent": round(mem_percent, 1),
+    }
+
+
+def update_limits(client, container_id, spec):
+    """Change CPU/memory limits on an existing container without recreating
+    it -- Docker's own /containers/{id}/update endpoint. 0 means unlimited.
+    """
+    _require_allowed()
+    _require_id(container_id)
+    spec = spec or {}
+
+    try:
+        memory_mb = float(spec.get("memory_mb") or 0)
+    except (TypeError, ValueError):
+        raise ActionError("Memory limit must be a number.")
+    if memory_mb < 0 or memory_mb > MAX_MEMORY_MB:
+        raise ActionError("Memory limit must be between 0 (unlimited) and %d MB." % MAX_MEMORY_MB)
+
+    try:
+        cpu_limit = float(spec.get("cpu_limit") or 0)
+    except (TypeError, ValueError):
+        raise ActionError("CPU limit must be a number.")
+    if cpu_limit < 0 or cpu_limit > MAX_CPU_LIMIT:
+        raise ActionError("CPU limit must be between 0 (unlimited) and %g." % MAX_CPU_LIMIT)
+
+    # Docker's update endpoint silently ignores a literal 0 for Memory/NanoCpus
+    # (Go's omitempty drops zero fields), so it can never actually clear a
+    # limit once set -- a documented moby/moby quirk, not something fixable
+    # from here. Substitute the host's own capacity instead: a limit no
+    # tighter than what the host can provide anyway behaves as "unlimited"
+    # in practice, and this way "0" in the UI reliably means "no limit".
+    if not memory_mb or not cpu_limit:
+        try:
+            info = client.info() or {}
+        except Exception as exc:
+            raise ActionError(str(exc))
+        if not memory_mb:
+            memory_mb = (info.get("MemTotal") or 0) / (1024 * 1024)
+        if not cpu_limit:
+            cpu_limit = float(info.get("NCPU") or 1)
+
+    memory_bytes = int(memory_mb * 1024 * 1024)
+    body = {
+        "Memory": memory_bytes,
+        # Docker rejects a Memory update if it would leave MemorySwap smaller
+        # than the new Memory -- set both together. Equal to Memory means no
+        # extra swap beyond the hard memory limit.
+        "MemorySwap": memory_bytes,
+        "NanoCpus": int(cpu_limit * 1e9),
+    }
+    try:
+        client.update_container(container_id, body)
+    except Exception as exc:
+        raise ActionError(str(exc))
 
 
 def create_volume(client, spec):

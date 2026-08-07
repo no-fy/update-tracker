@@ -277,6 +277,19 @@ class DockerClient:
         self.delete(
             "/%s/containers/%s" % (API_VERSION, urllib.parse.quote(container_id, safe="")))
 
+    def container_stats(self, container_id):
+        """One-shot resource snapshot (stream=0) -- not the live stream."""
+        return self.get(
+            "/%s/containers/%s/stats?stream=0" % (
+                API_VERSION, urllib.parse.quote(container_id, safe="")))
+
+    def update_container(self, container_id, body):
+        return self.post_json(
+            "/%s/containers/%s/update" % (
+                API_VERSION, urllib.parse.quote(container_id, safe="")),
+            body,
+        )
+
     def rename_container(self, container_id, new_name):
         self.post_json(
             "/%s/containers/%s/rename?name=%s" % (
@@ -721,6 +734,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     self._send(200, _containerctl().clone_spec(client, container_id))
                 except _containerctl().ActionError as exc:
                     self._send(400, {"error": str(exc)})
+            elif path.startswith("/v1/containers/") and path.endswith("/stats"):
+                container_id = path[len("/v1/containers/"):-len("/stats")]
+                try:
+                    self._send(200, _containerctl().stats(client, container_id))
+                except _containerctl().ActionError as exc:
+                    self._send(400, {"error": str(exc)})
             elif "/images/job/" in path:
                 job_id = path.rsplit("/", 1)[-1]
                 job = _imagectl().RUNNER.get(job_id)
@@ -901,6 +920,19 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     self._send(503, {"error": str(exc)})
                     return
                 self._send(200, {"ok": True, "container": container_id, "name": body.get("name")})
+                return
+
+            if action == "limits":
+                client = DockerClient(self.server.docker_endpoint)
+                try:
+                    containerctl.update_limits(client, container_id, body)
+                except containerctl.ActionError as exc:
+                    self._send(400, {"error": str(exc)})
+                    return
+                except DockerError as exc:
+                    self._send(503, {"error": str(exc)})
+                    return
+                self._send(200, {"ok": True, "container": container_id})
                 return
 
             if action == "recreate":
