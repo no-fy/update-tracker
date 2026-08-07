@@ -103,7 +103,16 @@ def agent_command(enrollment, dashboard_url, socket_path="/var/run/docker.sock")
     so the compose file this agent writes is somewhere docker compose can
     still find once it's running via the host's own namespaces. Without
     it, the Deploy stack button simply does not list this host.
+
+    Two more features are opt-in, off by default, and gated separately from
+    CUD_ALLOW_CONTAINER_ACTIONS -- both are a materially bigger trust
+    boundary than start/stop/restart. Add `-e CUD_ALLOW_EXEC=1` for a
+    Terminal button (a real shell in the container); the port mapping this
+    command already includes for it (agent port + 1) is enough, nothing
+    else to add. Add `-e CUD_ALLOW_VOLUME_BACKUP=1` for Backup/Restore
+    buttons on the Volumes tab -- restore overwrites a volume's data.
     """
+    ws_port = int(enrollment.port) + 1
     return (
         "docker run -d --name {name} --restart unless-stopped \\\n"
         "  --pid=host --privileged \\\n"
@@ -111,6 +120,7 @@ def agent_command(enrollment, dashboard_url, socket_path="/var/run/docker.sock")
         "  -v /:/host:ro \\\n"
         "  -v {name}-logs:/var/lib/container-update-agent \\\n"
         "  -p {port}:{port} \\\n"
+        "  -p {ws_port}:{ws_port} \\\n"
         "  -e CUD_AGENT_TOKEN={agent_token} \\\n"
         "  -e CUD_HOST_ROOT=/host \\\n"
         "  -e CUD_ENROLL_URL={url}/api/enroll \\\n"
@@ -120,6 +130,7 @@ def agent_command(enrollment, dashboard_url, socket_path="/var/run/docker.sock")
         name=CONTAINER_NAME,
         socket=socket_path,
         port=enrollment.port,
+        ws_port=ws_port,
         agent_token=enrollment.agent_token,
         url=dashboard_url.rstrip("/"),
         token=enrollment.token,

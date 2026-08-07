@@ -5,7 +5,15 @@ Runs the real collector, agent and web server against a fake Docker daemon.
 Registry lookups hit the real registries, so this needs outbound HTTPS; pass
 --offline to skip the checks that depend on a live digest.
 
+Exec and volume backup/restore need real Docker hijack behavior the fake
+daemon doesn't implement; pass --with-docker to also run those against
+/var/run/docker.sock (creates and removes real throwaway containers/volumes
+prefixed cud-smoketest-). Off by default -- every other check here is fully
+isolated from whatever Docker daemon happens to be on the machine running
+this file, and that stays true unless you ask for it.
+
     python3 tests/test_smoke.py
+    python3 tests/test_smoke.py --with-docker
 """
 
 import http.server
@@ -14,6 +22,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -31,9 +40,23 @@ import agent as agent_module  # noqa: E402
 from dashboard import collector, config as config_mod, registry as registry_mod  # noqa: E402
 from dashboard import server as server_mod  # noqa: E402
 from dashboard import enroll  # noqa: E402
+import containerctl  # noqa: E402
+import eventstore  # noqa: E402
+import execctl  # noqa: E402
+import imagectl  # noqa: E402
 import ospackages  # noqa: E402
 import osupdate  # noqa: E402
+import stackctl  # noqa: E402
+import volumectl  # noqa: E402
 from fake_docker import FakeDocker, make_fixtures  # noqa: E402
+
+try:
+    import websockets  # noqa: F401
+    HAVE_WEBSOCKETS = True
+except ImportError:
+    HAVE_WEBSOCKETS = False
+
+HAVE_DOCKER_SOCKET = os.path.exists("/var/run/docker.sock")
 
 PASSED = []
 FAILED = []
@@ -50,6 +73,101 @@ def check(name, condition, detail=""):
 
 def section(title):
     print("\n\033[1m%s\033[0m" % title)
+
+
+class StubClient:
+    """A hand-built stand-in for agent.DockerClient's write-path methods --
+    for testing containerctl/imagectl/volumectl/execctl's own logic (input
+    validation, shaping, math) without needing a real or fake Docker server
+    to actually run anything."""
+
+    def __init__(self, **overrides):
+        self._calls = []
+        for key, value in overrides.items():
+            setattr(self, key, value)
+
+    def _record(self, name, *args):
+        self._calls.append((name,) + args)
+
+    def system_df(self):
+        return getattr(self, "_system_df", {})
+
+    def container_stats(self, container_id):
+        self._record("container_stats", container_id)
+        return getattr(self, "_stats", {})
+
+    def prune_containers(self):
+        self._record("prune_containers")
+        return getattr(self, "_prune_containers", {})
+
+    def prune_volumes(self):
+        self._record("prune_volumes")
+        return getattr(self, "_prune_volumes", {})
+
+    def prune_networks(self):
+        self._record("prune_networks")
+        return getattr(self, "_prune_networks", {})
+
+    def prune_images(self, dangling_only=True):
+        self._record("prune_images", dangling_only)
+        return getattr(self, "_prune_images", {})
+
+    def update_container(self, container_id, body):
+        self._record("update_container", container_id, body)
+
+    def volumes(self):
+        return {"Volumes": getattr(self, "_volumes", [])}
+
+    def image(self, ref):
+        return {}
+
+    def pull_image(self, repository, reference, on_line=None):
+        self._record("pull_image", repository, reference)
+
+    def create_container(self, name, body):
+        self._record("create_container", name, body)
+        return {"Id": getattr(self, "_created_id", "stubcontainer0001")}
+
+    def container_action(self, container_id, action, timeout=None):
+        self._record("container_action", container_id, action)
+
+    def wait_container(self, container_id):
+        self._record("wait_container", container_id)
+        return {"StatusCode": getattr(self, "_exit_code", 0)}
+
+    def remove_container(self, container_id):
+        self._record("remove_container", container_id)
+
+    def hijack_attach(self, container_id):
+        self._record("hijack_attach", container_id)
+        return getattr(self, "_attach_sock"), getattr(self, "_attach_leftover", b"")
+
+    def exec_resize(self, exec_id, cols, rows):
+        self._record("exec_resize", exec_id, cols, rows)
+
+
+class FakeSocket:
+    """A minimal recv()-only stand-in for a hijacked Docker connection --
+    yields each entry in ``chunks`` in turn, then empty bytes (EOF)."""
+
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    def recv(self, _n):
+        return self._chunks.pop(0) if self._chunks else b""
+
+    def settimeout(self, _t):
+        pass
+
+    def sendall(self, _data):
+        pass
+
+    def close(self):
+        pass
+
+
+def docker_multiplex_frame(stream_type, payload):
+    return bytes([stream_type, 0, 0, 0]) + len(payload).to_bytes(4, "big") + payload
 
 
 def _raises(exception, func, *args, **kwargs):
@@ -77,6 +195,13 @@ def live_digests(refs):
 
 def main(argv):
     offline = "--offline" in argv
+    # Opt-in, not auto-detected: everything else in this suite runs against
+    # an isolated FakeDocker on a throwaway unix socket. Exec and volume
+    # backup/restore need real Docker hijack behavior FakeDocker doesn't
+    # implement, so these touch the real daemon at /var/run/docker.sock --
+    # only when explicitly asked, so running the suite never surprises
+    # someone by creating or removing real containers/volumes on their host.
+    with_docker = "--with-docker" in argv and HAVE_DOCKER_SOCKET and HAVE_WEBSOCKETS
     workdir = tempfile.mkdtemp(prefix="cud-test-")
     socket_path = os.path.join(workdir, "docker.sock")
     config_path = os.path.join(workdir, "config.json")
@@ -254,6 +379,113 @@ def main(argv):
             check("host removal persisted",
                   config_mod.find_host(reloaded, "dead") is None)
 
+            def dash_post(path, payload=None, raw=None, method="POST"):
+                data = raw if raw is not None else json.dumps(payload or {}).encode("utf-8")
+                request = urllib.request.Request(
+                    "http://127.0.0.1:18500" + path, data=data, method=method)
+                try:
+                    with urllib.request.urlopen(request, timeout=10) as response:
+                        return response.status, response.read()
+                except urllib.error.HTTPError as exc:
+                    return exc.code, exc.read()
+
+            def dash_delete(path):
+                request = urllib.request.Request("http://127.0.0.1:18500" + path, method="DELETE")
+                try:
+                    with urllib.request.urlopen(request, timeout=10) as response:
+                        return response.status, response.read()
+                except urllib.error.HTTPError as exc:
+                    return exc.code, exc.read()
+
+            section("Images / Volumes / Networks tabs")
+            status, body = dash_get("/api/hosts/fixture-local/images")
+            payload = json.loads(body.decode())
+            check("images route lists the fixture images",
+                  status == 200 and len(payload.get("images") or []) == len(fixtures["images"]))
+
+            status, body = dash_get("/api/hosts/fixture-local/volumes")
+            payload = json.loads(body.decode())
+            check("volumes route lists the fixture volumes",
+                  status == 200 and len(payload.get("volumes") or []) == 2, body[:200])
+
+            status, body = dash_get("/api/hosts/fixture-local/networks")
+            payload = json.loads(body.decode())
+            check("networks route lists the fixture networks",
+                  status == 200 and len(payload.get("networks") or []) == 2, body[:200])
+
+            status, body = dash_get("/api/hosts/fixture-local/disk-usage")
+            payload = json.loads(body.decode())
+            check("disk-usage route aggregates the fixture system/df",
+                  status == 200 and payload["volumes"]["reclaimable"] == 2 * 1024 * 1024, body[:300])
+
+            section("Prune routes")
+            status, body = dash_post("/api/hosts/fixture-local/prune/containers")
+            check("prune containers route reaches the fixture", status == 200, body[:200])
+
+            status, body = dash_post("/api/hosts/fixture-local/prune/volumes")
+            payload = json.loads(body.decode())
+            check("prune volumes route returns what was removed",
+                  status == 200 and payload["removed"] == ["orphan-vol"], body[:200])
+
+            status, body = dash_post("/api/hosts/fixture-local/prune/networks")
+            check("prune networks route reaches the fixture", status == 200, body[:200])
+
+            status, body = dash_post(
+                "/api/hosts/fixture-local/prune/images", {"dangling_only": True})
+            check("prune images route reaches the fixture", status == 200, body[:200])
+
+            section("Resource limits and clone-spec routes")
+            fixture_container_id = fixtures["containers"][0]["Id"]
+            status, body = dash_get(
+                "/api/hosts/fixture-local/containers/%s/clone-spec" % fixture_container_id)
+            payload = json.loads(body.decode())
+            check("clone-spec route includes resource limit fields",
+                  status == 200 and "memory_mb" in payload and "cpu_limit" in payload, body[:300])
+
+            status, body = dash_get(
+                "/api/hosts/fixture-local/containers/%s/stats" % fixture_container_id)
+            payload = json.loads(body.decode())
+            check("stats route computes cpu/memory from the fixture's raw stats",
+                  status == 200 and payload["cpu_percent"] > 0 and payload["memory_used"] > 0,
+                  body[:300])
+
+            status, body = dash_post(
+                "/api/hosts/fixture-local/containers/%s/limits" % fixture_container_id,
+                {"memory_mb": 256, "cpu_limit": 0.5})
+            check("limits route reaches the fixture's update endpoint", status == 200, body[:200])
+
+            section("Registry credentials via the API")
+            status, body = dash_post(
+                "/api/registries", {"host": "ghcr.io", "username": "bob", "password": "tok"})
+            check("registries route adds credentials", status == 200, body[:200])
+
+            status, body = dash_get("/api/registries")
+            payload = json.loads(body.decode())
+            hosts_listed = {r["host"] for r in payload["registries"]}
+            check("registries route lists the host without the password",
+                  "ghcr.io" in hosts_listed and b"tok" not in body)
+
+            status, body = dash_delete("/api/registries/ghcr.io")
+            check("registries route removes a host", status == 200, body[:200])
+            status, body = dash_get("/api/registries")
+            payload = json.loads(body.decode())
+            check("removed registry no longer listed",
+                  "ghcr.io" not in {r["host"] for r in payload["registries"]})
+
+            status, body = dash_delete("/api/registries/never-added.example")
+            check("removing an unknown registry 404s", status == 404, body[:200])
+
+            section("Stack templates via the API")
+            status, body = dash_post(
+                "/api/stack-templates", {"name": "web-basic", "compose": "services:\n  web:\n    image: nginx\n"})
+            check("stack-templates route saves a template", status == 200, body[:200])
+            status, body = dash_get("/api/stack-templates")
+            payload = json.loads(body.decode())
+            check("stack-templates route lists it back",
+                  any(t["name"] == "web-basic" for t in payload.get("templates") or []), body[:300])
+            status, body = dash_delete("/api/stack-templates/web-basic")
+            check("stack-templates route removes it", status == 200, body[:200])
+
             httpd.poller.stop()
             httpd.shutdown()
             httpd.server_close()
@@ -273,6 +505,221 @@ def main(argv):
             results_local = collector.poll_hosts(cfg["hosts"], timeout=10)
             check("registered local socket is readable",
                   results_local[0]["online"] and len(results_local[0]["containers"]) == 8)
+
+        section("containerctl: stats math and limit validation")
+        stats_client = StubClient(_stats={
+            "cpu_stats": {"cpu_usage": {"total_usage": 2000000000},
+                          "system_cpu_usage": 40000000000, "online_cpus": 4},
+            "precpu_stats": {"cpu_usage": {"total_usage": 1000000000},
+                              "system_cpu_usage": 30000000000},
+            "memory_stats": {"usage": 50 * 1024 * 1024, "limit": 512 * 1024 * 1024,
+                              "stats": {"cache": 0}},
+        })
+        stats = containerctl.stats(stats_client, "a" * 64)
+        check("cpu percent from the delta formula",
+              abs(stats["cpu_percent"] - 40.0) < 0.01, stats)
+        check("memory used subtracts cache", stats["memory_used"] == 50 * 1024 * 1024, stats)
+
+        limits_client = StubClient()
+        containerctl.update_limits(limits_client, "a" * 64, {"memory_mb": 256, "cpu_limit": 0.5})
+        sent = limits_client._calls[0]
+        check("update_limits sends bytes, not MB", sent[2]["Memory"] == 256 * 1024 * 1024, sent)
+        check("update_limits sends matching MemorySwap (no extra swap)",
+              sent[2]["MemorySwap"] == sent[2]["Memory"], sent)
+        check("update_limits refuses a negative memory value",
+              _raises(containerctl.ActionError, containerctl.update_limits,
+                      StubClient(), "a" * 64, {"memory_mb": -1, "cpu_limit": 0}))
+        check("update_limits refuses an absurd cpu value",
+              _raises(containerctl.ActionError, containerctl.update_limits,
+                      StubClient(), "a" * 64, {"memory_mb": 0, "cpu_limit": 99999}))
+
+        zero_client = StubClient()
+        zero_client.info = lambda: {"MemTotal": 16 * 1024 ** 3, "NCPU": 8}
+        containerctl.update_limits(zero_client, "a" * 64, {"memory_mb": 0, "cpu_limit": 0})
+        zero_sent = zero_client._calls[0]
+        check("update_limits substitutes host capacity for 0 (Docker ignores a literal 0)",
+              zero_sent[2]["Memory"] == 16 * 1024 ** 3 and zero_sent[2]["NanoCpus"] == 8 * 10 ** 9,
+              zero_sent)
+
+        section("containerctl: prune shaping and disk usage aggregation")
+        prune_client = StubClient(_prune_containers={"ContainersDeleted": ["c1", "c2"],
+                                                       "SpaceReclaimed": 1024})
+        result = containerctl.prune_containers(prune_client)
+        check("prune_containers shapes Docker's raw response",
+              result == {"removed": ["c1", "c2"], "space_reclaimed": 1024}, result)
+
+        prune_client2 = StubClient(_prune_volumes={"VolumesDeleted": None, "SpaceReclaimed": None})
+        result = containerctl.prune_volumes(prune_client2)
+        check("prune_volumes tolerates a null removed-list", result["removed"] == [], result)
+
+        df_client = StubClient(_system_df={
+            "Images": [{"Size": 100, "Containers": 0}, {"Size": 200, "Containers": 1}],
+            "Containers": [{"SizeRw": 50, "State": "exited"}, {"SizeRw": 30, "State": "running"}],
+            "Volumes": [{"UsageData": {"RefCount": 0, "Size": 10}}],
+            "BuildCache": [{"Size": 5, "InUse": False}, {"Size": 7, "InUse": True}],
+        })
+        usage = containerctl.disk_usage(df_client)
+        check("disk_usage only counts unattached images as reclaimable",
+              usage["images"]["reclaimable"] == 100, usage)
+        check("disk_usage only counts stopped containers as reclaimable",
+              usage["containers"]["reclaimable"] == 50, usage)
+        check("disk_usage totals every category",
+              usage["total_reclaimable"] == 100 + 50 + 10 + 5, usage)
+
+        section("imagectl: prune shaping")
+        img_client = StubClient(_prune_images={
+            "ImagesDeleted": [{"Untagged": "old:tag"}, {"Deleted": "sha256:abc"}],
+            "SpaceReclaimed": 4096,
+        })
+        result = imagectl.prune_images(img_client, dangling_only=True)
+        check("imagectl.prune_images prefers Untagged, falls back to Deleted",
+              result["removed"] == ["old:tag", "sha256:abc"], result)
+        check("imagectl.prune_images passes dangling_only through",
+              img_client._calls[0] == ("prune_images", True))
+
+        section("volumectl: demux, capability gating, volume existence")
+        frames = (
+            docker_multiplex_frame(1, b"tar-bytes-stdout-")
+            + docker_multiplex_frame(2, b"a stderr line that must be dropped")
+            + docker_multiplex_frame(1, b"more-stdout")
+        )
+        demuxed = volumectl._demux(FakeSocket([]), leftover=frames)
+        check("volumectl._demux keeps only stdout frames",
+              demuxed == b"tar-bytes-stdout-more-stdout", demuxed)
+
+        split_frames = [frames[:5], frames[5:]]
+        demuxed_split = volumectl._demux(FakeSocket(split_frames), leftover=b"")
+        check("volumectl._demux handles a header split across recv() calls",
+              demuxed_split == b"tar-bytes-stdout-more-stdout", demuxed_split)
+
+        check("volume backup is off by default", volumectl.capability()["can_backup"] is False)
+        check("backup refuses when the env var is off",
+              _raises(containerctl.ActionError, volumectl.backup, StubClient(), "any-volume"))
+        os.environ["CUD_ALLOW_VOLUME_BACKUP"] = "1"
+        try:
+            check("volume backup capability turns on with the env var",
+                  volumectl.capability()["can_backup"] is True)
+            check("backup refuses an unsafe volume name",
+                  _raises(containerctl.ActionError, volumectl.backup, StubClient(_volumes=[]),
+                          "../etc"))
+            check("backup refuses a volume Docker doesn't know about",
+                  _raises(containerctl.ActionError, volumectl.backup,
+                          StubClient(_volumes=[{"Name": "other"}]), "missing-volume"))
+            check("restore refuses an empty upload",
+                  _raises(containerctl.ActionError, volumectl.restore,
+                          StubClient(_volumes=[{"Name": "v"}]), "v", b""))
+        finally:
+            del os.environ["CUD_ALLOW_VOLUME_BACKUP"]
+
+        section("execctl: capability gating")
+        check("exec is off by default", execctl.capability()["can_exec"] is False)
+        check("open_session refuses when the env var is off",
+              _raises(containerctl.ActionError, execctl.open_session, StubClient(), "a" * 64))
+        os.environ["CUD_ALLOW_EXEC"] = "1"
+        try:
+            check("exec capability turns on with the env var",
+                  execctl.capability()["can_exec"] is True)
+            check("open_session still refuses a malformed container id",
+                  _raises(containerctl.ActionError, execctl.open_session, StubClient(), "not-an-id"))
+        finally:
+            del os.environ["CUD_ALLOW_EXEC"]
+        check("resize on a broken client is best-effort, not a crash",
+              execctl.resize(StubClient(), "e1", 80, 24) is None)
+        check("resize clamps a nonsense size instead of raising",
+              execctl.resize(StubClient(), "e1", "nonsense", 24) is None)
+
+        section("stackctl: name/path safety and capability gating")
+        check("a safe project name is accepted", bool(stackctl.SAFE_PROJECT.match("my-stack_1")))
+        check("a project name with a slash is rejected", not stackctl.SAFE_PROJECT.match("a/b"))
+        check("a safe compose path is accepted",
+              bool(stackctl.SAFE_PATH.match("/opt/stacks/app/docker-compose.yml")))
+        check("a relative path is rejected (must be absolute)",
+              not stackctl.SAFE_PATH.match("relative/path.yml"))
+
+        os.environ.pop("CUD_STACKS_DIR", None)
+        cap = stackctl.capability()
+        check("stack deploy needs CUD_STACKS_DIR configured", cap["can_deploy"] is False)
+        redeploy_cap = stackctl.redeploy_capability()
+        check("stack redeploy capability reports a reason when nsenter is unavailable",
+              redeploy_cap["can_redeploy"] is False or redeploy_cap["reason"] is None)
+
+        with tempfile.TemporaryDirectory() as stacks_dir:
+            os.environ["CUD_STACKS_DIR"] = stacks_dir
+            try:
+                cap = stackctl.capability()
+                check("stack deploy capability turns on once CUD_STACKS_DIR is set",
+                      cap["can_deploy"] is True, cap)
+                inside = os.path.join(stacks_dir, "proj", "docker-compose.yml")
+                os.makedirs(os.path.dirname(inside))
+                with open(inside, "w") as handle:
+                    handle.write("services: {}\n")
+                stackctl.write_compose_file(inside, "services:\n  web:\n    image: nginx\n")
+                with open(inside) as handle:
+                    check("write_compose_file writes inside the stacks dir",
+                          "nginx" in handle.read())
+                outside = os.path.join(os.path.dirname(stacks_dir), "escape.yml")
+                check("write_compose_file refuses a path outside the stacks dir",
+                      _raises(containerctl.ActionError, stackctl.write_compose_file,
+                              outside, "services: {}\n"))
+            finally:
+                del os.environ["CUD_STACKS_DIR"]
+
+        section("eventstore: shaping and actor id truncation")
+        container_event = eventstore._record_from_raw({
+            "Type": "container", "Action": "start", "time": time.time(),
+            "Actor": {"ID": "a" * 64, "Attributes": {"name": "web"}},
+        })
+        check("a container actor id is truncated to 12 chars",
+              container_event["actor_id"] == "a" * 12, container_event)
+
+        network_event = eventstore._record_from_raw({
+            "Type": "network", "Action": "connect", "time": time.time(),
+            "Actor": {"ID": "network-id-not-hex-and-not-12-chars", "Attributes": {}},
+        })
+        check("a non-container actor id is left alone",
+              network_event["actor_id"] == "network-id-not-hex-and-not-12-chars", network_event)
+
+        with tempfile.TemporaryDirectory() as event_dir:
+            store = eventstore.Store(os.path.join(event_dir, "events.db"))
+            check("a fresh event store is ready", store.ready, store.error)
+            check("capability reports enabled once ready", store.capability()["enabled"] is True)
+
+        section("config.py: registry credential storage")
+        reg_config = {"registries": {}, "insecure_registries": []}
+        config_mod.upsert_registry(reg_config, "GHCR.io", "alice", "secret1", insecure=False)
+        check("registry host is stored lowercase",
+              "ghcr.io" in reg_config["registries"], reg_config["registries"])
+        check("registry password is stored", reg_config["registries"]["ghcr.io"]["password"] == "secret1")
+
+        config_mod.upsert_registry(reg_config, "ghcr.io", "alice2", "", insecure=True)
+        check("a blank password on re-submit keeps the stored one",
+              reg_config["registries"]["ghcr.io"]["password"] == "secret1", reg_config["registries"])
+        check("username still updates even when password is blank",
+              reg_config["registries"]["ghcr.io"]["username"] == "alice2")
+        check("insecure flag adds the host to insecure_registries",
+              "ghcr.io" in reg_config["insecure_registries"])
+
+        config_mod.upsert_registry(reg_config, "ghcr.io", "alice2", "", insecure=False)
+        check("insecure flag can be turned back off",
+              "ghcr.io" not in reg_config["insecure_registries"])
+
+        removed = config_mod.remove_registry(reg_config, "ghcr.io")
+        check("remove_registry returns the removed entry", removed is not None)
+        check("remove_registry actually removes it", "ghcr.io" not in reg_config["registries"])
+        check("removing an unknown registry returns None",
+              config_mod.remove_registry(reg_config, "never-there") is None)
+
+        section("collector.py: stacks summary")
+        synthetic_hosts = [
+            {"containers": [{"update_status": "up-to-date", "state": "running"}],
+             "online": True, "os": {},
+             "stacks": [{"needs_attention": False}, {"needs_attention": True}]},
+            {"containers": [], "online": True, "os": {}, "stacks": [{"needs_attention": False}]},
+        ]
+        stacks_summary = collector.summarise(synthetic_hosts)
+        check("summarise totals stacks across hosts", stacks_summary["stacks_total"] == 3)
+        check("summarise counts only the stacks needing attention",
+              stacks_summary["stacks_needing_attention"] == 1)
 
         section("Credentials")
         hashed = config_mod.hash_password("correct-horse")
@@ -372,11 +819,11 @@ def main(argv):
             def log_message(self, *_args):
                 pass
 
-        live = store.create(name="enrolled", port=19714)
-        stub = http.server.HTTPServer(("127.0.0.1", 19714), StubAgent)
+        live = store.create(name="enrolled", port=19914)
+        stub = http.server.HTTPServer(("127.0.0.1", 19914), StubAgent)
         threading.Thread(target=stub.serve_forever, daemon=True).start()
         try:
-            registered = store.claim(live.token, "127.0.0.1", {"port": 19714})
+            registered = store.claim(live.token, "127.0.0.1", {"port": 19914})
             check("verified agent is registered", registered.status == "registered")
             check("verification presented the agent token",
                   seen.get("auth") == "Bearer " + live.agent_token)
@@ -386,7 +833,7 @@ def main(argv):
                   entry is not None and entry["token"] == live.agent_token)
             check("registered host points at the caller",
                   entry is not None and entry["address"] == "127.0.0.1"
-                  and entry["port"] == 19714)
+                  and entry["port"] == 19914)
             check("label comes from the agent's own hostname",
                   entry is not None and entry["label"] == "pi.lan")
         finally:
@@ -594,6 +1041,79 @@ def main(argv):
         already = {"hosts": [{"name": "nas", "mode": "agent"}]}
         check("existing hosts are left alone",
               server_mod.ensure_local_host_registered(already, fresh_path) is None)
+
+        if with_docker:
+            section("Exec and volume backup/restore (real Docker socket)")
+            real_client = agent_module.DockerClient("/var/run/docker.sock")
+            test_container = None
+            test_volume = "cud-smoketest-vol-%d" % int(time.time())
+            try:
+                subprocess.run(
+                    ["docker", "run", "-d", "--rm", "--name",
+                     "cud-smoketest-%d" % int(time.time()), "busybox", "sleep", "120"],
+                    check=True, capture_output=True, text=True,
+                )
+                inspect = subprocess.run(
+                    ["docker", "ps", "-q", "--filter", "name=cud-smoketest-"],
+                    check=True, capture_output=True, text=True,
+                )
+                test_container = inspect.stdout.strip().splitlines()[-1]
+
+                os.environ["CUD_ALLOW_EXEC"] = "1"
+                try:
+                    sock, leftover, exec_id = execctl.open_session(real_client, test_container)
+                    sock.sendall(b"echo smoketest-exec-ok\n")
+                    time.sleep(0.4)
+                    sock.settimeout(2)
+                    output = leftover + sock.recv(65536)
+                    check("real exec session returns real shell output",
+                          b"smoketest-exec-ok" in output, output[:200])
+                    execctl.resize(real_client, exec_id, 100, 30)
+                    sock.close()
+                finally:
+                    del os.environ["CUD_ALLOW_EXEC"]
+
+                subprocess.run(["docker", "volume", "create", test_volume],
+                                check=True, capture_output=True, text=True)
+                subprocess.run(
+                    ["docker", "run", "--rm", "-v", "%s:/data" % test_volume, "busybox",
+                     "sh", "-c", "echo real-backup-test > /data/f.txt"],
+                    check=True, capture_output=True, text=True,
+                )
+                os.environ["CUD_ALLOW_VOLUME_BACKUP"] = "1"
+                try:
+                    archive = volumectl.backup(real_client, test_volume)
+                    check("real backup produces a valid gzip header", archive[:2] == b"\x1f\x8b")
+                    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tf:
+                        names = tf.getnames()
+                    check("real backup archive contains the file written to the volume",
+                          any(n.endswith("f.txt") for n in names), names)
+
+                    restore_volume = test_volume + "-restore"
+                    subprocess.run(["docker", "volume", "create", restore_volume],
+                                    check=True, capture_output=True, text=True)
+                    try:
+                        volumectl.restore(real_client, restore_volume, archive)
+                        cat = subprocess.run(
+                            ["docker", "run", "--rm", "-v", "%s:/data" % restore_volume,
+                             "busybox", "cat", "/data/f.txt"],
+                            check=True, capture_output=True, text=True,
+                        )
+                        check("real restore round-trips the file content",
+                              cat.stdout.strip() == "real-backup-test", cat.stdout)
+                    finally:
+                        subprocess.run(["docker", "volume", "rm", "-f", restore_volume],
+                                        capture_output=True, text=True)
+                finally:
+                    del os.environ["CUD_ALLOW_VOLUME_BACKUP"]
+            finally:
+                if test_container:
+                    subprocess.run(["docker", "kill", test_container], capture_output=True, text=True)
+                subprocess.run(["docker", "volume", "rm", "-f", test_volume],
+                                capture_output=True, text=True)
+        else:
+            print("  \033[33mskip\033[0m real-Docker exec/volume-backup checks "
+                  "(pass --with-docker to run them against /var/run/docker.sock)")
 
     finally:
         shutil.rmtree(workdir, ignore_errors=True)

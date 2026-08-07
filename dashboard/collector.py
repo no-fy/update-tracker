@@ -54,6 +54,37 @@ def _http_get_json(url, token=None, timeout=20, verify_tls=True):
         return json.loads(response.read().decode("utf-8"))
 
 
+def _http_get_raw(url, token=None, timeout=60, verify_tls=True):
+    headers = {"User-Agent": "container-update-dashboard/1.0"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    request = urllib.request.Request(url, headers=headers)
+    context = None
+    if url.startswith("https://") and not verify_tls:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+        return response.read()
+
+
+def _http_post_raw(url, data, token=None, timeout=60, verify_tls=True):
+    headers = {
+        "User-Agent": "container-update-dashboard/1.0",
+        "Content-Type": "application/octet-stream",
+    }
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    context = None
+    if url.startswith("https://") and not verify_tls:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
 def poll_host(host, timeout=20, include_stopped=True):
     """Fetch one host's snapshot. Never raises -- failures become host errors."""
     name = host.get("name") or host.get("address") or "unnamed"
@@ -77,6 +108,8 @@ def poll_host(host, timeout=20, include_stopped=True):
         event_history=None,
         stack_deploy=None,
         stack_redeploy=None,
+        exec=None,
+        volume_backup=None,
     )
 
     if not host.get("enabled", True):
@@ -112,6 +145,8 @@ def poll_host(host, timeout=20, include_stopped=True):
         result["event_history"] = snapshot.get("event_history")
         result["stack_deploy"] = snapshot.get("stack_deploy")
         result["stack_redeploy"] = snapshot.get("stack_redeploy")
+        result["exec"] = snapshot.get("exec")
+        result["volume_backup"] = snapshot.get("volume_backup")
         result["os"] = _poll_os(host, timeout)
     except agent_module.DockerError as exc:
         result["error"] = str(exc)
@@ -605,6 +640,45 @@ def image_job(host, job_id, timeout=20):
         if exc.code == 404:
             return None
         raise
+
+
+def volume_backup(host, volume_name, timeout=120):
+    if host.get("mode") == "local":
+        import containerctl
+        import volumectl
+
+        client = agent_module.DockerClient(host.get("docker_socket"))
+        try:
+            return volumectl.backup(client, volume_name)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/volumes/%s/backup" % (
+        scheme, host.get("address"), host.get("port", 9713),
+        urllib.parse.quote(volume_name, safe=""))
+    return _http_get_raw(url, token=host.get("token"), timeout=timeout,
+                         verify_tls=host.get("verify_tls", True))
+
+
+def volume_restore(host, volume_name, tar_bytes, timeout=120):
+    if host.get("mode") == "local":
+        import containerctl
+        import volumectl
+
+        client = agent_module.DockerClient(host.get("docker_socket"))
+        try:
+            volumectl.restore(client, volume_name, tar_bytes)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+        return {"ok": True, "volume": volume_name}
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/volumes/%s/restore" % (
+        scheme, host.get("address"), host.get("port", 9713),
+        urllib.parse.quote(volume_name, safe=""))
+    return _http_post_raw(url, tar_bytes, token=host.get("token"), timeout=timeout,
+                          verify_tls=host.get("verify_tls", True))
 
 
 def host_disk_usage(host, timeout=20):

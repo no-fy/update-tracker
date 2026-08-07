@@ -1,10 +1,14 @@
 FROM python:3.12-alpine
 
-# The agent is stdlib-only. su-exec lets the entrypoint drop root; nsenter
-# (util-linux-misc) runs OS updates in the host's namespaces.
+# su-exec lets the entrypoint drop root; nsenter (util-linux-misc) runs OS
+# updates in the host's namespaces.
 RUN apk add --no-cache su-exec util-linux-misc
 
-COPY agent/agent.py agent/containerctl.py agent/eventstore.py agent/imagectl.py agent/logstore.py agent/ospackages.py agent/osupdate.py agent/stackctl.py /app/
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY agent/agent.py agent/containerctl.py agent/eventstore.py agent/execctl.py agent/imagectl.py agent/logstore.py agent/ospackages.py agent/osupdate.py agent/stackctl.py agent/volumectl.py /app/
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
@@ -15,7 +19,9 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 RUN adduser -S -u 10001 -H cudagent
 ENV APP_USER=cudagent
 
-EXPOSE 9713
+# 9713: the agent HTTP API. 9714: WebSocket only, for exec/terminal sessions
+# -- same reason as the dashboard's split port, see Dockerfile.
+EXPOSE 9713 9714
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 CMD \
   python3 -c "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9713/healthz', timeout=4).status == 200 else 1)"

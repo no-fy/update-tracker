@@ -926,6 +926,22 @@ tr.detail td { padding: 0 18px 14px; background: transparent; }
   font-size: 0.82rem;
 }
 
+.exec-output {
+  background: #0b0b0b;
+  color: #e8e8e3;
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  line-height: 1.4;
+  padding: 12px 14px;
+  border-radius: 8px;
+  height: 420px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 8px 0;
+}
+.exec-output:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
 .disk-usage { display: flex; flex-direction: column; gap: 4px; margin: 10px 0; font-size: 0.82rem; }
 .disk-usage-row { display: flex; justify-content: space-between; gap: 12px; padding: 4px 2px; }
 .disk-usage-reclaimable { color: var(--text-muted); }

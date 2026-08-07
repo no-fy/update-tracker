@@ -109,8 +109,48 @@ def make_fixtures(live_digests=None):
         "Containers": len(containers),
         "ContainersRunning": sum(1 for c in containers if c["State"] == "running"),
         "Images": len(images),
+        "Warnings": ["WARNING: No swap limit support"],
     }
-    return {"info": info, "containers": containers, "images": images}
+
+    volumes = [
+        {"Name": "homelab_db-data", "Driver": "local",
+         "Mountpoint": "/var/lib/docker/volumes/homelab_db-data/_data",
+         "CreatedAt": "2026-01-01T00:00:00Z", "Labels": {}, "Scope": "local"},
+        {"Name": "orphan-vol", "Driver": "local",
+         "Mountpoint": "/var/lib/docker/volumes/orphan-vol/_data",
+         "CreatedAt": "2026-01-02T00:00:00Z", "Labels": {}, "Scope": "local"},
+    ]
+
+    networks = [
+        {"Id": "net1", "Name": "homelab_default", "Driver": "bridge", "Scope": "local",
+         "IPAM": {"Config": [{"Subnet": "172.20.0.0/16", "Gateway": "172.20.0.1"}]}},
+        {"Id": "net2", "Name": "bridge", "Driver": "bridge", "Scope": "local",
+         "IPAM": {"Config": [{"Subnet": "172.17.0.0/16", "Gateway": "172.17.0.1"}]}},
+    ]
+
+    system_df = {
+        "LayersSize": 500 * 1024 * 1024,
+        "Images": [
+            {"Id": iid, "Size": 100 * 1024 * 1024,
+             "Containers": 1 if any(c["ImageID"] == iid for c in containers) else 0}
+            for iid in images
+        ],
+        "Containers": [
+            {"Id": c["Id"], "SizeRw": 1024 * 1024, "State": c["State"]} for c in containers
+        ],
+        "Volumes": [
+            {"Name": "homelab_db-data", "UsageData": {"RefCount": 1, "Size": 5 * 1024 * 1024}},
+            {"Name": "orphan-vol", "UsageData": {"RefCount": 0, "Size": 2 * 1024 * 1024}},
+        ],
+        "BuildCache": [
+            {"ID": "c1", "Size": 10 * 1024 * 1024, "InUse": False},
+        ],
+    }
+
+    return {
+        "info": info, "containers": containers, "images": images,
+        "volumes": volumes, "networks": networks, "system_df": system_df,
+    }
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -137,8 +177,38 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if path.endswith("/info"):
             self._json(200, data["info"])
             return
+        if path.endswith("/system/df"):
+            self._json(200, data["system_df"])
+            return
+        if path.endswith("/volumes"):
+            self._json(200, {"Volumes": data["volumes"]})
+            return
+        if path.endswith("/networks"):
+            self._json(200, data["networks"])
+            return
+        if "/images/json" in path:
+            self._json(200, list(data["images"].values()))
+            return
         if "/containers/json" in path:
             self._json(200, data["containers"])
+            return
+        if "/containers/" in path and path.endswith("/json"):
+            cid = path.split("/containers/", 1)[1][: -len("/json")]
+            for container in data["containers"]:
+                if container["Id"] == cid:
+                    self._json(200, self._inspect(container, data))
+                    return
+            self._json(404, {"message": "no such container: " + cid})
+            return
+        if "/containers/" in path and path.endswith("/stats"):
+            self._json(200, {
+                "cpu_stats": {"cpu_usage": {"total_usage": 2000000000},
+                              "system_cpu_usage": 40000000000, "online_cpus": 4},
+                "precpu_stats": {"cpu_usage": {"total_usage": 1000000000},
+                                  "system_cpu_usage": 30000000000},
+                "memory_stats": {"usage": 50 * 1024 * 1024, "limit": 512 * 1024 * 1024,
+                                  "stats": {"cache": 0}},
+            })
             return
         if "/images/" in path and path.endswith("/json"):
             ref = urllib.parse.unquote(path.split("/images/", 1)[1][: -len("/json")])
@@ -150,6 +220,48 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     self._json(200, image)
                     return
             self._json(404, {"message": "no such image: " + ref})
+            return
+        self._json(404, {"message": "unsupported: " + path})
+
+    def _inspect(self, container, data):
+        image = data["images"].get(container["ImageID"], {})
+        return {
+            "Id": container["Id"],
+            "Name": "/" + container["Names"][0].lstrip("/"),
+            "State": {"Status": container["State"]},
+            "Config": {
+                "Image": container["Image"], "Cmd": None,
+                "Env": ["PATH=/usr/bin", "APP_ENV=fixture"],
+            },
+            "HostConfig": {
+                "Binds": [], "PortBindings": {}, "RestartPolicy": {"Name": "unless-stopped"},
+                "Memory": 0, "NanoCpus": 0,
+            },
+            "NetworkSettings": {"Networks": {"homelab_default": {}}},
+            "Mounts": [],
+        }
+
+    def do_POST(self):  # noqa: N802
+        data = self.server.fixtures
+        path = urllib.parse.urlparse(self.path).path
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+
+        if path.endswith("/containers/prune"):
+            self._json(200, {"ContainersDeleted": [], "SpaceReclaimed": 0})
+            return
+        if path.endswith("/volumes/prune"):
+            self._json(200, {"VolumesDeleted": ["orphan-vol"], "SpaceReclaimed": 2097152})
+            return
+        if path.endswith("/networks/prune"):
+            self._json(200, {"NetworksDeleted": []})
+            return
+        if path.endswith("/images/prune"):
+            self._json(200, {"ImagesDeleted": [], "SpaceReclaimed": 0})
+            return
+        if path.endswith("/update"):
+            self._json(200, {"Warnings": []})
             return
         self._json(404, {"message": "unsupported: " + path})
 
