@@ -33,7 +33,7 @@
     containerJobs: {}, logsOpen: {}, logs: {}, renaming: {}, settings: {}, logsRange: {},
     stackOpen: {}, stackTemplates: [], stackFileContext: null,
     configOpen: {}, config: {}, stats: {}, limitsJobs: {}, portMapOpen: false,
-    registries: [],
+    registries: [], exec: { ws: null, buffer: "" },
     assistant: { open: false, wire: [], display: [], loading: false, error: null }
   };
   var el = {};
@@ -795,7 +795,10 @@
     var table = document.createElement("table");
     var thead = document.createElement("thead");
     var headRow = document.createElement("tr");
-    [["Name", ""], ["Driver", "optional"], ["Created", "optional"], ["Used by", ""]].forEach(function (c) {
+    var canBackup = !!(host.volume_backup && host.volume_backup.can_backup);
+    var columns = [["Name", ""], ["Driver", "optional"], ["Created", "optional"], ["Used by", ""]];
+    if (canBackup) columns.push(["Backup", ""]);
+    columns.forEach(function (c) {
       headRow.appendChild(text("th", c[1], c[0]));
     });
     thead.appendChild(headRow);
@@ -813,12 +816,87 @@
       row.appendChild(text("td", null, users.length
         ? users.map(function (c) { return c.name; }).join(", ")
         : "orphaned"));
+      if (canBackup) {
+        var actionsCell = text("td", null);
+        var backupBtn = text("button", "button small");
+        backupBtn.type = "button";
+        backupBtn.textContent = "Backup";
+        backupBtn.addEventListener("click", function () { backupVolume(host, vol); });
+        actionsCell.appendChild(backupBtn);
+        var restoreBtn = text("button", "button small");
+        restoreBtn.type = "button";
+        restoreBtn.textContent = "Restore";
+        restoreBtn.addEventListener("click", function () { openRestoreVolume(host, vol); });
+        actionsCell.appendChild(restoreBtn);
+        row.appendChild(actionsCell);
+      }
       tbody.appendChild(row);
     });
     table.appendChild(tbody);
     scroll.appendChild(table);
     card.appendChild(scroll);
     return card;
+  }
+
+  function downloadBlob(filename, blob) {
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  }
+
+  function backupVolume(host, vol) {
+    fetch("/api/hosts/" + encodeURIComponent(host.name) + "/volumes/" +
+      encodeURIComponent(vol.name) + "/backup")
+      .then(function (r) {
+        if (!r.ok) {
+          return r.json().then(function (e) { throw new Error(e.error || "Backup failed."); });
+        }
+        return r.blob();
+      })
+      .then(function (blob) { downloadBlob(vol.name + ".tar.gz", blob); })
+      .catch(function (err) { window.alert(err.message || "Backup failed."); });
+  }
+
+  var restoreVolumeContext = null;
+
+  function openRestoreVolume(host, vol) {
+    restoreVolumeContext = { host: host, vol: vol };
+    el.restoreVolumeFileInput.value = "";
+    el.restoreVolumeFileInput.click();
+  }
+
+  function handleRestoreVolumeFile() {
+    var file = el.restoreVolumeFileInput.files[0];
+    var ctx = restoreVolumeContext;
+    if (!file || !ctx) return;
+    confirmDialog(
+      "Restore into this volume?",
+      "This replaces everything currently in " + ctx.vol.name + " on " +
+      (ctx.host.label || ctx.host.name) + " with the contents of " + file.name +
+      ". There is no undo.",
+      { confirmLabel: "Restore", danger: true }
+    ).then(function (ok) {
+      if (!ok) return;
+      file.arrayBuffer()
+        .then(function (buf) {
+          return fetch(
+            "/api/hosts/" + encodeURIComponent(ctx.host.name) + "/volumes/" +
+            encodeURIComponent(ctx.vol.name) + "/restore",
+            { method: "POST", body: buf }
+          );
+        })
+        .then(function (r) { return r.json(); })
+        .then(function (result) {
+          if (result.error) throw new Error(result.error);
+          window.alert("Restored " + ctx.vol.name + ".");
+        })
+        .catch(function (err) { window.alert(err.message || "Restore failed."); });
+    });
   }
 
   // -- Networks --
@@ -1229,14 +1307,14 @@
     }).filter(function (v) { return v.source && v.destination; });
   }
 
-  function openCreateContainer(prefill, hostName) {
+  function openCreateContainer(prefill, hostName, title) {
     var hosts = eligibleHosts(state.data, function (h) { return h.container_actions; });
     fillSelect(el.createContainerHost, hosts);
     if (hostName && hosts.some(function (h) { return h.name === hostName; })) {
       el.createContainerHost.value = hostName;
     }
 
-    el.createContainerTitle.textContent = prefill ? "Clone container" : "Create a container";
+    el.createContainerTitle.textContent = title || (prefill ? "Clone container" : "Create a container");
     el.createContainerName.value = (prefill && prefill.name) ? prefill.name + "-copy" : "";
     el.createContainerImage.value = (prefill && prefill.image) || "";
     var command = prefill && prefill.command;
@@ -1306,6 +1384,35 @@
       .catch(function (err) {
         window.alert(err.message || "Could not read that container's config.");
       });
+  }
+
+  function openImportConfig() {
+    el.importConfigFileInput.value = "";
+    el.importConfigFileInput.click();
+  }
+
+  function handleImportConfigFile() {
+    var file = el.importConfigFileInput.files[0];
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function () {
+      var spec;
+      try {
+        spec = JSON.parse(reader.result);
+      } catch (err) {
+        window.alert("That file isn't valid JSON.");
+        return;
+      }
+      if (!spec || typeof spec !== "object" || !spec.image) {
+        window.alert("That doesn't look like an exported container config -- expected an \"image\" field.");
+        return;
+      }
+      openCreateContainer(spec, state.host || null, "Import container config");
+    };
+    reader.onerror = function () {
+      window.alert("Could not read that file.");
+    };
+    reader.readAsText(file);
   }
 
   function submitCreateContainer(event) {
@@ -1528,6 +1635,24 @@
     });
   }
 
+  function openDeployStackFilePicker() {
+    el.deployStackFileInput.value = "";
+    el.deployStackFileInput.click();
+  }
+
+  function handleDeployStackFile() {
+    var file = el.deployStackFileInput.files[0];
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function () {
+      el.deployStackCompose.value = reader.result;
+    };
+    reader.onerror = function () {
+      window.alert("Could not read that file.");
+    };
+    reader.readAsText(file);
+  }
+
   function openStackFile(host, stack) {
     var path = stackConfigPath(stack);
     if (!path) {
@@ -1624,6 +1749,9 @@
       el.tabAction.hidden = false;
       el.tabAction.textContent = "Create container";
       el.tabAction.onclick = function () { openCreateContainer(null, state.host || null); };
+      el.tabAction2.hidden = false;
+      el.tabAction2.textContent = "Import config";
+      el.tabAction2.onclick = openImportConfig;
     } else if (state.tab === "compose") {
       el.tabAction.hidden = false;
       el.tabAction.textContent = "Deploy stack";
@@ -1918,6 +2046,14 @@
     exportBtn.textContent = "Export config";
     exportBtn.addEventListener("click", function () { exportContainerConfig(host, container); });
     manage.appendChild(exportBtn);
+
+    if (running && host.exec && host.exec.can_exec) {
+      var termBtn = text("button", "button small");
+      termBtn.type = "button";
+      termBtn.textContent = "Terminal";
+      termBtn.addEventListener("click", function () { openTerminal(host, container); });
+      manage.appendChild(termBtn);
+    }
     bar.appendChild(manage);
 
     if (job && job.status && job.status !== "running") {
@@ -3440,6 +3576,120 @@
     if (typeof el.portMapDialog.showModal === "function") el.portMapDialog.showModal();
   }
 
+  // ---- terminal / exec ------------------------------------------------------
+
+  // A "dumb terminal" -- carriage return and backspace are honored so a
+  // normal shell prompt renders correctly, and recognized ANSI escape
+  // sequences (cursor movement, color) are stripped rather than interpreted.
+  // Full-screen programs (vim, top, less) will look wrong; a plain shell,
+  // package installs, log tailing and similar will not. A real VT100
+  // emulator is a much bigger undertaking than this dashboard's own
+  // hand-rolled markdown renderer or table code, and out of scope here.
+  var EXEC_ANSI_STRIP =
+    /\x1b\][^\x07\x1b]*(\x07|\x1b\\)|\x1b\[[0-9;?]*[a-zA-Z]|\x1b[()][A-Za-z0-9]|\x1b./g;
+
+  function stripAnsi(text) {
+    return text.replace(EXEC_ANSI_STRIP, "");
+  }
+
+  function execWsUrl(host, container) {
+    var proto = location.protocol === "https:" ? "wss:" : "ws:";
+    var port = (Number(location.port) || (location.protocol === "https:" ? 443 : 80)) + 1;
+    return proto + "//" + location.hostname + ":" + port +
+      "/api/hosts/" + encodeURIComponent(host.name) +
+      "/containers/" + encodeURIComponent(container.id) + "/exec";
+  }
+
+  function appendExecOutput(text) {
+    text = stripAnsi(text);
+    var buf = state.exec.buffer;
+    for (var i = 0; i < text.length; i++) {
+      var ch = text[i];
+      if (ch === "\r") {
+        buf = buf.slice(0, buf.lastIndexOf("\n") + 1);
+      } else if (ch === "\b") {
+        buf = buf.slice(0, -1);
+      } else {
+        buf += ch;
+      }
+    }
+    if (buf.length > 200000) buf = buf.slice(buf.length - 150000);
+    state.exec.buffer = buf;
+    el.execOutput.textContent = buf;
+    el.execOutput.scrollTop = el.execOutput.scrollHeight;
+  }
+
+  function execKeyToBytes(event) {
+    if (event.ctrlKey && !event.altKey && !event.metaKey &&
+        event.key.length === 1 && /[a-zA-Z]/.test(event.key)) {
+      return String.fromCharCode(event.key.toUpperCase().charCodeAt(0) - 64);
+    }
+    switch (event.key) {
+      case "Enter": return "\r";
+      case "Backspace": return "\x7f";
+      case "Tab": return "\t";
+      case "Escape": return "\x1b";
+      case "ArrowUp": return "\x1b[A";
+      case "ArrowDown": return "\x1b[B";
+      case "ArrowRight": return "\x1b[C";
+      case "ArrowLeft": return "\x1b[D";
+      default:
+        return event.key.length === 1 ? event.key : null;
+    }
+  }
+
+  function execKeydown(event) {
+    var ws = state.exec.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    var bytes = execKeyToBytes(event);
+    if (bytes === null) return;
+    event.preventDefault();
+    ws.send(bytes);
+  }
+
+  function closeTerminal() {
+    if (state.exec.ws) {
+      try { state.exec.ws.close(); } catch (err) { /* already closing */ }
+      state.exec.ws = null;
+    }
+  }
+
+  function openTerminal(host, container) {
+    closeTerminal();
+    state.exec.buffer = "";
+    el.execOutput.textContent = "";
+    el.execTitle.textContent = "-- " + container.name + " on " + (host.label || host.name);
+    el.execStatus.textContent = "Connecting…";
+    hide(el.execError);
+
+    var ws = new WebSocket(execWsUrl(host, container));
+    ws.binaryType = "arraybuffer";
+    state.exec.ws = ws;
+
+    ws.addEventListener("open", function () {
+      el.execStatus.textContent = "Connected.";
+    });
+    ws.addEventListener("message", function (event) {
+      if (typeof event.data === "string") {
+        try {
+          var msg = JSON.parse(event.data);
+          if (msg.error) showError(el.execError, msg.error);
+        } catch (err) { /* not JSON -- ignore */ }
+        return;
+      }
+      appendExecOutput(new TextDecoder("utf-8", { fatal: false }).decode(event.data));
+    });
+    ws.addEventListener("close", function () {
+      el.execStatus.textContent = "Session ended.";
+    });
+    ws.addEventListener("error", function () {
+      showError(el.execError, "Connection error.");
+    });
+
+    if (typeof el.execDialog.showModal === "function") el.execDialog.showModal();
+    el.execOutput.focus();
+  }
+
   // ---- cleanup / prune -----------------------------------------------------
 
   function openCleanup() {
@@ -3906,6 +4156,12 @@
       cleanupLog: $("cleanup-log"),
       cleanupError: $("cleanup-error"),
       cleanupDiskUsage: $("cleanup-disk-usage"),
+      execDialog: $("exec-dialog"),
+      execTitle: $("exec-title"),
+      execStatus: $("exec-status"),
+      execOutput: $("exec-output"),
+      execError: $("exec-error"),
+      execClose: $("exec-close"),
       tabContainers: $("tab-containers"),
       tabOs: $("tab-os"),
       tabCompose: $("tab-compose"),
@@ -3985,6 +4241,8 @@
       deployStackProject: $("deploy-stack-project"),
       deployStackCompose: $("deploy-stack-compose"),
       deployStackTemplatePicker: $("deploy-stack-template-picker"),
+      deployStackLoadFile: $("deploy-stack-load-file"),
+      deployStackFileInput: $("deploy-stack-file-input"),
       deployStackSaveTemplate: $("deploy-stack-save-template"),
       deployStackValidation: $("deploy-stack-validation"),
       deployStackValidate: $("deploy-stack-validate"),
@@ -4058,7 +4316,9 @@
       aiAssistantMessages: $("ai-assistant-messages"),
       aiAssistantForm: $("ai-assistant-form"),
       aiAssistantInput: $("ai-assistant-input"),
-      aiAssistantSend: $("ai-assistant-send")
+      aiAssistantSend: $("ai-assistant-send"),
+      importConfigFileInput: $("import-config-file-input"),
+      restoreVolumeFileInput: $("restore-volume-file-input")
     };
 
     initTheme();
@@ -4085,6 +4345,8 @@
     el.refresh.addEventListener("click", refresh);
     el.addHost.addEventListener("click", openHostDialog);
     el.portMapOpen.addEventListener("click", openPortMap);
+    el.execOutput.addEventListener("keydown", execKeydown);
+    el.execDialog.addEventListener("close", closeTerminal);
     el.cleanupOpen.addEventListener("click", openCleanup);
     el.cleanupHost.addEventListener("change", loadCleanupDiskUsage);
     el.cleanupContainers.addEventListener("click", function () { runCleanup("containers"); });
@@ -4115,6 +4377,10 @@
     el.deployStackForm.addEventListener("submit", submitDeployStack);
     el.deployStackCancel.addEventListener("click", function () { el.deployStackDialog.close(); });
     el.deployStackTemplatePicker.addEventListener("change", applyStackTemplate);
+    el.deployStackLoadFile.addEventListener("click", openDeployStackFilePicker);
+    el.deployStackFileInput.addEventListener("change", handleDeployStackFile);
+    el.importConfigFileInput.addEventListener("change", handleImportConfigFile);
+    el.restoreVolumeFileInput.addEventListener("change", handleRestoreVolumeFile);
     el.deployStackSaveTemplate.addEventListener("click", saveStackTemplate);
     el.deployStackValidate.addEventListener("click", runValidateStack);
     el.stackFileCancel.addEventListener("click", function () { el.stackFileDialog.close(); });

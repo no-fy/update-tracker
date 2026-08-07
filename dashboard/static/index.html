@@ -479,7 +479,11 @@
     </label>
     <label class="stack">
       <span>docker-compose.yml</span>
-      <textarea id="deploy-stack-compose" rows="14" placeholder="services:&#10;  web:&#10;    image: nginx:latest&#10;    ports:&#10;      - &quot;8080:80&quot;" required></textarea>
+      <div class="dialog-row">
+        <textarea id="deploy-stack-compose" rows="14" placeholder="services:&#10;  web:&#10;    image: nginx:latest&#10;    ports:&#10;      - &quot;8080:80&quot;" required></textarea>
+      </div>
+      <button type="button" class="button small" id="deploy-stack-load-file">Load from file…</button>
+      <input type="file" id="deploy-stack-file-input" accept=".yml,.yaml,.txt" hidden>
     </label>
     <div id="deploy-stack-validation" class="dialog-note" hidden></div>
     <pre class="joblog" id="deploy-stack-log" hidden></pre>
@@ -557,6 +561,18 @@
   </form>
 </dialog>
 
+<dialog id="exec-dialog" class="dialog wide-dialog">
+  <form method="dialog">
+    <h2>Terminal <span id="exec-title" class="dialog-lede"></span></h2>
+    <p id="exec-status" class="dialog-note"></p>
+    <pre id="exec-output" class="exec-output" tabindex="0"></pre>
+    <p class="dialog-error" id="exec-error" hidden></p>
+    <div class="dialog-actions">
+      <button type="submit" class="button primary" id="exec-close">Close</button>
+    </div>
+  </form>
+</dialog>
+
 <dialog id="port-map-dialog" class="dialog wide-dialog">
   <form method="dialog">
     <h2>Port map</h2>
@@ -568,6 +584,9 @@
     </div>
   </form>
 </dialog>
+
+<input type="file" id="import-config-file-input" accept=".json" hidden>
+<input type="file" id="restore-volume-file-input" accept=".gz,.tar.gz" hidden>
 
 <button type="button" class="ai-fab" id="ai-assistant-open" hidden>✦ Ask AI</button>
 

@@ -32,6 +32,7 @@ if __package__ in (None, ""):  # allow `python3 dashboard/server.py`
         collector,
         config as config_mod,
         enroll as enroll_mod,
+        execws,
         registry as registry_mod,
     )
 else:
@@ -41,6 +42,7 @@ else:
         collector,
         config as config_mod,
         enroll as enroll_mod,
+        execws,
         registry as registry_mod,
     )
 
@@ -278,6 +280,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except ValueError:
             return {}
 
+    def _read_raw_body(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(length) if length else b""
+
+    def _raw(self, status, body, content_type="application/octet-stream", filename=None):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if filename:
+            self.send_header("Content-Disposition", 'attachment; filename="%s"' % filename)
+        self.end_headers()
+        self.wfile.write(body)
+
     def _serve_static(self, rel_path):
         rel_path = posixpath.normpath("/" + rel_path).lstrip("/")
         full = os.path.join(STATIC_DIR, rel_path)
@@ -419,6 +435,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_host_resource(
                 urllib.parse.unquote(path[len("/api/hosts/"):-len("/networks")]),
                 collector.host_networks)
+            return
+
+        if path.startswith("/api/hosts/") and "/volumes/" in path and path.endswith("/backup"):
+            self._handle_volume_backup(path)
             return
 
         if path.startswith("/api/hosts/") and path.endswith("/disk-usage"):
@@ -584,6 +604,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 name,
                 lambda host: collector.prune_images(
                     host, dangling_only=body.get("dangling_only", True)))
+            return
+
+        if path.startswith("/api/hosts/") and "/volumes/" in path and path.endswith("/restore"):
+            self._handle_volume_restore(path)
             return
 
         if path.startswith("/api/hosts/") and path.endswith("/volumes"):
@@ -902,6 +926,61 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
             return
         self.server.poller.refresh_async()
+        self._json(200, result)
+
+    def _split_volume_path(self, path, suffix):
+        rest = path[len("/api/hosts/"):-len(suffix)]
+        name, _, volume_name = rest.partition("/volumes/")
+        return urllib.parse.unquote(name), urllib.parse.unquote(volume_name)
+
+    def _handle_volume_backup(self, path):
+        name, volume_name = self._split_volume_path(path, "/backup")
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+        try:
+            data = collector.volume_backup(host, volume_name)
+        except collector.ContainerActionRefused as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")
+            try:
+                self._json(exc.code, json.loads(detail))
+            except ValueError:
+                self._json(exc.code, {"error": detail[:300] or "agent refused"})
+            return
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self._raw(200, data, content_type="application/gzip",
+                  filename="%s.tar.gz" % volume_name)
+
+    def _handle_volume_restore(self, path):
+        name, volume_name = self._split_volume_path(path, "/restore")
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+        tar_bytes = self._read_raw_body()
+        try:
+            result = collector.volume_restore(host, volume_name, tar_bytes)
+        except collector.ContainerActionRefused as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")
+            try:
+                self._json(exc.code, json.loads(detail))
+            except ValueError:
+                self._json(exc.code, {"error": detail[:300] or "agent refused"})
+            return
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
         self._json(200, result)
 
     def _handle_container_stats(self, path):
@@ -1590,6 +1669,11 @@ def run(config_path=None, bind=None, port=None, verbose=False):
     if not httpd.password:
         print("  note      no password set -- the dashboard will ask you to pick one")
     sys.stdout.flush()
+
+    execws.serve(
+        httpd.load_config, httpd.sessions, httpd.password, SESSION_COOKIE,
+        bind=host, port=port + 1,
+    )
 
     httpd.poller.start_background(interval)
     try:

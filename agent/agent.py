@@ -3,10 +3,10 @@
 
 A collector that reports the containers on one Docker host, with optional
 capability to manage them (start/stop/restart, read logs) and to install OS
-package updates. It is a single stdlib-only file so it can be scp'd to any
-machine with Python 3.12+ and run under systemd. Reporting is always GETs
-against the container, image and info endpoints; the write paths live in
-containerctl.py and osupdate.py and are each gated by their own env var.
+package updates. Reporting is always GETs against the container, image and
+info endpoints; the write paths live in containerctl.py and osupdate.py and
+are each gated by their own env var. The only third-party dependency is
+``websockets``, for the exec/terminal feature.
 
 It is also importable: the dashboard uses ``DockerClient`` and
 ``collect_snapshot`` directly for the host it runs on, so local and remote hosts
@@ -277,8 +277,125 @@ class DockerClient:
         self.delete(
             "/%s/containers/%s" % (API_VERSION, urllib.parse.quote(container_id, safe="")))
 
+    def raw_socket(self):
+        """A bare connected socket to the Docker endpoint, outside http.client
+        -- for hijacked exec/attach streams, which stop being HTTP after the
+        initial response and become a raw duplex byte stream."""
+        ep = self.endpoint
+        if ep.startswith("unix://") or ep.startswith("/"):
+            path = ep[len("unix://"):] if ep.startswith("unix://") else ep
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout)
+            try:
+                sock.connect(path)
+            except OSError as exc:
+                raise DockerError("cannot connect to Docker at %s: %s" % (path, exc)) from exc
+            return sock
+        parsed = urllib.parse.urlparse(ep)
+        host = parsed.hostname or "localhost"
+        port = parsed.port or (2376 if parsed.scheme == "https" else 2375)
+        sock = socket.create_connection((host, port), timeout=self.timeout)
+        if parsed.scheme == "https":
+            context = ssl.create_default_context()
+            sock = context.wrap_socket(sock, server_hostname=host)
+        return sock
+
     def system_df(self):
         return self.get("/%s/system/df" % API_VERSION)
+
+    def create_exec(self, container_id, cmd):
+        return self.post_json(
+            "/%s/containers/%s/exec" % (API_VERSION, urllib.parse.quote(container_id, safe="")),
+            {
+                "AttachStdin": True, "AttachStdout": True, "AttachStderr": True,
+                "Tty": True, "Cmd": cmd,
+            },
+        )
+
+    def exec_resize(self, exec_id, cols, rows):
+        self.post(
+            "/%s/exec/%s/resize?h=%d&w=%d" % (
+                API_VERSION, urllib.parse.quote(exec_id, safe=""), int(rows), int(cols))
+        )
+
+    def hijack_exec_start(self, exec_id):
+        """Start an exec session and take over its connection for raw I/O.
+
+        Docker responds ``101 UPGRADED`` and the socket becomes a plain
+        duplex byte stream from then on (no HTTP framing, no multiplexing,
+        since this is always opened with Tty=True) -- exactly what a
+        terminal needs. Returns ``(sock, leftover_bytes)``: any stream bytes
+        that arrived in the same packet as the tail of the response headers.
+        """
+        sock = self.raw_socket()
+        body = json.dumps({"Detach": False, "Tty": True}).encode("utf-8")
+        request = (
+            "POST /%s/exec/%s/start HTTP/1.1\r\n"
+            "Host: docker\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: Upgrade\r\n"
+            "Upgrade: tcp\r\n"
+            "\r\n"
+        ) % (API_VERSION, urllib.parse.quote(exec_id, safe=""), len(body))
+        sock.sendall(request.encode("utf-8") + body)
+
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                sock.close()
+                raise DockerError("Docker closed the connection before exec started.")
+            buf += chunk
+        headers, _, leftover = buf.partition(b"\r\n\r\n")
+        status_line = headers.split(b"\r\n", 1)[0]
+        if b"101" not in status_line and b"200" not in status_line:
+            sock.close()
+            raise DockerError(
+                "exec start failed: %s" % status_line.decode("utf-8", "replace"))
+        return sock, leftover
+
+    def wait_container(self, container_id):
+        return self.post(
+            "/%s/containers/%s/wait" % (API_VERSION, urllib.parse.quote(container_id, safe="")))
+
+    def hijack_attach(self, container_id):
+        """Like hijack_exec_start, but for a container's own stdin/stdout --
+        used to stream a tar into a not-yet-started restore container, or to
+        read one out of a backup container's stdout. Must be called before
+        start() for Docker to actually deliver the stdin bytes once the
+        process launches (restore) and to not miss any output (backup).
+
+        Unlike exec's hijacked stream, this is never opened with Tty=True,
+        so Docker keeps its stdout/stderr multiplexing frame format on
+        anything it sends back -- callers reading output need to demux it,
+        volumectl.py does this for the backup direction.
+        """
+        sock = self.raw_socket()
+        request = (
+            "POST /%s/containers/%s/attach?stream=1&stdin=1&stdout=1&stderr=1 HTTP/1.1\r\n"
+            "Host: docker\r\n"
+            "Connection: Upgrade\r\n"
+            "Upgrade: tcp\r\n"
+            "Content-Length: 0\r\n"
+            "\r\n"
+        ) % (API_VERSION, urllib.parse.quote(container_id, safe=""))
+        sock.sendall(request.encode("utf-8"))
+
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                sock.close()
+                raise DockerError("Docker closed the connection before attach started.")
+            buf += chunk
+        headers, _, leftover = buf.partition(b"\r\n\r\n")
+        status_line = headers.split(b"\r\n", 1)[0]
+        if b"101" not in status_line and b"200" not in status_line:
+            sock.close()
+            raise DockerError(
+                "attach failed: %s" % status_line.decode("utf-8", "replace"))
+        return sock, leftover
 
     def prune_containers(self):
         return self.post("/%s/containers/prune" % API_VERSION) or {}
@@ -490,6 +607,16 @@ def _stackctl():
     return stackctl
 
 
+def _execctl():
+    import execctl
+    return execctl
+
+
+def _volumectl():
+    import volumectl
+    return volumectl
+
+
 def collect_snapshot(client, include_stopped=True):
     """Return ``{"info": {...}, "containers": [...]}`` for one Docker host."""
     try:
@@ -584,6 +711,8 @@ def collect_snapshot(client, include_stopped=True):
         "event_history": _eventstore().capability(),
         "stack_deploy": _stackctl().capability(),
         "stack_redeploy": _stackctl().redeploy_capability(),
+        "exec": _execctl().capability(),
+        "volume_backup": _volumectl().capability(),
     }
 
 
@@ -654,6 +783,16 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_raw(self, status, body, content_type="application/octet-stream", filename=None):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if filename:
+            self.send_header("Content-Disposition", 'attachment; filename="%s"' % filename)
         self.end_headers()
         self.wfile.write(body)
 
@@ -778,6 +917,15 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     self._send(404, {"error": "no such job"})
                 else:
                     self._send(200, job.snapshot())
+            elif path.startswith("/v1/volumes/") and path.endswith("/backup"):
+                volume_name = path[len("/v1/volumes/"):-len("/backup")]
+                try:
+                    data = _volumectl().backup(client, volume_name)
+                except _containerctl().ActionError as exc:
+                    self._send(400, {"error": str(exc)})
+                    return
+                self._send_raw(200, data, content_type="application/gzip",
+                                filename="%s.tar.gz" % volume_name)
             elif path == "/v1/stacks/file":
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 file_path = (query.get("path") or [""])[0]
@@ -806,8 +954,24 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return
 
         length = int(self.headers.get("Content-Length") or 0)
+        raw_body = self.rfile.read(length) if length else b""
+
+        if path.startswith("/v1/volumes/") and path.endswith("/restore"):
+            volume_name = path[len("/v1/volumes/"):-len("/restore")]
+            client = DockerClient(self.server.docker_endpoint)
+            try:
+                _volumectl().restore(client, volume_name, raw_body)
+            except _containerctl().ActionError as exc:
+                self._send(400, {"error": str(exc)})
+                return
+            except DockerError as exc:
+                self._send(503, {"error": str(exc)})
+                return
+            self._send(200, {"ok": True, "volume": volume_name})
+            return
+
         try:
-            body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            body = json.loads(raw_body.decode("utf-8")) if raw_body else {}
         except ValueError:
             body = {}
 
@@ -1088,8 +1252,110 @@ class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     address_family = socket.AF_INET
 
 
+def _exec_ws_handler(ws, token, docker_endpoint):
+    """One browser terminal session: create+hijack a Docker exec, then pump
+    bytes both ways until either side closes. Runs on its own thread per
+    connection -- ``websockets.sync.server`` already gives us one."""
+    parsed = urllib.parse.urlparse(ws.request.path)
+    parts = [p for p in parsed.path.split("/") if p]
+    if len(parts) != 4 or parts[0] != "v1" or parts[1] != "containers" or parts[3] != "exec":
+        ws.close(code=1008, reason="not found")
+        return
+    container_id = parts[2]
+
+    if token:
+        supplied = (urllib.parse.parse_qs(parsed.query).get("token") or [""])[0]
+        if not hmac.compare_digest(supplied, token):
+            ws.close(code=1008, reason="unauthorized")
+            return
+
+    execctl = _execctl()
+    client = DockerClient(docker_endpoint)
+    try:
+        sock, leftover, exec_id = execctl.open_session(client, container_id)
+    except _containerctl().ActionError as exc:
+        ws.send(json.dumps({"error": str(exc)}))
+        ws.close(code=1011, reason="refused")
+        return
+    except Exception as exc:
+        ws.send(json.dumps({"error": "%s: %s" % (type(exc).__name__, exc)}))
+        ws.close(code=1011, reason="error")
+        return
+
+    stop = threading.Event()
+
+    def pump_docker_to_browser():
+        try:
+            if leftover:
+                ws.send(leftover)
+            while not stop.is_set():
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                ws.send(chunk)
+        except Exception:
+            pass
+        finally:
+            stop.set()
+
+    reader = threading.Thread(target=pump_docker_to_browser, daemon=True)
+    reader.start()
+
+    try:
+        for message in ws:
+            if isinstance(message, str):
+                try:
+                    control = json.loads(message)
+                except ValueError:
+                    continue
+                resize = control.get("resize") or {}
+                if resize:
+                    execctl.resize(client, exec_id, resize.get("cols"), resize.get("rows"))
+            else:
+                try:
+                    sock.sendall(message)
+                except OSError:
+                    break
+    except Exception:
+        pass
+    finally:
+        stop.set()
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def serve_ws(token, bind="0.0.0.0", port=None, docker_endpoint=None, certfile=None, keyfile=None):
+    """The exec/terminal WebSocket server -- separate port, since the plain
+    http.server everything else runs on cannot itself do a protocol upgrade.
+    Runs in its own thread; failing to start it (missing dependency, port in
+    use) does not take down the main agent, since exec is opt-in already."""
+    try:
+        from websockets.sync.server import serve as ws_serve
+    except ImportError:
+        sys.stderr.write(
+            "exec/terminal disabled: the 'websockets' package is not installed\n")
+        return None
+
+    ssl_context = None
+    if certfile:
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_context.load_cert_chain(certfile, keyfile or certfile)
+
+    def handler(ws):
+        _exec_ws_handler(ws, token, docker_endpoint)
+
+    server = ws_serve(handler, bind, port, ssl=ssl_context)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    sys.stderr.write("exec/terminal websocket listening on %s://%s:%s\n" % (
+        "wss" if ssl_context else "ws", bind, port))
+    return server
+
+
 def serve(token, bind="0.0.0.0", port=DEFAULT_PORT, docker_endpoint=None,
-          verbose=False, certfile=None, keyfile=None):
+          verbose=False, certfile=None, keyfile=None, ws_port=None):
     if ":" in bind:
         _Server.address_family = socket.AF_INET6
     httpd = _Server((bind, port), _Handler)
@@ -1109,6 +1375,8 @@ def serve(token, bind="0.0.0.0", port=DEFAULT_PORT, docker_endpoint=None,
     _logstore().init(docker_endpoint)
     _eventstore().init(docker_endpoint)
     _osupdate().start_auto_refresh(on_finish=lambda job: os_updates(force=True))
+    serve_ws(token, bind=bind, port=ws_port or (port + 1), docker_endpoint=docker_endpoint,
+             certfile=certfile, keyfile=keyfile)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:
@@ -1161,6 +1429,8 @@ def main(argv=None):
     parser.add_argument("--no-auth", action="store_true", help="disable token auth (loopback only)")
     parser.add_argument("--bind", default=None, help="bind address (default 0.0.0.0)")
     parser.add_argument("--port", type=int, default=None, help="port (default %d)" % DEFAULT_PORT)
+    parser.add_argument("--ws-port", type=int, default=None,
+                         help="exec/terminal websocket port (default: --port + 1)")
     parser.add_argument("--docker", default=None, help="docker socket path or tcp:// endpoint")
     parser.add_argument("--tls-cert", default=None, help="serve HTTPS with this certificate")
     parser.add_argument("--tls-key", default=None, help="private key for --tls-cert")
@@ -1184,6 +1454,7 @@ def main(argv=None):
              or os.environ.get("CUD_AGENT_TOKEN"))
     bind = args.bind or cfg.get("bind") or "0.0.0.0"
     port = args.port or cfg.get("port") or DEFAULT_PORT
+    ws_port = args.ws_port or cfg.get("ws_port") or os.environ.get("CUD_AGENT_WS_PORT")
     docker_endpoint = args.docker or cfg.get("docker_socket") or None
     certfile = args.tls_cert or cfg.get("tls_cert")
     keyfile = args.tls_key or cfg.get("tls_key")
@@ -1215,6 +1486,7 @@ def main(argv=None):
         verbose=args.verbose or bool(cfg.get("verbose")),
         certfile=certfile,
         keyfile=keyfile,
+        ws_port=int(ws_port) if ws_port else None,
     )
 
 

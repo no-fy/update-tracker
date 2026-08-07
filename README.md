@@ -20,8 +20,10 @@ image, across as many servers as you like.
   what they are and how big they are, and you can install a selection — or
   every security update — from the dashboard. `CUD_ALLOW_UPDATES=0` makes an
   agent report-only.
-- **No dependencies.** Python 3.12+ standard library only, on both sides. No pip
-  install, no node, no build step, no database.
+- **Minimal dependencies.** Python 3.12+, no node, no build step, no database.
+  One third-party package (`websockets`, for the exec/terminal feature) --
+  everything else, including talking to the Docker API itself, is the
+  standard library on both sides.
 
 ```
                           ┌──────────────────────┐
@@ -64,11 +66,11 @@ socket and the password.
 <details>
 <summary>Running from a checkout instead</summary>
 
-There is nothing to build and nothing to install — Python 3.12+ and the standard
-library are the only requirements.
+Nothing to build. One dependency to install (`websockets`, for exec/terminal).
 
 ```bash
 cd container-update-dashboard
+pip install -r requirements.txt
 
 ./cud serve                    # http://localhost:8500, registers itself
 ./cud check                    # the same report, in the terminal
@@ -256,7 +258,7 @@ The lifecycle actions and a **Logs** button sit right on each container's row
 | **Remove** | Only offered once a container is stopped. |
 | **Recreate with latest image** | Only shown when the container is **update available** or **restart pending** — this is the button that closes the loop the dashboard started with. It pulls the tag's current image, then swaps the container for a new one built from the same config (env, labels, ports, volumes, restart policy, networks and aliases), streaming progress the same way an OS update does. |
 | **Clone** | Reads the container's current config back out (image, command, env, ports, volumes, restart policy, network) and opens **Create container** pre-filled with it, name suffixed `-copy` — nothing is created until you save. |
-| **Export config** | The same read as Clone, downloaded as a `.config.json` file instead of opening a form — a config snapshot to keep or diff, not a restore mechanism. Compose stacks have their own **Download** button next to Save/Redeploy in the stack file dialog, for the raw `docker-compose.yml`. |
+| **Export config** | The same read as Clone, downloaded as a `.config.json` file instead of opening a form. Compose stacks have their own **Download** button next to Save/Redeploy in the stack file dialog, for the raw `docker-compose.yml`. |
 
 **Create container** (also in the Containers tab's header) opens the same
 form empty: image, an optional name, command, environment variables, ports,
@@ -264,6 +266,13 @@ volumes and a restart policy, plus which network to attach and whether to
 start it right away. It builds Docker's own container-create request from
 those fields; it does not pull the image first, so pick one that's already
 on the host (pull it from the Images tab if it isn't).
+
+**Import config** (next to Create container) reverses Export: pick a
+previously-downloaded `.config.json` and it opens the same pre-filled
+Create form Clone does — nothing is created until you save, so it's a
+starting point, not a one-click restore. **Deploy stack** has the same idea
+for compose files — a **Load from file…** button next to the textarea reads
+a local `docker-compose.yml` in, in place of pasting it.
 
 Clicking a container still expands it, now just for **Details** (image,
 digests, ports, compose info) and whatever the **Logs** button opens.
@@ -562,13 +571,81 @@ Each tab's header also has what you'd expect to create one:
 - **Create network** (Networks tab): name, driver, and an optional
   subnet/gateway.
 
-**Backup/export is config-only, not data.** Export config and the compose
-Download button give you back exactly what Clone and the stack editor
-already read -- JSON/YAML text, cheap to fetch and safe to hand to anyone.
-Backing up what's actually *inside* a volume needs a different mechanism
-entirely (streaming a tar of live data through a helper container, which is
-its own scoped feature with its own size/timeout/format questions) and is
-not attempted here.
+**Export config** and the compose **Download** button give you back exactly
+what Clone and the stack editor already read — JSON/YAML text, cheap to
+fetch and safe to hand to anyone. What's actually *inside* a volume is a
+separate thing — see [Volume backup and restore](#volume-backup-and-restore)
+below.
+
+### Volume backup and restore
+
+**Backup** and **Restore** buttons sit on each volume's row (Volumes tab),
+behind their own opt-in — `CUD_ALLOW_VOLUME_BACKUP=1` on the agent, off by
+default. Restore overwrites what's already in the volume, which is a bigger
+and less reversible trust boundary than start/stop/restart, so unlike the
+container lifecycle actions this doesn't share `CUD_ALLOW_CONTAINER_ACTIONS`
+or its on-by-default posture.
+
+- **A throwaway helper container does the work.** Docker has no API to read
+  or write a volume's contents directly. Backup creates a container (never
+  started as itself, just created so it exists on disk), mounts the volume
+  read-only, and runs `tar -czf - -C /data .`; restore mounts it read-write
+  and runs `tar -xzf - -C /data`, piping the uploaded file in as the
+  process's stdin. Both use a small `busybox` image, pulled automatically
+  the first time if it isn't already present. The helper container is
+  removed either way, success or failure.
+- **Bytes travel over the same kind of hijacked connection exec uses**
+  (below), not the plain `GET .../logs` endpoint — that path was observed to
+  silently corrupt binary data (via what looks like a UTF-8 replacement-
+  character pass) on at least one real deployment target's Docker socket
+  proxy. The hijacked connection round-trips arbitrary bytes correctly.
+- **Backup downloads a `.tar.gz`** — a real backup of what was in the
+  volume at that moment, not a config snapshot. **Restore requires a plain
+  yes/no confirmation** styled like every other destructive action here,
+  since there is no undo once tar starts overwriting files.
+- **A volume name is checked against Docker's own volume list first.**
+  Docker silently *creates* a named volume the first time something mounts
+  it — convenient for a real mount, a footgun here, since a typo'd name
+  would otherwise quietly back up (or restore into) a blank volume instead
+  of failing loudly.
+
+### Terminal (exec)
+
+A **Terminal** button on each running container opens an interactive shell
+in it (`docker exec` equivalent), behind its own opt-in —
+`CUD_ALLOW_EXEC=1` on the agent, off by default for the same reason as
+volume restore above: a shell is arbitrary code execution as whatever user
+the container runs as, and on a privileged or host-mounted container that's
+very close to a host shell.
+
+- **A real PTY, not a canned command list.** Docker's own exec-create +
+  hijacked-start protocol, same as `docker exec -it`. The hijacked
+  connection becomes a raw duplex byte stream once started — exactly what a
+  terminal needs — bridged to the browser over a WebSocket.
+- **A second, WebSocket-only port**, separate from the dashboard's and each
+  agent's main HTTP port (`+1` by convention — 8501 for the dashboard on
+  8500, 9714 for an agent on 9713), because the stdlib `http.server`
+  everything else in this project runs on cannot itself do a protocol
+  upgrade. The browser only ever talks to the *dashboard's* WebSocket port —
+  never directly to an agent, so an agent's bearer token never has to reach
+  the browser. For a remote host, the dashboard proxies: it opens its own
+  outbound WebSocket to that agent (carrying the token) and relays bytes
+  both ways, the same local/remote split every other feature here has, just
+  applied to a raw stream instead of a JSON request. Authentication on the
+  browser-facing side is the same session cookie the main dashboard already
+  issues — sent automatically on the WebSocket handshake, since cookies
+  aren't port-scoped.
+- **A "dumb" terminal, not a full emulator.** Carriage return and backspace
+  are honored, so a plain shell prompt renders correctly, and recognized
+  ANSI escape sequences (cursor movement, color) are stripped rather than
+  interpreted. Full-screen programs (`vim`, `top`, `less`) will look wrong;
+  a plain shell, package installs, log tailing and similar will not. A real
+  VT100 emulator is a much bigger undertaking than anything else hand-rolled
+  in this dashboard's frontend, and out of scope here.
+- **One dependency** makes this possible: `websockets`, the one exception to
+  this project otherwise being standard-library-only. Everything else about
+  exec — the Docker protocol parts, the proxy, the terminal rendering — is
+  still hand-rolled the same way as every other feature here.
 
 The **Cleanup** button (top bar) prunes stopped containers, dangling images,
 unused volumes or unused networks on one host at a time — Docker's own
@@ -724,7 +801,10 @@ docker pull ghcr.io/no-fy/update-tracker-agent:latest   # update it
 
 Requirements on the host: Docker, a reachable port for the agent (9713 by
 default), and network access from the dashboard to that port. No Python, no
-systemd, no SSH, and no login of any kind for the dashboard.
+systemd, no SSH, and no login of any kind for the dashboard. If exec is
+enabled (`CUD_ALLOW_EXEC=1`), the dashboard also needs to reach the agent's
+WebSocket port, `9713 + 1` by convention (9714 by default) — open that one
+too if there's a firewall between them.
 
 Removing a host is two steps, because the dashboard cannot reach into a machine
 it has no credentials for: `./cud remove nas` (or the delete control in the UI)
@@ -795,7 +875,9 @@ elsewhere.
 
 ## Running the dashboard as a service
 
-If you are not using the container, systemd runs it from a checkout:
+If you are not using the container, systemd runs it from a checkout (after
+`pip install -r requirements.txt` there, same as [Running from a checkout
+instead](#quick-start)):
 
 ```ini
 # /etc/systemd/system/container-update-dashboard.service
@@ -936,6 +1018,8 @@ tokens are never returned.
 | POST | `/api/hosts/<name>/prune/images` | remove images: `{"dangling_only": true}` |
 | POST | `/api/hosts/<name>/prune/volumes` | remove unused volumes -- **deletes their data** |
 | POST | `/api/hosts/<name>/prune/networks` | remove unused networks |
+| GET | `/api/hosts/<name>/volumes/<volume>/backup` | tar+gzip of the volume's contents, as a file download -- refused unless `CUD_ALLOW_VOLUME_BACKUP=1` |
+| POST | `/api/hosts/<name>/volumes/<volume>/restore` | extract a tar+gzip archive (raw body, not JSON) into the volume, replacing what's there |
 | POST | `/api/enrollments` | mint an enrolment and return the command to run |
 | GET | `/api/enrollments` | pending and finished enrolments, tokens omitted |
 | GET | `/api/enrollments/<id>` | one enrolment, to watch for the agent checking in |
@@ -951,6 +1035,13 @@ tokens are never returned.
 `POST /api/setup` is refused once credentials exist, and `POST /api/enrollments`
 is refused until they do — an unauthenticated dashboard will not hand out
 enrolment tokens to whoever can reach the port.
+
+One endpoint isn't in the table above because it isn't REST: exec/terminal is
+a WebSocket at `ws://<dashboard>:<port+1>/api/hosts/<name>/containers/<id>/exec`
+(`wss://` if the dashboard is on HTTPS), authenticated by the same session
+cookie as everything else. Binary frames are raw terminal bytes in both
+directions; a JSON text frame `{"resize": {"cols", "rows"}}` from the browser
+resizes the PTY. Refused unless `CUD_ALLOW_EXEC=1` on the target agent.
 
 The container-create spec (used by both `POST .../containers/create` and
 what `GET .../clone-spec` returns) is dashboard-shaped, not Docker's own

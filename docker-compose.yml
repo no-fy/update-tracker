@@ -14,6 +14,9 @@ services:
     privileged: true
     ports:
       - "8500:8500"
+      # WebSocket-only, for the exec/terminal feature (CUD_ALLOW_EXEC below).
+      # Harmless to leave published even with exec off.
+      - "8501:8501"
     volumes:
       - cud-config:/config
       # Watching this machine's own containers -- and, by default, managing
@@ -45,6 +48,12 @@ services:
       # CUD_PASSWORD: change-me
       # Container start/stop/restart and log access are on by default.
       # CUD_ALLOW_CONTAINER_ACTIONS: "0"
+      # A Terminal button (a real shell in a container) and Backup/Restore
+      # buttons (a volume's actual data, not just config) are both off by
+      # default -- a bigger trust boundary than the actions above, so each
+      # needs its own explicit opt-in:
+      # CUD_ALLOW_EXEC: "1"
+      # CUD_ALLOW_VOLUME_BACKUP: "1"
       # Historical logs are on by default too, once there is somewhere to
       # put them (the cud-logs volume above). Days of history to keep:
       # CUD_LOG_RETENTION_DAYS: "7"
