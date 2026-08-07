@@ -442,14 +442,40 @@
       </label>
     </div>
     <label class="stack">
+      <span>Template <small>optional</small></span>
+      <div class="dialog-row">
+        <select id="deploy-stack-template-picker">
+          <option value="">Start from scratch</option>
+        </select>
+        <button type="button" class="button small" id="deploy-stack-save-template">Save as template</button>
+      </div>
+    </label>
+    <label class="stack">
       <span>docker-compose.yml</span>
       <textarea id="deploy-stack-compose" rows="14" placeholder="services:&#10;  web:&#10;    image: nginx:latest&#10;    ports:&#10;      - &quot;8080:80&quot;" required></textarea>
     </label>
+    <div id="deploy-stack-validation" class="dialog-note" hidden></div>
     <pre class="joblog" id="deploy-stack-log" hidden></pre>
     <p class="dialog-error" id="deploy-stack-error" hidden></p>
     <div class="dialog-actions">
       <button type="button" class="button" id="deploy-stack-cancel">Close</button>
+      <button type="button" class="button" id="deploy-stack-validate">Validate</button>
       <button class="button primary" id="deploy-stack-submit" type="submit">Deploy</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="stack-file-dialog" class="dialog wide-dialog">
+  <form id="stack-file-form">
+    <h2>Compose file</h2>
+    <p class="dialog-lede" id="stack-file-path"></p>
+    <textarea id="stack-file-content" rows="16"></textarea>
+    <pre class="joblog" id="stack-file-log" hidden></pre>
+    <p class="dialog-error" id="stack-file-error" hidden></p>
+    <div class="dialog-actions">
+      <button type="button" class="button" id="stack-file-cancel">Close</button>
+      <button type="button" class="button" id="stack-file-redeploy">Redeploy</button>
+      <button type="button" class="button primary" id="stack-file-save">Save</button>
     </div>
   </form>
 </dialog>

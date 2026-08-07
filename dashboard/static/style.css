@@ -603,7 +603,10 @@ tr.detail td { padding: 0 18px 14px; background: transparent; }
   color: var(--text-secondary);
   font-size: 0.82rem;
   line-height: 1.5;
+  white-space: pre-wrap;
 }
+
+.dialog-error-note { color: var(--danger, #c0392b); }
 
 .dialog-status {
   display: flex;

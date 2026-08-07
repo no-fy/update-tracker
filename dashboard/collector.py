@@ -76,6 +76,7 @@ def poll_host(host, timeout=20, include_stopped=True):
         log_history=None,
         event_history=None,
         stack_deploy=None,
+        stack_redeploy=None,
     )
 
     if not host.get("enabled", True):
@@ -110,6 +111,7 @@ def poll_host(host, timeout=20, include_stopped=True):
         result["log_history"] = snapshot.get("log_history")
         result["event_history"] = snapshot.get("event_history")
         result["stack_deploy"] = snapshot.get("stack_deploy")
+        result["stack_redeploy"] = snapshot.get("stack_redeploy")
         result["os"] = _poll_os(host, timeout)
     except agent_module.DockerError as exc:
         result["error"] = str(exc)
@@ -582,6 +584,77 @@ def deploy_stack(host, project, compose, timeout=30):
     scheme = "https" if host.get("tls") else "http"
     url = "%s://%s:%s/v1/stacks" % (scheme, host.get("address"), host.get("port", 9713))
     return _http_post_json(url, {"project": project, "compose": compose},
+                           token=host.get("token"), timeout=timeout,
+                           verify_tls=host.get("verify_tls", True))
+
+
+def redeploy_stack(host, project, path, timeout=30):
+    if host.get("mode") == "local":
+        import containerctl
+        import stackctl
+
+        try:
+            job = stackctl.RUNNER.start_redeploy(project, path)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+        return job.snapshot()
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/stacks/redeploy" % (scheme, host.get("address"), host.get("port", 9713))
+    return _http_post_json(url, {"project": project, "path": path},
+                           token=host.get("token"), timeout=timeout,
+                           verify_tls=host.get("verify_tls", True))
+
+
+def validate_stack(host, project, compose, timeout=60):
+    if host.get("mode") == "local":
+        import containerctl
+        import stackctl
+
+        try:
+            return stackctl.validate(project, compose)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/stacks/validate" % (scheme, host.get("address"), host.get("port", 9713))
+    return _http_post_json(url, {"project": project, "compose": compose},
+                           token=host.get("token"), timeout=timeout,
+                           verify_tls=host.get("verify_tls", True))
+
+
+def read_stack_file(host, path, timeout=20):
+    if host.get("mode") == "local":
+        import containerctl
+        import stackctl
+
+        try:
+            content = stackctl.read_compose_file(path)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+        return {"path": path, "content": content}
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/stacks/file?path=%s" % (
+        scheme, host.get("address"), host.get("port", 9713), urllib.parse.quote(path, safe=""))
+    return _http_get_json(url, token=host.get("token"), timeout=timeout,
+                          verify_tls=host.get("verify_tls", True))
+
+
+def write_stack_file(host, path, content, timeout=20):
+    if host.get("mode") == "local":
+        import containerctl
+        import stackctl
+
+        try:
+            stackctl.write_compose_file(path, content)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+        return {"ok": True}
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/stacks/file" % (scheme, host.get("address"), host.get("port", 9713))
+    return _http_post_json(url, {"path": path, "content": content},
                            token=host.get("token"), timeout=timeout,
                            verify_tls=host.get("verify_tls", True))
 
