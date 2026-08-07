@@ -233,6 +233,7 @@ The lifecycle actions and a **Logs** button sit right on each container's row
 | **Remove** | Only offered once a container is stopped. |
 | **Recreate with latest image** | Only shown when the container is **update available** or **restart pending** — this is the button that closes the loop the dashboard started with. It pulls the tag's current image, then swaps the container for a new one built from the same config (env, labels, ports, volumes, restart policy, networks and aliases), streaming progress the same way an OS update does. |
 | **Clone** | Reads the container's current config back out (image, command, env, ports, volumes, restart policy, network) and opens **Create container** pre-filled with it, name suffixed `-copy` — nothing is created until you save. |
+| **Export config** | The same read as Clone, downloaded as a `.config.json` file instead of opening a form — a config snapshot to keep or diff, not a restore mechanism. Compose stacks have their own **Download** button next to Save/Redeploy in the stack file dialog, for the raw `docker-compose.yml`. |
 
 **Create container** (also in the Containers tab's header) opens the same
 form empty: image, an optional name, command, environment variables, ports,
@@ -538,7 +539,21 @@ Each tab's header also has what you'd expect to create one:
 - **Create network** (Networks tab): name, driver, and an optional
   subnet/gateway.
 
-Pruning/removing any of these is a later phase — this is add-only for now.
+**Backup/export is config-only, not data.** Export config and the compose
+Download button give you back exactly what Clone and the stack editor
+already read -- JSON/YAML text, cheap to fetch and safe to hand to anyone.
+Backing up what's actually *inside* a volume needs a different mechanism
+entirely (streaming a tar of live data through a helper container, which is
+its own scoped feature with its own size/timeout/format questions) and is
+not attempted here.
+
+The **Cleanup** button (top bar) prunes stopped containers, dangling images,
+unused volumes or unused networks on one host at a time — Docker's own
+`/prune` endpoints, behind the same `CUD_ALLOW_CONTAINER_ACTIONS` gate and
+danger-styled confirm dialog as Remove. **Pruning a volume deletes its
+data permanently** — Docker only knows whether a volume is currently
+attached to a container, not whether a stopped stack still needs it, and
+this can't tell either.
 
 Each host reports its pending OS package updates, ranked so the ones that
 matter are not buried:
@@ -740,9 +755,13 @@ Notable settings:
 - **`dashboard.session_hours`** — how long a sign-in lasts, 12 by default.
 - **`registries`** — credentials for private images, keyed by registry host.
   Use `docker.io` for Docker Hub. Without these, private images report
-  *Check failed*.
+  *Check failed*. Manageable from **Settings → Registries** in the UI as well
+  as by hand: add a host/username/password there and it writes here; a blank
+  password on an existing entry leaves the stored one alone, since the UI
+  never sends a stored password back to the browser to prefill the field.
 - **`insecure_registries`** — registries to reach over plain HTTP. `localhost`
-  and `127.0.0.1` are already treated this way.
+  and `127.0.0.1` are already treated this way. The **Insecure** checkbox in
+  Settings sets this per registry.
 - **`registry_cache_hours`** — successful digest lookups are cached this long
   (default 6h) in `config/registry-cache.json`; failures are re-tried after 20
   minutes. This is what keeps you clear of Docker Hub's rate limits.
@@ -886,6 +905,13 @@ tokens are never returned.
 | GET | `/api/ai/models` | OpenRouter's model catalog, for the Settings model picker |
 | GET | `/api/settings` | current dashboard-wide preferences |
 | POST | `/api/settings` | update one or more of them |
+| GET | `/api/registries` | configured registry hosts (no passwords) |
+| POST | `/api/registries` | add/update one: `{"host", "username", "password", "insecure"}` -- blank password keeps the existing one |
+| DELETE | `/api/registries/<host>` | remove credentials for one registry |
+| POST | `/api/hosts/<name>/prune/containers` | remove stopped containers |
+| POST | `/api/hosts/<name>/prune/images` | remove images: `{"dangling_only": true}` |
+| POST | `/api/hosts/<name>/prune/volumes` | remove unused volumes -- **deletes their data** |
+| POST | `/api/hosts/<name>/prune/networks` | remove unused networks |
 | POST | `/api/enrollments` | mint an enrolment and return the command to run |
 | GET | `/api/enrollments` | pending and finished enrolments, tokens omitted |
 | GET | `/api/enrollments/<id>` | one enrolment, to watch for the agent checking in |

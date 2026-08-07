@@ -277,6 +277,21 @@ class DockerClient:
         self.delete(
             "/%s/containers/%s" % (API_VERSION, urllib.parse.quote(container_id, safe="")))
 
+    def prune_containers(self):
+        return self.post("/%s/containers/prune" % API_VERSION) or {}
+
+    def prune_images(self, dangling_only=True):
+        filters = json.dumps({"dangling": ["true" if dangling_only else "false"]})
+        return self.post(
+            "/%s/images/prune?filters=%s" % (API_VERSION, urllib.parse.quote(filters, safe=""))
+        ) or {}
+
+    def prune_volumes(self):
+        return self.post("/%s/volumes/prune" % API_VERSION) or {}
+
+    def prune_networks(self):
+        return self.post("/%s/networks/prune" % API_VERSION) or {}
+
     def container_stats(self, container_id):
         """One-shot resource snapshot (stream=0) -- not the live stream."""
         return self.get(
@@ -875,6 +890,47 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if path == "/v1/stacks/validate":
             try:
                 result = _stackctl().validate(body.get("project"), body.get("compose"))
+            except _containerctl().ActionError as exc:
+                self._send(400, {"error": str(exc)})
+                return
+            self._send(200, result)
+            return
+
+        if path == "/v1/prune/containers":
+            client = DockerClient(self.server.docker_endpoint)
+            try:
+                result = _containerctl().prune_containers(client)
+            except _containerctl().ActionError as exc:
+                self._send(400, {"error": str(exc)})
+                return
+            self._send(200, result)
+            return
+
+        if path == "/v1/prune/volumes":
+            client = DockerClient(self.server.docker_endpoint)
+            try:
+                result = _containerctl().prune_volumes(client)
+            except _containerctl().ActionError as exc:
+                self._send(400, {"error": str(exc)})
+                return
+            self._send(200, result)
+            return
+
+        if path == "/v1/prune/networks":
+            client = DockerClient(self.server.docker_endpoint)
+            try:
+                result = _containerctl().prune_networks(client)
+            except _containerctl().ActionError as exc:
+                self._send(400, {"error": str(exc)})
+                return
+            self._send(200, result)
+            return
+
+        if path == "/v1/prune/images":
+            client = DockerClient(self.server.docker_endpoint)
+            try:
+                result = _imagectl().prune_images(
+                    client, dangling_only=body.get("dangling_only", True))
             except _containerctl().ActionError as exc:
                 self._send(400, {"error": str(exc)})
                 return

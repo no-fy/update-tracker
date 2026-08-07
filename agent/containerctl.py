@@ -324,6 +324,42 @@ def update_limits(client, container_id, spec):
         raise ActionError(str(exc))
 
 
+def prune_containers(client):
+    _require_allowed()
+    try:
+        raw = client.prune_containers()
+    except Exception as exc:
+        raise ActionError(str(exc))
+    return {
+        "removed": raw.get("ContainersDeleted") or [],
+        "space_reclaimed": raw.get("SpaceReclaimed") or 0,
+    }
+
+
+def prune_volumes(client):
+    _require_allowed()
+    try:
+        raw = client.prune_volumes()
+    except Exception as exc:
+        raise ActionError(str(exc))
+    return {
+        "removed": raw.get("VolumesDeleted") or [],
+        "space_reclaimed": raw.get("SpaceReclaimed") or 0,
+    }
+
+
+def prune_networks(client):
+    _require_allowed()
+    try:
+        raw = client.prune_networks()
+    except Exception as exc:
+        raise ActionError(str(exc))
+    return {
+        "removed": raw.get("NetworksDeleted") or [],
+        "space_reclaimed": 0,
+    }
+
+
 def create_volume(client, spec):
     _require_allowed()
     name = (spec.get("name") or "").strip()

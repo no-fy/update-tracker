@@ -146,6 +146,37 @@ def remove_host(config, name):
     return None
 
 
+def upsert_registry(config, host, username, password, insecure=False):
+    """Add/update credentials for one registry host. A blank password on an
+    existing entry means "keep the current one" -- the dashboard never sends
+    a stored password back to the browser, so a re-submitted form has none."""
+    host = (host or "").strip().lower()
+    registries = config.setdefault("registries", {})
+    entry = dict(registries.get(host) or {})
+    if username is not None:
+        entry["username"] = username
+    if password:
+        entry["password"] = password
+    registries[host] = entry
+
+    insecure_list = config.setdefault("insecure_registries", [])
+    if insecure and host not in insecure_list:
+        insecure_list.append(host)
+    elif not insecure and host in insecure_list:
+        insecure_list.remove(host)
+    return host
+
+
+def remove_registry(config, host):
+    host = (host or "").strip().lower()
+    registries = config.setdefault("registries", {})
+    removed = registries.pop(host, None)
+    insecure_list = config.setdefault("insecure_registries", [])
+    if host in insecure_list:
+        insecure_list.remove(host)
+    return removed
+
+
 def upsert_stack_template(config, name, compose):
     """Save/overwrite a reusable compose snippet under `name`. Small and
     textual, so config.json is enough -- no need for anything else."""

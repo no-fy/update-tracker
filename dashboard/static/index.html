@@ -16,6 +16,7 @@
   <div class="topbar-actions">
     <button id="add-host" class="button">Add host</button>
     <button id="port-map-open" class="button">Port map</button>
+    <button id="cleanup-open" class="button">Cleanup</button>
     <button id="refresh" class="button primary">
       <span class="spinner" aria-hidden="true"></span>
       <span class="button-label">Refresh</span>
@@ -217,6 +218,31 @@
       <span>Log refresh interval <small>seconds</small></span>
       <input type="number" id="settings-log-refresh" min="2" step="1">
     </label>
+
+    <h3 class="dialog-subhead">Registries</h3>
+    <p class="dialog-lede">Credentials for private registries, used to check for image updates and to
+      pull. Docker Hub needs no entry unless you're rate-limited or pulling private images.</p>
+    <div id="settings-registry-list" class="registry-list"></div>
+    <div class="dialog-row">
+      <label class="stack">
+        <span>Host</span>
+        <input type="text" id="settings-registry-host" placeholder="ghcr.io">
+      </label>
+      <label class="stack">
+        <span>Username</span>
+        <input type="text" id="settings-registry-username" autocomplete="off">
+      </label>
+      <label class="stack">
+        <span>Password / token</span>
+        <input type="password" id="settings-registry-password" autocomplete="off">
+      </label>
+    </div>
+    <label class="check">
+      <input type="checkbox" id="settings-registry-insecure">
+      <span>Insecure (plain HTTP or self-signed TLS)</span>
+    </label>
+    <button type="button" class="button" id="settings-registry-add">Add / update registry</button>
+    <p class="dialog-error" id="settings-registry-error" hidden></p>
 
     <h3 class="dialog-subhead">AI assistant</h3>
     <p class="dialog-lede">Powers the <strong>Ask AI</strong> button in the corner, via OpenRouter. It can see every host/container/OS-update and, with your approval, act on them.</p>
@@ -475,8 +501,57 @@
     <p class="dialog-error" id="stack-file-error" hidden></p>
     <div class="dialog-actions">
       <button type="button" class="button" id="stack-file-cancel">Close</button>
+      <button type="button" class="button" id="stack-file-download">Download</button>
       <button type="button" class="button" id="stack-file-redeploy">Redeploy</button>
       <button type="button" class="button primary" id="stack-file-save">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="cleanup-dialog" class="dialog wide-dialog">
+  <form method="dialog">
+    <h2>Cleanup</h2>
+    <p class="dialog-lede">Remove things Docker considers unused, on one host at a time. This is
+      permanent -- pruned volumes lose their data, and there is no way to tell here whether a
+      stopped stack still needs what it's using.</p>
+    <label class="stack">
+      <span>Host</span>
+      <select id="cleanup-host"></select>
+    </label>
+    <div class="cleanup-actions" id="cleanup-actions">
+      <div class="cleanup-row">
+        <div>
+          <strong>Stopped containers</strong>
+          <p>Removes every container that isn't running.</p>
+        </div>
+        <button type="button" class="button danger" id="cleanup-containers">Prune containers</button>
+      </div>
+      <div class="cleanup-row">
+        <div>
+          <strong>Dangling images</strong>
+          <p>Untagged image layers left behind by rebuilds and pulls.</p>
+        </div>
+        <button type="button" class="button danger" id="cleanup-images">Prune images</button>
+      </div>
+      <div class="cleanup-row">
+        <div>
+          <strong>Unused volumes</strong>
+          <p>Any volume not attached to a container right now -- <strong>including their data</strong>.</p>
+        </div>
+        <button type="button" class="button danger" id="cleanup-volumes">Prune volumes</button>
+      </div>
+      <div class="cleanup-row">
+        <div>
+          <strong>Unused networks</strong>
+          <p>Custom networks with no containers attached.</p>
+        </div>
+        <button type="button" class="button danger" id="cleanup-networks">Prune networks</button>
+      </div>
+    </div>
+    <pre class="joblog" id="cleanup-log" hidden></pre>
+    <p class="dialog-error" id="cleanup-error" hidden></p>
+    <div class="dialog-actions">
+      <button type="submit" class="button primary">Close</button>
     </div>
   </form>
 </dialog>

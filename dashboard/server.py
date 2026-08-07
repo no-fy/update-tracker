@@ -359,6 +359,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(200, current_settings(config))
             return
 
+        if path == "/api/registries":
+            config, _ = self.server.load_config()
+            insecure = set(config.get("insecure_registries") or [])
+            registries = [
+                {"host": host, "username": entry.get("username") or "", "insecure": host in insecure}
+                for host, entry in sorted((config.get("registries") or {}).items())
+            ]
+            self._json(200, {"registries": registries})
+            return
+
         if path == "/api/ai/models":
             try:
                 models = aihelper.list_models()
@@ -520,6 +530,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_new_enrollment()
             return
 
+        if path == "/api/registries":
+            self._handle_save_registry()
+            return
+
         if path == "/api/ai/chat":
             self._handle_ai_chat()
             return
@@ -537,6 +551,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path.startswith("/api/hosts/") and path.endswith("/containers/create"):
             self._handle_container_create(
                 urllib.parse.unquote(path[len("/api/hosts/"):-len("/containers/create")]))
+            return
+
+        if path.startswith("/api/hosts/") and path.endswith("/prune/containers"):
+            self._handle_prune(
+                urllib.parse.unquote(path[len("/api/hosts/"):-len("/prune/containers")]),
+                collector.prune_containers)
+            return
+
+        if path.startswith("/api/hosts/") and path.endswith("/prune/volumes"):
+            self._handle_prune(
+                urllib.parse.unquote(path[len("/api/hosts/"):-len("/prune/volumes")]),
+                collector.prune_volumes)
+            return
+
+        if path.startswith("/api/hosts/") and path.endswith("/prune/networks"):
+            self._handle_prune(
+                urllib.parse.unquote(path[len("/api/hosts/"):-len("/prune/networks")]),
+                collector.prune_networks)
+            return
+
+        if path.startswith("/api/hosts/") and path.endswith("/prune/images"):
+            name = urllib.parse.unquote(path[len("/api/hosts/"):-len("/prune/images")])
+            body = self._read_body()
+            self._handle_prune(
+                name,
+                lambda host: collector.prune_images(
+                    host, dangling_only=body.get("dangling_only", True)))
             return
 
         if path.startswith("/api/hosts/") and path.endswith("/volumes"):
@@ -838,6 +879,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as exc:
             self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
             return
+        self._json(200, result)
+
+    def _handle_prune(self, name, runner):
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+        try:
+            result = runner(host)
+        except collector.ContainerActionRefused as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self.server.poller.refresh_async()
         self._json(200, result)
 
     def _handle_container_stats(self, path):
@@ -1291,6 +1349,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.server.poller.wake()
         self._json(200, current_settings(config))
 
+    def _handle_save_registry(self):
+        body = self._read_body()
+        host = (body.get("host") or "").strip()
+        if not host:
+            self._json(400, {"error": "A registry host is required."})
+            return
+        config, config_path = self.server.load_config()
+        config_mod.upsert_registry(
+            config, host, body.get("username"), body.get("password"),
+            insecure=bool(body.get("insecure")),
+        )
+        config_mod.save_config(config, config_path)
+        self.server.poller.wake()
+        self._json(200, {"ok": True, "host": host.strip().lower()})
+
     # -- adding hosts ------------------------------------------------------
 
     def _dashboard_url(self):
@@ -1359,6 +1432,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             item_id = urllib.parse.unquote(path[len("/api/enrollments/"):])
             removed = self.server.enrollments.delete(item_id)
             self._json(200 if removed else 404, {"removed": removed, "id": item_id})
+            return
+
+        if path.startswith("/api/registries/"):
+            host = urllib.parse.unquote(path[len("/api/registries/"):])
+            config, config_path = self.server.load_config()
+            removed = config_mod.remove_registry(config, host)
+            if removed is None:
+                self._json(404, {"error": "no such registry: %s" % host})
+                return
+            config_mod.save_config(config, config_path)
+            self.server.poller.wake()
+            self._json(200, {"removed": True, "host": host})
             return
 
         if path.startswith("/api/stack-templates/"):

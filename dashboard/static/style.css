@@ -903,6 +903,30 @@ tr.detail td { padding: 0 18px 14px; background: transparent; }
 
 .port-conflict td { background: color-mix(in srgb, var(--critical) 12%, transparent); }
 
+.registry-list { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+.registry-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: var(--wash);
+  font-size: 0.82rem;
+}
+
+.cleanup-actions { display: flex; flex-direction: column; gap: 10px; margin: 10px 0; }
+.cleanup-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--hairline);
+}
+.cleanup-row p { margin: 2px 0 0; font-size: 0.78rem; color: var(--text-muted); }
+
 .os-row { cursor: pointer; }
 .os-row:hover td { background: var(--wash); }
 .os-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
