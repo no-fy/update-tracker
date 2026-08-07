@@ -607,6 +607,22 @@ def image_job(host, job_id, timeout=20):
         raise
 
 
+def host_disk_usage(host, timeout=20):
+    if host.get("mode") == "local":
+        import containerctl
+
+        client = agent_module.DockerClient(host.get("docker_socket"))
+        try:
+            return containerctl.disk_usage(client)
+        except containerctl.ActionError as exc:
+            raise ContainerActionRefused(str(exc))
+
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/system/df" % (scheme, host.get("address"), host.get("port", 9713))
+    return _http_get_json(url, token=host.get("token"), timeout=timeout,
+                          verify_tls=host.get("verify_tls", True))
+
+
 def prune_containers(host, timeout=30):
     if host.get("mode") == "local":
         import containerctl

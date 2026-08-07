@@ -238,6 +238,16 @@
           : "no security updates pending"
       ));
     }
+    if (summary.stacks_total) {
+      el.kpis.appendChild(kpi(
+        "Compose stacks", summary.stacks_needing_attention ? "update-available" : "up-to-date",
+        summary.stacks_total,
+        summary.stacks_needing_attention
+          ? summary.stacks_needing_attention + " " +
+            plural(summary.stacks_needing_attention, "stack needs", "stacks need") + " attention"
+          : "all up to date"
+      ));
+    }
     el.kpis.appendChild(kpi(
       "Hosts online", null,
       (summary.hosts_online || 0) + "/" + (summary.hosts_total || 0),
@@ -3047,6 +3057,14 @@
       return card;
     }
 
+    var warnings = (host.info || {}).warnings || [];
+    if (warnings.length) {
+      var warn = text("div", "host-warnings");
+      warn.appendChild(dot("update-available"));
+      warn.appendChild(text("span", null, warnings.join(" · ")));
+      card.appendChild(warn);
+    }
+
     if (!containers.length) {
       card.appendChild(text("div", "host-error", "No containers match the current filter."));
       return card;
@@ -3431,7 +3449,36 @@
     el.cleanupLog.textContent = "";
     hide(el.cleanupError);
     setCleanupBusy(false);
+    loadCleanupDiskUsage();
     if (typeof el.cleanupDialog.showModal === "function") el.cleanupDialog.showModal();
+  }
+
+  function loadCleanupDiskUsage() {
+    var host = el.cleanupHost.value;
+    el.cleanupDiskUsage.textContent = "";
+    if (!host) return;
+    el.cleanupDiskUsage.appendChild(text("span", "os-running", "Loading disk usage…"));
+    fetch("/api/hosts/" + encodeURIComponent(host) + "/disk-usage")
+      .then(function (r) { return r.json(); })
+      .then(function (result) {
+        el.cleanupDiskUsage.textContent = "";
+        if (result.error) throw new Error(result.error);
+        [["containers", "Containers"], ["images", "Images"], ["volumes", "Volumes"],
+         ["build_cache", "Build cache"]].forEach(function (pair) {
+          var d = result[pair[0]] || {};
+          var row = text("div", "disk-usage-row");
+          row.appendChild(text("span", null, pair[1]));
+          row.appendChild(text("span", null, bytes(d.size) || "0 B"));
+          row.appendChild(text("span", "disk-usage-reclaimable",
+            d.reclaimable ? bytes(d.reclaimable) + " reclaimable" : "nothing to reclaim"));
+          el.cleanupDiskUsage.appendChild(row);
+        });
+      })
+      .catch(function (err) {
+        el.cleanupDiskUsage.textContent = "";
+        el.cleanupDiskUsage.appendChild(text("span", "os-readonly",
+          err.message || "Could not load disk usage."));
+      });
   }
 
   function setCleanupBusy(busy) {
@@ -3474,6 +3521,7 @@
             (removed.length ? removed.length + " removed" : "nothing to remove") +
             (result.space_reclaimed ? ", " + bytes(result.space_reclaimed) + " reclaimed" : "");
           el.cleanupLog.textContent = (el.cleanupLog.textContent ? el.cleanupLog.textContent + "\n" : "") + line;
+          loadCleanupDiskUsage();
           fetch("/api/refresh", { method: "POST" });
         })
         .catch(function (err) {
@@ -3857,6 +3905,7 @@
       cleanupNetworks: $("cleanup-networks"),
       cleanupLog: $("cleanup-log"),
       cleanupError: $("cleanup-error"),
+      cleanupDiskUsage: $("cleanup-disk-usage"),
       tabContainers: $("tab-containers"),
       tabOs: $("tab-os"),
       tabCompose: $("tab-compose"),
@@ -4037,6 +4086,7 @@
     el.addHost.addEventListener("click", openHostDialog);
     el.portMapOpen.addEventListener("click", openPortMap);
     el.cleanupOpen.addEventListener("click", openCleanup);
+    el.cleanupHost.addEventListener("change", loadCleanupDiskUsage);
     el.cleanupContainers.addEventListener("click", function () { runCleanup("containers"); });
     el.cleanupImages.addEventListener("click", function () { runCleanup("images"); });
     el.cleanupVolumes.addEventListener("click", function () { runCleanup("volumes"); });

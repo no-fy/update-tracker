@@ -277,6 +277,9 @@ class DockerClient:
         self.delete(
             "/%s/containers/%s" % (API_VERSION, urllib.parse.quote(container_id, safe="")))
 
+    def system_df(self):
+        return self.get("/%s/system/df" % API_VERSION)
+
     def prune_containers(self):
         return self.post("/%s/containers/prune" % API_VERSION) or {}
 
@@ -504,6 +507,7 @@ def collect_snapshot(client, include_stopped=True):
         "containers_total": info.get("Containers"),
         "containers_running": info.get("ContainersRunning"),
         "images_total": info.get("Images"),
+        "warnings": info.get("Warnings") or [],
     }
 
     image_cache = {}
@@ -710,6 +714,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             elif path == "/v1/volumes":
                 payload = client.volumes() or {}
                 self._send(200, {"volumes": shape_volumes(payload.get("Volumes") or [])})
+            elif path == "/v1/system/df":
+                try:
+                    self._send(200, _containerctl().disk_usage(client))
+                except _containerctl().ActionError as exc:
+                    self._send(400, {"error": str(exc)})
             elif path == "/v1/networks":
                 self._send(200, {"networks": shape_networks(client.networks() or [])})
             elif path.startswith("/v1/containers/") and path.endswith("/logs/history"):

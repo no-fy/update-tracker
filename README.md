@@ -220,6 +220,29 @@ The host needs Docker and a reachable port; that is the whole requirement.
 There is no SSH path any more, from the browser or anywhere else — the
 dashboard holds no credentials for your machines at all.
 
+## Overview and daemon health
+
+The hero number and KPI row at the top (containers needing an update, OS
+updates, hosts online) are a cross-host summary computed on every poll, not
+a separate page or fetch -- a **Compose stacks** KPI joins them once any
+stack exists, so stacks needing attention are visible without opening that
+tab.
+
+Each host card also surfaces what `docker info` itself reports as a
+warning (kernel missing cgroup features, no swap accounting, and similar --
+the same list `docker info` prints on the CLI), read from the same info call
+already made every poll, so a host that's technically online but degraded
+doesn't look identical to a healthy one. **Cleanup** additionally shows a
+disk usage breakdown (`docker system df`, aggregated the way the CLI does
+it) per resource type before you prune anything, so the reclaimable-space
+numbers next to each button aren't a guess.
+
+Search and host filtering already exist per-tab (Containers, Images,
+Volumes, Networks, Events all have their own search box, sharing one host
+filter) -- there is no separate global search, since each tab's data shape
+is different enough that one box searching all of them at once would mostly
+just be confusing about what a match meant.
+
 ## Managing containers
 
 The lifecycle actions and a **Logs** button sit right on each container's row
@@ -908,6 +931,7 @@ tokens are never returned.
 | GET | `/api/registries` | configured registry hosts (no passwords) |
 | POST | `/api/registries` | add/update one: `{"host", "username", "password", "insecure"}` -- blank password keeps the existing one |
 | DELETE | `/api/registries/<host>` | remove credentials for one registry |
+| GET | `/api/hosts/<name>/disk-usage` | reclaimable space per resource type (`docker system df`, aggregated) |
 | POST | `/api/hosts/<name>/prune/containers` | remove stopped containers |
 | POST | `/api/hosts/<name>/prune/images` | remove images: `{"dangling_only": true}` |
 | POST | `/api/hosts/<name>/prune/volumes` | remove unused volumes -- **deletes their data** |
