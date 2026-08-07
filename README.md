@@ -404,14 +404,41 @@ shared by everyone signed in:
 
 ## OS package updates
 
-The dashboard has four tabs: **Containers** (the image view), **Compose**
+The dashboard has seven tabs: **Containers** (the image view), **Compose**
 (containers grouped into stacks, hidden until one exists), **OS updates**
-(pending packages per host) and **Events** (a cross-host timeline). Each tab
-keeps its own status filter and search query — the search box follows
-whichever tab you are on, so switching never applies a search meant for the
-other list — while the host filter is shared across all four. On the
-containers tab each host still shows a one-line OS summary, and *See N
-packages* jumps straight to that host on the OS tab.
+(pending packages per host), **Events** (a cross-host timeline), and
+**Images** / **Volumes** / **Networks** (the other core Docker objects,
+read-only for now — see below). Each tab keeps its own status filter and
+search query — the search box follows whichever tab you are on, so switching
+never applies a search meant for the other list — while the host filter is
+shared across all of them. On the containers tab each host still shows a
+one-line OS summary, and *See N packages* jumps straight to that host on the
+OS tab.
+
+### Images, Volumes, Networks
+
+Read-only views of the other three core Docker object types, fetched only
+when you open the tab (not part of the regular poll — these change far less
+often than containers, so there's no reason to fetch them every cycle):
+
+- **Images**: tags, size, when built, and which containers on that host are
+  actually running each one (or "unused" if none are — a **Dangling only**
+  filter finds untagged images specifically). Cross-referenced from the same
+  container list the Containers tab already has; the agent adds nothing
+  beyond Docker's own `/images/json`.
+- **Volumes**: driver, mountpoint, and which containers mount it (or
+  "orphaned" if none do — an **Orphaned only** filter surfaces cleanup
+  candidates). The container-to-volume mapping comes from `Mounts`, which
+  Docker already includes in the same container list response this project
+  polls for everything else — no extra API call per container.
+- **Networks**: driver, subnet/gateway, and which containers are attached.
+  Docker's own network-list endpoint doesn't include attached containers
+  (only `inspect` does, one call per network), so this is cross-referenced
+  the same way — from each container's own `NetworkSettings.Networks`,
+  already present in the list response.
+
+Nothing here writes anything yet; creating, pruning or removing any of these
+is a later phase.
 
 Each host reports its pending OS package updates, ranked so the ones that
 matter are not buried:
@@ -734,6 +761,9 @@ tokens are never returned.
 | GET | `/api/hosts/<name>/containers/<id>/logs/history?since=&until=&limit=` | stored log lines, if the agent has history on |
 | GET | `/api/hosts/<name>/events?since=&until=&limit=` | recent Docker events for one host, if the agent has event history on |
 | GET | `/api/events?host=&since=&until=&limit=` | recent Docker events across every (or one) host, merged and sorted newest first -- backs the Events tab |
+| GET | `/api/hosts/<name>/images` | that host's images, with tags, size and whether they're dangling |
+| GET | `/api/hosts/<name>/volumes` | that host's volumes, with driver and mountpoint |
+| GET | `/api/hosts/<name>/networks` | that host's networks, with driver and subnet/gateway |
 | POST | `/api/ai/chat` | the assistant: `{"messages", "confirm"?, "pending"?}` → `{"status": "final"\|"needs_confirmation"\|"error", ...}` — refused unless an OpenRouter key is configured |
 | GET | `/api/ai/models` | OpenRouter's model catalog, for the Settings model picker |
 | GET | `/api/settings` | current dashboard-wide preferences |

@@ -393,6 +393,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 urllib.parse.unquote(path[len("/api/hosts/"):-len("/events")]))
             return
 
+        if path.startswith("/api/hosts/") and path.endswith("/images"):
+            self._handle_host_resource(
+                urllib.parse.unquote(path[len("/api/hosts/"):-len("/images")]),
+                collector.host_images)
+            return
+
+        if path.startswith("/api/hosts/") and path.endswith("/volumes"):
+            self._handle_host_resource(
+                urllib.parse.unquote(path[len("/api/hosts/"):-len("/volumes")]),
+                collector.host_volumes)
+            return
+
+        if path.startswith("/api/hosts/") and path.endswith("/networks"):
+            self._handle_host_resource(
+                urllib.parse.unquote(path[len("/api/hosts/"):-len("/networks")]),
+                collector.host_networks)
+            return
+
         if path.startswith("/api/hosts/") and "/containers/" in path and path.endswith("/logs/history"):
             self._handle_container_logs_history(path)
             return
@@ -692,6 +710,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
             return
         self._json(200, {"events": events})
+
+    def _handle_host_resource(self, name, fetcher):
+        """Shared by the Images/Volumes/Networks routes -- each is just one
+        host, one Docker API list, no filtering to parse from the query string."""
+        config, _ = self.server.load_config()
+        host = config_mod.find_host(config, name)
+        if not host:
+            self._json(404, {"error": "no such host: %s" % name})
+            return
+        try:
+            result = fetcher(host)
+        except Exception as exc:
+            self._json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self._json(200, result)
 
     def _handle_host_events(self, name):
         config, _ = self.server.load_config()

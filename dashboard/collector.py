@@ -409,6 +409,37 @@ def host_events(host, since=None, until=None, limit=200, timeout=20):
                           verify_tls=host.get("verify_tls", True))
 
 
+def host_images(host, timeout=20):
+    if host.get("mode") == "local":
+        client = agent_module.DockerClient(host.get("docker_socket"))
+        return {"images": agent_module.shape_images(client.images() or [])}
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/images" % (scheme, host.get("address"), host.get("port", 9713))
+    return _http_get_json(url, token=host.get("token"), timeout=timeout,
+                          verify_tls=host.get("verify_tls", True))
+
+
+def host_volumes(host, timeout=20):
+    if host.get("mode") == "local":
+        client = agent_module.DockerClient(host.get("docker_socket"))
+        payload = client.volumes() or {}
+        return {"volumes": agent_module.shape_volumes(payload.get("Volumes") or [])}
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/volumes" % (scheme, host.get("address"), host.get("port", 9713))
+    return _http_get_json(url, token=host.get("token"), timeout=timeout,
+                          verify_tls=host.get("verify_tls", True))
+
+
+def host_networks(host, timeout=20):
+    if host.get("mode") == "local":
+        client = agent_module.DockerClient(host.get("docker_socket"))
+        return {"networks": agent_module.shape_networks(client.networks() or [])}
+    scheme = "https" if host.get("tls") else "http"
+    url = "%s://%s:%s/v1/networks" % (scheme, host.get("address"), host.get("port", 9713))
+    return _http_get_json(url, token=host.get("token"), timeout=timeout,
+                          verify_tls=host.get("verify_tls", True))
+
+
 def all_events(hosts, since=None, until=None, limit=200, timeout=20, max_workers=8):
     """Docker events across every enabled host, merged and sorted newest
     first -- the same fan-out shape as poll_hosts, just for events instead

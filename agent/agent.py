@@ -140,6 +140,15 @@ class DockerClient:
     def image(self, ref):
         return self.get("/%s/images/%s/json" % (API_VERSION, urllib.parse.quote(ref, safe="")))
 
+    def images(self, all_images=True):
+        return self.get("/%s/images/json?all=%d" % (API_VERSION, 1 if all_images else 0))
+
+    def volumes(self):
+        return self.get("/%s/volumes" % API_VERSION)
+
+    def networks(self):
+        return self.get("/%s/networks" % API_VERSION)
+
     def post(self, path):
         conn = self._connect()
         try:
@@ -459,6 +468,15 @@ def collect_snapshot(client, include_stopped=True):
                 "compose_workdir": labels.get(COMPOSE_WORKDIR),
                 "compose_config": labels.get(COMPOSE_CONFIG),
                 "ignored_by": _ignored_by_label(labels),
+                # Already in the same /containers/json response Docker sends for
+                # everything above -- free cross-referencing for the Volumes and
+                # Networks tabs, no extra API call per container.
+                "mounts": [
+                    {"type": m.get("Type"), "name": m.get("Name"), "source": m.get("Source"),
+                     "destination": m.get("Destination"), "rw": m.get("RW")}
+                    for m in (raw.get("Mounts") or [])
+                ],
+                "networks": sorted((raw.get("NetworkSettings") or {}).get("Networks") or {}),
             }
         )
 
@@ -472,6 +490,58 @@ def collect_snapshot(client, include_stopped=True):
         "log_history": _logstore().capability(),
         "event_history": _eventstore().capability(),
     }
+
+
+def shape_images(raw_list):
+    """Trim Docker's own /images/json response to what the Images tab needs.
+    Which containers use an image is cross-referenced dashboard-side from
+    the container list this agent already reports -- not duplicated here."""
+    out = []
+    for img in raw_list or []:
+        tags = [t for t in (img.get("RepoTags") or []) if t and t != "<none>:<none>"]
+        out.append({
+            "id": (img.get("Id") or "").replace("sha256:", "")[:12],
+            "full_id": img.get("Id"),
+            "tags": tags,
+            "dangling": not tags,
+            "digests": img.get("RepoDigests") or [],
+            "created": img.get("Created"),
+            "size": img.get("Size"),
+            "labels": img.get("Labels") or {},
+        })
+    return out
+
+
+def shape_volumes(raw_list):
+    out = []
+    for vol in raw_list or []:
+        out.append({
+            "name": vol.get("Name"),
+            "driver": vol.get("Driver"),
+            "mountpoint": vol.get("Mountpoint"),
+            "created": vol.get("CreatedAt"),
+            "scope": vol.get("Scope"),
+            "labels": vol.get("Labels") or {},
+        })
+    return out
+
+
+def shape_networks(raw_list):
+    out = []
+    for net in raw_list or []:
+        ipam = (net.get("IPAM") or {}).get("Config") or []
+        out.append({
+            "id": (net.get("Id") or "")[:12],
+            "name": net.get("Name"),
+            "driver": net.get("Driver"),
+            "scope": net.get("Scope"),
+            "internal": bool(net.get("Internal")),
+            "subnets": [c.get("Subnet") for c in ipam if c.get("Subnet")],
+            "gateways": [c.get("Gateway") for c in ipam if c.get("Gateway")],
+            "created": net.get("Created"),
+            "labels": net.get("Labels") or {},
+        })
+    return out
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -544,6 +614,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                         limit=(query.get("limit") or [None])[0],
                     )
                     self._send(200, {"events": events, "enabled": True})
+            elif path == "/v1/images":
+                self._send(200, {"images": shape_images(client.images() or [])})
+            elif path == "/v1/volumes":
+                payload = client.volumes() or {}
+                self._send(200, {"volumes": shape_volumes(payload.get("Volumes") or [])})
+            elif path == "/v1/networks":
+                self._send(200, {"networks": shape_networks(client.networks() or [])})
             elif path.startswith("/v1/containers/") and path.endswith("/logs/history"):
                 container_id = path[len("/v1/containers/"):-len("/logs/history")]
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
